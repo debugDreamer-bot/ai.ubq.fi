@@ -64,9 +64,20 @@ class MemoryKv {
 
   getMany<T extends readonly unknown[]>(
     keys: readonly Deno.KvKey[],
-    options?: { consistency?: Deno.KvConsistencyLevel }
+    _options?: { consistency?: Deno.KvConsistencyLevel }
   ): Promise<{ [K in keyof T]: Deno.KvEntryMaybe<T[K]> }> {
-    return Promise.all(keys.map((key) => this.get(key, options))) as Promise<{ [K in keyof T]: Deno.KvEntryMaybe<T[K]> }>;
+    // Snapshot every value and versionstamp synchronously so one resolved tuple
+    // cannot mix rows from different write generations.
+    this.#purgeExpired();
+    const snapshot = keys.map((key) => {
+      const entry = this.entries.get(encodeKey(key));
+      return {
+        key: clone(key),
+        value: entry ? clone(entry.value) : null,
+        versionstamp: entry?.versionstamp ?? null,
+      };
+    });
+    return Promise.resolve(snapshot as { [K in keyof T]: Deno.KvEntryMaybe<T[K]> });
   }
 
   set(key: Deno.KvKey, value: unknown, options?: { expireIn?: number }): Promise<Deno.KvCommitResult> {
@@ -147,7 +158,6 @@ const OUTCOMES: readonly Outcome[] = [
   { name: "network", kind: "network" },
 ];
 
-const ACCOUNT_FALLBACK_STATUSES = new Set([401, 403, 429]);
 const MODEL = "gpt-5-routing-matrix";
 const KEY_ID = "routing-matrix-key";
 const KEY_HASH = "routing-matrix-hash";
@@ -156,8 +166,6 @@ const CODEX_RESPONSES_URL = `${config.codexBaseUrl}/responses`;
 const CODEX_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const METERED_RESPONSES_URL = `${METERED_BASE_URL}/v1/responses`;
 const encoder = new TextEncoder();
-
-const isFallbackOutcome = (outcome: Outcome): boolean => outcome.kind === "http" && ACCOUNT_FALLBACK_STATUSES.has(outcome.status);
 
 const is401 = (outcome: Outcome): boolean => outcome.kind === "http" && outcome.status === 401;
 const is429 = (outcome: Outcome): boolean => outcome.kind === "http" && outcome.status === 429;
@@ -379,15 +387,6 @@ const retryLogs = (logs: readonly unknown[][]): Record<string, unknown>[] =>
 
 const drainBackgroundTasks = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-// The recorded Codex outcome whose status decides the client-visible response:
-// on the generic-429 replay path it is whichever account returned the 429,
-// otherwise it is the last account that was actually reached.
-const terminalOutcome = (first: Outcome, second: Outcome, replays429: boolean, reachesSecond: boolean): Outcome => {
-  if (replays429) return is429(first) ? first : second;
-  if (reachesSecond) return second;
-  return first;
-};
-
 const runCase = async (first: Outcome, second: Outcome, sequence: number): Promise<void> => {
   await seedFixture();
   const run: ActiveRun = {
@@ -417,33 +416,29 @@ const runCase = async (first: Outcome, second: Outcome, sequence: number): Promi
       }
     );
 
-    const reachesSecond = isFallbackOutcome(first);
-    // Ambiguous transport failures are terminal and must not replay the
-    // inference on a sibling account. Every 429 in this matrix is deliberately
-    // non-authoritative.
-    const completesGeneric429Retry = isFallbackOutcome(first) && isFallbackOutcome(second) && (is429(first) || is429(second));
-    const terminalCodexOutcome = terminalOutcome(first, second, completesGeneric429Retry, reachesSecond);
+    const reachesSecond = is401(first);
+    // Serial routing keeps one active account: only a final credential
+    // invalidity moves the request to the second configured account. A generic
+    // 429 stays on the same account with one bounded retry, and a raw 403 with
+    // a still-valid bearer is terminal.
+    const firstAuthRetry = is401(first) ? 1 : 0;
+    const firstGenericRetry = is429(first) ? 1 : 0;
+    const secondAuthRetry = reachesSecond && is401(second) ? 1 : 0;
+    const secondGenericRetry = reachesSecond && is429(second) ? 1 : 0;
+    const terminalCodexOutcome = reachesSecond ? second : first;
     const expectedStatus = is401(terminalCodexOutcome) ? 503 : directStatus(terminalCodexOutcome);
     assert.equal(response.status, expectedStatus, `${label}: final status`);
     assert.equal(response.headers.get("x-uos-upstream"), "chatgpt_codex", `${label}: selected upstream`);
-    assert.equal(run.meteredCalls, 0, `${label}: generic 429 must not reach Metered`);
-    assert.equal(run.codexCalls["account-two"] > 0, reachesSecond, `${label}: account two reachability`);
-    assert.equal(run.refreshCalls["account-one"], is401(first) ? 1 : 0, `${label}: account one refresh count`);
-    assert.equal(run.refreshCalls["account-two"], reachesSecond && is401(second) ? 1 : 0, `${label}: account two refresh count`);
+    assert.equal(run.meteredCalls, 0, `${label}: no authoritative exhaustion in this matrix`);
+    assert.equal(run.codexCalls["account-one"], 1 + firstAuthRetry + firstGenericRetry, `${label}: account one attempt count`);
+    assert.equal(run.codexCalls["account-two"], reachesSecond ? 1 + secondAuthRetry + secondGenericRetry : 0, `${label}: account two attempt count`);
+    assert.equal(run.refreshCalls["account-one"], firstAuthRetry, `${label}: account one refresh count`);
+    assert.equal(run.refreshCalls["account-two"], secondAuthRetry, `${label}: account two refresh count`);
 
-    const firstAccountRefresh = is401(first) ? 1 : 0;
-    const secondAccountRefresh = is401(second) ? 1 : 0;
-    const expectedBaseCalls = 1 + firstAccountRefresh + (reachesSecond ? 1 + secondAccountRefresh : 0);
-    const expectsGlobal429Retry = completesGeneric429Retry;
-    assert.equal(
-      run.codexCalls["account-one"] + run.codexCalls["account-two"],
-      expectedBaseCalls + (expectsGlobal429Retry ? 1 : 0),
-      `${label}: total Codex attempt count`
-    );
     const retries = retryLogs(run.infoLogs);
-    assert.equal(retries.length, expectsGlobal429Retry ? 1 : 0, `${label}: global 429 retry count`);
-    if (expectsGlobal429Retry) {
-      assert.equal(retries[0]?.delay_ms, 0, `${label}: generic 429 recheck must be immediate`);
+    assert.equal(retries.length, firstGenericRetry + secondGenericRetry, `${label}: bounded retry count`);
+    for (const retry of retries) {
+      assert.equal(retry.delay_ms, 0, `${label}: generic 429 recheck must be immediate`);
     }
     await response.arrayBuffer();
     await drainBackgroundTasks();
@@ -490,7 +485,7 @@ Deno.test("two-account Codex-to-Metered /v1/responses routing matrix", async (t)
     });
 
     await t.step("every reached second-account 5xx returns directly", async () => {
-      const first = OUTCOMES.find((outcome) => outcome.name === "403");
+      const first = OUTCOMES.find((outcome) => outcome.name === "401");
       assert.ok(first);
       for (const [index, status] of [500, 501, 502, 503, 504, 599].entries()) {
         await runCase(first, { name: String(status), kind: "http", status }, 20_000 + index);

@@ -5,7 +5,7 @@ import { CEREBRAS_CHAT_COMPLETIONS_URL, fetchCerebrasChatCompletions } from "../
 import {
   CODEX_AUTH_POOL_KV_KEY,
   fetchCodexResponses,
-  getCodexResponseAffinityOutcome,
+  getCodexResponseActiveTelemetry,
   getCodexResponseSlot,
   markCodexResponseCompleted,
   resetCodexAuthCacheForTest,
@@ -395,7 +395,7 @@ Deno.test({
       shouldQuotaFailOne = false;
       assert.equal(remapped.status, 200);
       assert.equal(getCodexResponseSlot(remapped), 2, "account two is the canonical wrapper identity");
-      assert.equal(getCodexResponseAffinityOutcome(remapped), "remapped");
+      assert.deepEqual(getCodexResponseActiveTelemetry(remapped), { activeGeneration: 2, activeTransitionReason: "quota_exhausted" });
       await remapped.text();
       const trace = remapRecorder.snapshotAndSeal();
       assert.deepEqual(

@@ -9,7 +9,7 @@ import {
   fetchCodexResponses,
   getCodexModelsSnapshotDefaultModel,
   getCodexResponseAccountCohortId,
-  getCodexResponseAffinityOutcome,
+  getCodexResponseActiveTelemetry,
   getCodexResponseSlot,
   getCodexRoutingError,
   loadCodexModelsSnapshot,
@@ -170,7 +170,7 @@ const supportsReasoningProgressRelease = (provider: UpstreamProvider): boolean =
 export type InferenceFallbackReason = "primary_quota_blocked" | "dynamic_paid_model";
 export type UsageTelemetryStatus = "missing" | "partial" | "reported" | "invalid";
 export type PromptCacheMode = "implicit" | "explicit" | "legacy_retention" | "unspecified";
-export type AffinityOutcome = "none" | "preferred" | "preferred_unavailable" | "remapped" | "failover" | "shadow_only";
+export type ActiveTransitionReason = "quota_exhausted" | "credential_invalid" | "account_removed_or_replaced" | null;
 
 export type ResponseTelemetry = Readonly<{
   provider: string;
@@ -189,7 +189,8 @@ export type ResponseTelemetry = Readonly<{
   promptCacheMode: PromptCacheMode;
   explicitBreakpointCount: number;
   accountSlot: number | null;
-  affinityOutcome: AffinityOutcome;
+  activeGeneration: number | null;
+  activeTransitionReason: ActiveTransitionReason;
   quotaUsedPercent: number | null | undefined;
   completed: boolean;
   semanticOutputObserved: boolean | null;
@@ -237,7 +238,8 @@ type ResponseTelemetryState = {
   explicitBreakpointCount: number;
   accountSlot: number | null;
   accountCohortId: string | null;
-  affinityOutcome: AffinityOutcome;
+  activeGeneration: number | null;
+  activeTransitionReason: ActiveTransitionReason;
   quotaUsedPercent: number | null | undefined;
   completed: boolean;
   semanticOutputObserved: boolean | null;
@@ -285,7 +287,8 @@ const createResponseTelemetryState = (): ResponseTelemetryState => ({
   explicitBreakpointCount: 0,
   accountSlot: null,
   accountCohortId: null,
-  affinityOutcome: "none",
+  activeGeneration: null,
+  activeTransitionReason: null,
   quotaUsedPercent: undefined,
   completed: false,
   semanticOutputObserved: null,
@@ -414,7 +417,12 @@ const aggregateResponseTelemetry = (sources: readonly Response[], target: Respon
   aggregate.explicitBreakpointCount = Math.max(0, ...states.map((state) => state.explicitBreakpointCount));
   aggregate.accountSlot = commonTelemetryValue(states.map((state) => state.accountSlot));
   aggregate.accountCohortId = commonTelemetryValue(states.map((state) => state.accountCohortId));
-  aggregate.affinityOutcome = commonTelemetryValue(states.map((state) => state.affinityOutcome)) ?? "failover";
+  // Generation and reason are reported together: a differing generation, or
+  // any source without active telemetry, yields null for both fields.
+  const allSourcesHaveActiveGeneration = states.length === sources.length && states.every((state) => state.activeGeneration !== null);
+  const commonActiveGeneration = allSourcesHaveActiveGeneration ? commonTelemetryValue(states.map((state) => state.activeGeneration)) : null;
+  aggregate.activeGeneration = commonActiveGeneration;
+  aggregate.activeTransitionReason = commonActiveGeneration === null ? null : commonTelemetryValue(states.map((state) => state.activeTransitionReason));
   const usedPercents = states.map((state) => state.quotaUsedPercent).filter((value): value is number => typeof value === "number");
   aggregate.quotaUsedPercent = aggregatedQuotaUsedPercent(usedPercents, states);
   aggregate.completed = states.length === sources.length && states.every((state) => state.completed);
@@ -478,7 +486,8 @@ export const getResponseTelemetry = (response: Response): ResponseTelemetry | nu
     promptCacheMode: state.promptCacheMode,
     explicitBreakpointCount: state.explicitBreakpointCount,
     accountSlot: state.accountSlot,
-    affinityOutcome: state.affinityOutcome,
+    activeGeneration: state.activeGeneration,
+    activeTransitionReason: state.activeTransitionReason,
     quotaUsedPercent: state.quotaUsedPercent,
     completed: state.completed,
     semanticOutputObserved: state.semanticOutputObserved,
@@ -520,6 +529,8 @@ const selectRemovedProviderTelemetry = (context: UsageContext | undefined): void
   telemetry.provider = "removed_provider";
   telemetry.accountSlot = null;
   telemetry.accountCohortId = null;
+  telemetry.activeGeneration = null;
+  telemetry.activeTransitionReason = null;
   telemetry.providerRequestId = null;
 };
 
@@ -2569,6 +2580,8 @@ const fetchTemporaryFreeSurplusRoutedResponses = async (
     telemetry.fallbackReason = null;
     telemetry.accountSlot = null;
     telemetry.accountCohortId = null;
+    telemetry.activeGeneration = null;
+    telemetry.activeTransitionReason = null;
     telemetry.providerRequestId = null;
     telemetry.quotaUsedPercent = null;
   }
@@ -2805,7 +2818,9 @@ const recordCodexPrimaryTelemetry = async (primary: Response, telemetry: Respons
   if (!telemetry) return;
   telemetry.accountSlot = getCodexResponseSlot(primary);
   telemetry.accountCohortId = await getCodexResponseAccountCohortId(primary);
-  telemetry.affinityOutcome = getCodexResponseAffinityOutcome(primary);
+  const active = getCodexResponseActiveTelemetry(primary);
+  telemetry.activeGeneration = active.activeGeneration;
+  telemetry.activeTransitionReason = active.activeTransitionReason;
   telemetry.providerRequestId = providerRequestIdFromResponse(primary);
 };
 
@@ -3336,6 +3351,8 @@ const fetchResponsesWithPaidFallback = async (
     telemetry.provider = routing.paidProviders[0];
     telemetry.accountSlot = null;
     telemetry.accountCohortId = null;
+    telemetry.activeGeneration = null;
+    telemetry.activeTransitionReason = null;
     telemetry.providerRequestId = null;
     telemetry.quotaUsedPercent = reservation.quota_used_percent;
   }
@@ -9383,6 +9400,8 @@ type ResponsesFailureCorrelation = Readonly<{
   provider: string | null;
   accountSlot: number | null;
   accountCohortId: string | null;
+  activeGeneration: number | null;
+  activeTransitionReason: ActiveTransitionReason;
   providerRequestId: string | null;
 }>;
 
@@ -9842,6 +9861,8 @@ const recordCodexPrimaryFailureTelemetry = (state: ResponsesHandlerState, failed
       provider: telemetry.provider,
       accountSlot: telemetry.accountSlot,
       accountCohortId: telemetry.accountCohortId,
+      activeGeneration: telemetry.activeGeneration,
+      activeTransitionReason: telemetry.activeTransitionReason,
       providerRequestId: telemetry.providerRequestId,
     };
   }
@@ -10056,6 +10077,8 @@ const settleRemovedProviderFailure = async (state: ResponsesHandlerState, attemp
       telemetry.provider = state.primaryFailureCorrelation?.provider ?? primaryFailureResponse.headers.get("x-uos-upstream") ?? "chatgpt_codex";
       telemetry.accountSlot = state.primaryFailureCorrelation?.accountSlot ?? null;
       telemetry.accountCohortId = state.primaryFailureCorrelation?.accountCohortId ?? null;
+      telemetry.activeGeneration = state.primaryFailureCorrelation?.activeGeneration ?? null;
+      telemetry.activeTransitionReason = state.primaryFailureCorrelation?.activeTransitionReason ?? null;
       telemetry.providerRequestId = state.primaryFailureCorrelation?.providerRequestId ?? null;
     } else {
       selectRemovedProviderTelemetry(state.usageContext);

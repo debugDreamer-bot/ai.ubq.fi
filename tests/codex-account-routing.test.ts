@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { CODEX_AUTH_POOL_KV_KEY, CodexError, fetchCodexResponses, resetCodexAuthCacheForTest } from "../src/codex.ts";
+import { CODEX_AUTH_POOL_KV_KEY, CodexError, fetchCodexResponses, getCodexRoutingError, resetCodexAuthCacheForTest } from "../src/codex.ts";
 import { setKvForTest } from "../src/kv.ts";
 import {
   claimCodexRoutingProbe,
   CODEX_ACCOUNT_ROUTING_KV_KEY,
+  CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
   CODEX_CAPACITY_ROUTING_MAX_AGE_MS,
   CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY,
   CODEX_HALF_OPEN_LEASE_MS,
@@ -15,6 +16,7 @@ import {
   markCodexRecoveryProbeQuotaBlocked,
   markCodexSuccess,
   markCodexUpstreamTimeout,
+  parseCodexActiveAccountSelection,
   parseCodexAccountRoutingState,
   readCodex429,
   recheckCodexRoutingSlot,
@@ -22,8 +24,10 @@ import {
   reconcileCodexQuotaAfterVerifiedReset,
   reconcileCodexRoutingAccount,
   recordCodexCapacityRoutingObservations,
+  refreshCodexActiveAccountAdmission,
   resetCodexAccountRoutingForTest,
   selectCodexRoutingAccounts,
+  selectCodexRoutingAccountsStrong,
 } from "../src/codex_account_routing.ts";
 import { PROVIDER_CAPACITY_SNAPSHOT_KEY } from "../src/provider_capacity_contract.ts";
 import type { CodexAuthPoolState } from "../src/types.ts";
@@ -81,6 +85,22 @@ class RoutingKv {
       value: value ?? null,
       versionstamp: version === undefined ? null : String(version).padStart(20, "0"),
     } as Deno.KvEntryMaybe<T>);
+  }
+
+  getMany<T extends readonly unknown[]>(kvKeys: readonly Deno.KvKey[]): Promise<{ [K in keyof T]: Deno.KvEntryMaybe<T[K]> }> {
+    // Snapshot every value and versionstamp synchronously so one resolved tuple
+    // cannot mix rows from different write generations.
+    const snapshot = kvKeys.map((kvKey) => {
+      const encoded = key(kvKey);
+      const value = this.values.get(encoded) as T[number] | undefined;
+      const version = this.versions.get(encoded);
+      return {
+        key: kvKey,
+        value: value ?? null,
+        versionstamp: version === undefined ? null : String(version).padStart(20, "0"),
+      } as Deno.KvEntryMaybe<T[number]>;
+    });
+    return Promise.resolve(snapshot as { [K in keyof T]: Deno.KvEntryMaybe<T[K]> });
   }
 
   set(kvKey: Deno.KvKey, value: unknown): Promise<Deno.KvCommitResult> {
@@ -2639,7 +2659,7 @@ Deno.test("an administrative recheck fences a stable reset identity until a succ
   }
 });
 
-Deno.test("fresh Spark capacity reconciles a blocked account and sends it first", async () => {
+Deno.test("fresh Spark capacity reconciles a blocked account without reordering configured accounts", async () => {
   const kv = new RoutingKv();
   setKvForTest(kv as unknown as Deno.Kv);
   resetCodexAccountRoutingForTest();
@@ -2690,8 +2710,11 @@ Deno.test("fresh Spark capacity reconciles a blocked account and sends it first"
     const selected = await selectCodexRoutingAccounts(pool, pool.accounts, now + 2, "gpt-5.3-codex-spark");
     assert.equal(selected.kind, "eligible");
 
-    assert.equal(selected.accounts[0]?.auth.account_id, "two");
-    assert.equal(selected.accounts[0]?.quotaHeadroom, 50);
+    // Configured order is the selection order; fresh capacity reopens the
+    // account without promoting it ahead of the first configured account.
+    assert.equal(selected.accounts[0]?.auth.account_id, "one");
+    const reopened = selected.accounts.find((account) => account.auth.account_id === "two");
+    assert.equal(reopened?.quotaHeadroom, 50);
     assert.equal(selected.blockedAccounts.length, 0);
 
     const state = parseCodexAccountRoutingState(kv.values.get(key(CODEX_ACCOUNT_ROUTING_KV_KEY)));
@@ -3006,8 +3029,9 @@ Deno.test("the persisted analytics snapshot reopens the matching account for its
     const selected = await selectCodexRoutingAccounts(pool, pool.accounts, now + 2, "gpt-5.3-codex-spark");
     assert.equal(selected.kind, "eligible");
 
-    assert.equal(selected.accounts[0]?.auth.account_id, "two");
-    assert.equal(selected.accounts[0]?.quotaHeadroom, 50);
+    assert.equal(selected.accounts[0]?.auth.account_id, "one");
+    const reopened = selected.accounts.find((account) => account.auth.account_id === "two");
+    assert.equal(reopened?.quotaHeadroom, 50);
     const state = parseCodexAccountRoutingState(kv.values.get(key(CODEX_ACCOUNT_ROUTING_KV_KEY)));
     assert.equal(state?.slots[1]?.quota_blocked_until_ms, null);
   } finally {
@@ -3132,8 +3156,9 @@ Deno.test("capacity reconciliation uses the requested model instead of any addit
     const spark = await selectCodexRoutingAccounts(pool, pool.accounts, now + 2, "gpt-5.3-codex-spark");
     assert.equal(spark.kind, "eligible");
 
-    assert.equal(spark.accounts[0]?.auth.account_id, "two");
-    assert.equal(spark.accounts[0]?.quotaHeadroom, 50);
+    assert.equal(spark.accounts[0]?.auth.account_id, "one");
+    const sparkTwo = spark.accounts.find((account) => account.auth.account_id === "two");
+    assert.equal(sparkTwo?.quotaHeadroom, 50);
   } finally {
     setKvForTest(null);
     resetCodexAccountRoutingForTest();
@@ -3234,6 +3259,410 @@ Deno.test("capacity observations expire old account identities from durable rout
     assert.equal(stored?.observations?.length, 1);
     assert.equal(stored.observations[0]?.snapshot_at_ms, secondAtMs);
     assert.equal(stored.observations[0]?.windows?.primary?.used_percent, 40);
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("a relative Retry-After quota answer moves the active account to the sibling", async () => {
+  const kv = new RoutingKv();
+  const originalFetch = globalThis.fetch;
+  const now = Date.now();
+  const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+  const calls: string[] = [];
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+  try {
+    globalThis.fetch = (input, init): Promise<Response> => {
+      const url = requestUrl(input);
+      if (!url.endsWith("/responses")) throw new Error(`Unexpected Codex URL: ${url}`);
+      calls.push(new Headers(init?.headers).get("ChatGPT-Account-ID") ?? "");
+      if (calls.length === 1) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": "3600" },
+          })
+        );
+      }
+      return Promise.resolve(new Response(JSON.stringify({ id: "served-by-sibling" }), { status: 200 }));
+    };
+
+    const response = await fetchCodexResponses({ model: "gpt-5-routing", input: "relative-quota" }, { retrySleep: async () => {} });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, ["one", "two"]);
+    assert.equal(((await response.json()) as { id?: string }).id, "served-by-sibling");
+  } finally {
+    globalThis.fetch = originalFetch;
+    setKvForTest(null);
+    resetCodexAuthCacheForTest();
+  }
+});
+
+Deno.test("a generic 429 retries the same account and never switches siblings", async () => {
+  const kv = new RoutingKv();
+  const originalFetch = globalThis.fetch;
+  const now = Date.now();
+  const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+  const calls: string[] = [];
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+  try {
+    globalThis.fetch = (input, init): Promise<Response> => {
+      const url = requestUrl(input);
+      if (!url.endsWith("/responses")) throw new Error(`Unexpected Codex URL: ${url}`);
+      calls.push(new Headers(init?.headers).get("ChatGPT-Account-ID") ?? "");
+      if (calls.length === 1) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: { type: "rate_limit_error", code: "codex_rate_limited" } }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": "1" },
+          })
+        );
+      }
+      return Promise.resolve(new Response(JSON.stringify({ id: "same-account-retry" }), { status: 200 }));
+    };
+
+    const response = await fetchCodexResponses({ model: "gpt-5-routing", input: "generic-429" }, { retrySleep: async () => {} });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, ["one", "one"]);
+    await response.arrayBuffer();
+  } finally {
+    globalThis.fetch = originalFetch;
+    setKvForTest(null);
+    resetCodexAuthCacheForTest();
+  }
+});
+
+Deno.test("a mixed quota and invalid-credential cohort cannot open paid fallback", async () => {
+  const kv = new RoutingKv();
+  const originalFetch = globalThis.fetch;
+  const now = Date.now();
+  const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+  let dispatches = 0;
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+  try {
+    globalThis.fetch = (): Promise<Response> => {
+      dispatches += 1;
+      return Promise.resolve(new Response(null, { status: 200 }));
+    };
+    const initial = await selectCodexRoutingAccounts(pool, pool.accounts, now);
+    assert.equal(initial.kind, "eligible");
+    await markCodexQuotaBlocked(initial.accounts[0], httpDateQuotaResponse(now + 60_000), now);
+    await markCodexCredentialInvalid(initial.accounts[1]);
+    resetCodexAccountRoutingForTest();
+
+    const response = await fetchCodexResponses({ model: "gpt-5-routing", input: "mixed-cohort" }, { retrySleep: async () => {} });
+    assert.equal(response.status, 429);
+    assert.equal(getCodexRoutingError(response), null);
+    assert.equal(dispatches, 0);
+    await response.arrayBuffer();
+  } finally {
+    globalThis.fetch = originalFetch;
+    setKvForTest(null);
+    resetCodexAuthCacheForTest();
+  }
+});
+
+Deno.test("a genuinely all-exhausted relative cohort preserves paid fallback eligibility", async () => {
+  const kv = new RoutingKv();
+  const originalFetch = globalThis.fetch;
+  const now = Date.now();
+  const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+  let dispatches = 0;
+  const relativeQuotaResponse = (): Response =>
+    new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
+      status: 429,
+      headers: { "Content-Type": "application/json", "Retry-After": "3600" },
+    });
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+  try {
+    globalThis.fetch = (): Promise<Response> => {
+      dispatches += 1;
+      return Promise.resolve(new Response(null, { status: 200 }));
+    };
+    const initial = await selectCodexRoutingAccounts(pool, pool.accounts, now);
+    assert.equal(initial.kind, "eligible");
+    await markCodexQuotaBlocked(initial.accounts[0], relativeQuotaResponse(), now);
+    await markCodexQuotaBlocked(initial.accounts[1], relativeQuotaResponse(), now);
+    resetCodexAccountRoutingForTest();
+
+    const response = await fetchCodexResponses({ model: "gpt-5-routing", input: "relative-exhausted" }, { retrySleep: async () => {} });
+    assert.equal(response.status, 429);
+    assert.equal(getCodexRoutingError(response), "codex_quota_blocked");
+    assert.equal(dispatches, 0);
+    await response.arrayBuffer();
+  } finally {
+    globalThis.fetch = originalFetch;
+    setKvForTest(null);
+    resetCodexAuthCacheForTest();
+  }
+});
+
+Deno.test("a held recovery lease alone cannot open paid fallback", async () => {
+  const kv = new RoutingKv();
+  const originalFetch = globalThis.fetch;
+  const now = Date.now();
+  const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+  let dispatches = 0;
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+  try {
+    globalThis.fetch = (): Promise<Response> => {
+      dispatches += 1;
+      return Promise.resolve(new Response(null, { status: 200 }));
+    };
+    const initial = await selectCodexRoutingAccounts(pool, pool.accounts, now);
+    assert.equal(initial.kind, "eligible");
+    await markCodexQuotaBlocked(initial.accounts[0], httpDateQuotaResponse(now + 60_000), now);
+    await markCodexQuotaBlocked(initial.accounts[1], httpDateQuotaResponse(now - 1_000), now - 10_000);
+    resetCodexAccountRoutingForTest();
+    const expired = await selectCodexRoutingAccounts(pool, pool.accounts, now);
+    assert.equal(expired.kind, "eligible");
+    const probeAccount = expired.accounts.find((account) => account.auth.account_id === "two");
+    assert.ok(probeAccount);
+    assert.equal(probeAccount.probeRequired, true);
+    assert.ok(await claimCodexRoutingProbe(pool, probeAccount));
+    resetCodexAccountRoutingForTest();
+
+    const response = await fetchCodexResponses({ model: "gpt-5-routing", input: "lease-only" }, { retrySleep: async () => {} });
+    assert.equal(response.status, 429);
+    assert.equal(getCodexRoutingError(response), null);
+    assert.equal(dispatches, 0);
+    await response.arrayBuffer();
+  } finally {
+    globalThis.fetch = originalFetch;
+    setKvForTest(null);
+    resetCodexAuthCacheForTest();
+  }
+});
+
+Deno.test("a claimed expired-circuit probe refreshes its own admission fence exactly once", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: [{ ...singlePool.accounts[0], updated_at_ms: now }], updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    const initial = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(initial.kind, "eligible");
+    await markCodexQuotaBlocked(initial.accounts[0], httpDateQuotaResponse(now - 1_000), now - 10_000);
+    resetCodexAccountRoutingForTest();
+
+    const expired = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(expired.kind, "eligible");
+    const probeRequired = expired.accounts[0];
+    assert.equal(probeRequired.probeRequired, true);
+    const claimed = await claimCodexRoutingProbe(authPool, probeRequired);
+    assert.ok(claimed);
+    assert.equal(await refreshCodexActiveAccountAdmission(claimed), true);
+
+    const active = parseCodexActiveAccountSelection(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)));
+    const state = parseCodexAccountRoutingState(kv.values.get(key(CODEX_ACCOUNT_ROUTING_KV_KEY)));
+    assert.ok(state);
+    assert.equal(active?.generation, probeRequired.activeGeneration);
+    assert.equal(active?.routing_generation, state.slots[0]?.generation);
+    assert.ok(state.slots[0]?.probe_lease);
+
+    resetCodexAccountRoutingForTest();
+    const held = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(held.kind, "routing_unavailable");
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("same-account credential rotation refreshes admission without changing the active generation", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: [{ ...singlePool.accounts[0], updated_at_ms: now }], updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    const initial = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(initial.kind, "eligible");
+    const routed = initial.accounts[0];
+    const rotated = { ...routed.auth, access_token: "rotated-access-token", updated_at_ms: now + 1 };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, { accounts: [rotated], updated_at_ms: now + 1 });
+    const reconciled = await reconcileCodexRoutingAccount(routed, rotated);
+    assert.equal(await refreshCodexActiveAccountAdmission(reconciled), true);
+
+    const active = parseCodexActiveAccountSelection(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)));
+    const state = parseCodexAccountRoutingState(kv.values.get(key(CODEX_ACCOUNT_ROUTING_KV_KEY)));
+    assert.equal(active?.generation, routed.activeGeneration);
+    assert.equal(active?.credential_version, reconciled.credentialVersion);
+    assert.equal(active.routing_generation, state?.slots[0]?.generation);
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("a stale admission cannot dispatch after a concurrent active switch", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    const initial = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(initial.kind, "eligible");
+    const admitted = initial.accounts[0];
+    assert.equal(admitted.auth.account_id, "one");
+
+    await markCodexQuotaBlocked(admitted, httpDateQuotaResponse(now + 60_000), now);
+    const switched = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(switched.kind, "eligible");
+    assert.equal(switched.accounts[0]?.auth.account_id, "two");
+    assert.notEqual(switched.accounts[0]?.activeGeneration, admitted.activeGeneration);
+
+    assert.equal(await refreshCodexActiveAccountAdmission(admitted), false);
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("concurrent cold admission converges on one durable active generation", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    const selections = await Promise.all(Array.from({ length: 6 }, () => selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now)));
+    const eligible = selections.filter((selection) => selection.kind === "eligible");
+    assert.ok(eligible.length > 0);
+    assert.deepEqual([...new Set(eligible.map((selection) => selection.accounts[0]?.auth.account_id))], ["one"]);
+    const active = parseCodexActiveAccountSelection(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)));
+    assert.equal(active?.generation, 1);
+    assert.equal(active.slot, 0);
+
+    // Simultaneous authoritative exhaustion of the bootstrapped account
+    // converges on exactly one transition to the next configured account.
+    const admitted = eligible[0]?.accounts[0];
+    assert.ok(admitted);
+    await markCodexQuotaBlocked(admitted, httpDateQuotaResponse(now + 60_000), now);
+    const transitions = await Promise.all(Array.from({ length: 6 }, () => selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now)));
+    const transitioned = transitions.filter((selection) => selection.kind === "eligible");
+    assert.ok(transitioned.length > 0);
+    const transitionedAccountIds = transitioned.map((selection) => selection.accounts[0]?.auth.account_id);
+    assert.deepEqual([...new Set(transitionedAccountIds)], ["two"]);
+    const moved = parseCodexActiveAccountSelection(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)));
+    assert.equal(moved?.generation, 2, "concurrent exhaustion must not mint a second transition");
+    assert.equal(moved.slot, 1);
+    assert.equal(moved.transition_reason, "quota_exhausted");
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("the durable active account follows authoritative transitions without late rollback", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    const activeRow = (): ReturnType<typeof parseCodexActiveAccountSelection> =>
+      parseCodexActiveAccountSelection(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)));
+    const strong = (at: number) => selectCodexRoutingAccountsStrong(authPool, authPool.accounts, at);
+
+    const first = await strong(now);
+    assert.equal(first.kind, "eligible");
+    assert.equal(first.accounts[0]?.auth.account_id, "one");
+    assert.equal(activeRow()?.generation, 1);
+
+    // Authoritative exhaustion of A advances to B once.
+    await markCodexQuotaBlocked(first.accounts[0], httpDateQuotaResponse(now + 1_000), now);
+    const movedToB = await strong(now + 1);
+    assert.equal(movedToB.kind, "eligible");
+    assert.equal(movedToB.accounts[0]?.auth.account_id, "two");
+    assert.equal(activeRow()?.generation, 2);
+    const generationB = activeRow()?.generation ?? 0;
+
+    // A's window elapses, but its recovery cannot steal the active account.
+    const stillB = await strong(now + 2_000);
+    assert.equal(stillB.kind, "eligible");
+    assert.equal(stillB.accounts[0]?.auth.account_id, "two");
+    assert.equal(activeRow()?.generation, generationB);
+
+    // B exhaustion then selects the recovered A with a new generation. A's own
+    // window has already elapsed, so the authoritative B block is the only
+    // transition trigger.
+    await markCodexQuotaBlocked(movedToB.accounts[0], httpDateQuotaResponse(now + 10_000), now + 2_000);
+    const backToA = await strong(now + 3_001);
+    assert.equal(backToA.kind, "eligible");
+    assert.equal(backToA.accounts[0]?.auth.account_id, "one");
+    assert.equal(activeRow()?.generation, generationB + 1);
+
+    // A late completion admitted under B's generation can never be re-admitted.
+    assert.equal(await refreshCodexActiveAccountAdmission({ ...movedToB.accounts[0], activeGeneration: generationB }), false);
+
+    // A pool reorder keeps the active opaque identity and refreshes its slot.
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, { accounts: [authPool.accounts[1], authPool.accounts[0]], updated_at_ms: now + 4_000 });
+    const reordered = await strong(now + 4_000);
+    assert.equal(reordered.kind, "eligible");
+    assert.equal(reordered.accounts[0]?.auth.account_id, "one");
+    assert.equal(activeRow()?.slot, 1);
+    assert.equal(activeRow()?.generation, generationB + 1);
+
+    // Replacing the active account switches identity instead of inheriting it.
+    const hashBeforeReplacement = activeRow()?.account_id_hash;
+    const replacement = { ...authPool.accounts[0], account_id: "account-three", access_token: "access-three", refresh_token: "refresh-three" };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, { accounts: [replacement, authPool.accounts[1]], updated_at_ms: now + 5_000 });
+    const replaced = await strong(now + 5_000);
+    assert.equal(replaced.kind, "eligible");
+    assert.equal(replaced.accounts[0]?.auth.account_id, "account-three");
+    assert.equal(activeRow()?.generation, generationB + 2);
+    assert.equal(activeRow()?.slot, 0);
+    assert.notEqual(activeRow()?.account_id_hash, hashBeforeReplacement);
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("malformed durable active state fails retryably and preserves the record", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    const bootstrapped = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(bootstrapped.kind, "eligible");
+
+    const malformed = { v: 1, account_id_hash: "not-an-opaque-hash" };
+    await kv.set(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, malformed);
+    const failed = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(failed.kind, "routing_unavailable");
+    assert.deepEqual(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)), malformed, "a malformed record is never deleted");
+
+    // A validly missing row is the one bootstrap case.
+    kv.values.delete(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY));
+    resetCodexAccountRoutingForTest();
+    const rebootstrapped = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(rebootstrapped.kind, "eligible");
+    const active = parseCodexActiveAccountSelection(kv.values.get(key(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)));
+    assert.equal(active?.generation, 1);
+    assert.equal(active.slot, 0);
   } finally {
     setKvForTest(null);
     resetCodexAccountRoutingForTest();
