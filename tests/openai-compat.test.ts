@@ -151,10 +151,10 @@ const { resetRuntimeConfigCacheForTest } = await import("../src/runtime_config.t
 const { DEBUG_ROUTING_KEY, resetDebugRoutingCacheForTest } = await import("../src/debug_routing.ts");
 const { setRemovedProviderApiKeyForTest, setRemovedProviderTestAdapterForTest } = await import("../src/removed_provider.ts");
 const { CODEX_AUTH_REAUTH_MESSAGE, CODEX_AUTH_REAUTH_WARNING, resetCodexAuthCacheForTest } = await import("../src/codex.ts");
-const { deriveCodexAccountAffinityIdentity, recordCodexAccountAffinity } = await import("../src/codex_account_affinity.ts");
 const { attemptCodexBankedReset } = await import("../src/codex_banked_reset.ts");
 const {
   CODEX_ACCOUNT_ROUTING_KV_KEY,
+  CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
   getCodexQuotaBlockFence,
   isCodexQuotaBlockFenceCurrent,
   markCodexQuotaBlocked,
@@ -496,20 +496,27 @@ const createVerifiedBankedResetFixture = async (): Promise<readonly string[]> =>
   const selection = await selectCodexRoutingAccounts(authPool, authPool.accounts, now, DEFAULT_TEST_MODEL);
   if (selection.kind !== "eligible") throw new Error(`Expected an eligible fixture account, got ${selection.kind}.`);
   const routing = selection.accounts[0];
-  const blocked = await markCodexQuotaBlocked(
-    routing,
-    new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
-      status: 429,
-      headers: { "Content-Type": "application/json", "Retry-After": new Date(now + 60_000).toUTCString() },
-    }),
-    now
-  );
-  if (!blocked.usageLimitReached || blocked.retryAtMs === null) {
-    throw new Error("Expected a durable usage-limit quota fence.");
+  // A banked reset requires the complete cohort to be authoritatively
+  // exhausted, so every configured account receives the stable quota fence.
+  let blockedResetAtMs: number | null = null;
+  for (const account of selection.accounts) {
+    const blocked = await markCodexQuotaBlocked(
+      account,
+      new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": new Date(now + 60_000).toUTCString() },
+      }),
+      now
+    );
+    if (!blocked.usageLimitReached || blocked.retryAtMs === null) {
+      throw new Error("Expected a durable usage-limit quota fence.");
+    }
+    blockedResetAtMs ??= blocked.retryAtMs;
   }
-  const routingGeneration = await getCodexQuotaBlockFence(routing, blocked.retryAtMs);
+  if (blockedResetAtMs === null) throw new Error("Expected at least one blocked account.");
+  const routingGeneration = await getCodexQuotaBlockFence(routing, blockedResetAtMs);
   if (routingGeneration === null) throw new Error("Expected the durable quota fence to be readable.");
-  const quotaResetAtMs = blocked.retryAtMs;
+  const quotaResetAtMs = blockedResetAtMs;
 
   const calls: string[] = [];
   const provider: CodexUsageResetProvider = {
@@ -545,7 +552,7 @@ const createVerifiedBankedResetFixture = async (): Promise<readonly string[]> =>
     {
       accountId: routing.auth.account_id,
       credentialVersion: routing.credentialVersion,
-      quotaResetAtMs: blocked.retryAtMs,
+      quotaResetAtMs: blockedResetAtMs,
       routingGeneration,
       fences: [
         {
@@ -580,20 +587,27 @@ const createUnknownBankedResetFixture = async (): Promise<readonly string[]> => 
   const selection = await selectCodexRoutingAccounts(authPool, authPool.accounts, now, DEFAULT_TEST_MODEL);
   if (selection.kind !== "eligible") throw new Error(`Expected an eligible fixture account, got ${selection.kind}.`);
   const routing = selection.accounts[0];
-  const blocked = await markCodexQuotaBlocked(
-    routing,
-    new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
-      status: 429,
-      headers: { "Content-Type": "application/json", "Retry-After": new Date(now + 60_000).toUTCString() },
-    }),
-    now
-  );
-  if (!blocked.usageLimitReached || blocked.retryAtMs === null) {
-    throw new Error("Expected a durable usage-limit quota fence.");
+  // Recovery-only evaluation needs the complete cohort authoritatively
+  // exhausted; a partial cohort would be served by ordinary capacity instead.
+  let blockedResetAtMs: number | null = null;
+  for (const account of selection.accounts) {
+    const blocked = await markCodexQuotaBlocked(
+      account,
+      new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": new Date(now + 60_000).toUTCString() },
+      }),
+      now
+    );
+    if (!blocked.usageLimitReached || blocked.retryAtMs === null) {
+      throw new Error("Expected a durable usage-limit quota fence.");
+    }
+    blockedResetAtMs ??= blocked.retryAtMs;
   }
-  const routingGeneration = await getCodexQuotaBlockFence(routing, blocked.retryAtMs);
+  if (blockedResetAtMs === null) throw new Error("Expected at least one blocked account.");
+  const routingGeneration = await getCodexQuotaBlockFence(routing, blockedResetAtMs);
   if (routingGeneration === null) throw new Error("Expected the durable quota fence to be readable.");
-  const quotaResetAtMs = blocked.retryAtMs;
+  const quotaResetAtMs = blockedResetAtMs;
 
   const calls: string[] = [];
   const provider: CodexUsageResetProvider = {
@@ -629,7 +643,7 @@ const createUnknownBankedResetFixture = async (): Promise<readonly string[]> => 
     {
       accountId: routing.auth.account_id,
       credentialVersion: routing.credentialVersion,
-      quotaResetAtMs: blocked.retryAtMs,
+      quotaResetAtMs: blockedResetAtMs,
       routingGeneration,
       fences: [
         {
@@ -1647,7 +1661,10 @@ Deno.test("openai: an expired access token makes a quota-shaped 403 actionable",
     );
 
     const payload = (await response.json()) as { error?: { message?: string } };
-    assert.equal(response.status, 403);
+    // The expired credential is authoritatively invalidated, so the request
+    // reports the actionable re-authentication outcome instead of replaying a
+    // quota-shaped 403 that would look like provider capacity.
+    assert.equal(response.status, 503);
     assert.equal(response.headers.get("x-uos-warning"), CODEX_AUTH_REAUTH_WARNING);
     assert.ok(payload.error?.message?.includes(CODEX_AUTH_REAUTH_MESSAGE));
     assert.equal(inferenceCalls, 1);
@@ -4394,6 +4411,8 @@ Deno.test("openai: an all-blocked Codex response continues through paid Metered 
         assert.equal(response.headers.get("x-uos-codex-routing-error"), null);
         assert.equal(response.headers.get("x-uos-upstream"), "metered");
         assert.equal(meteredCalls, 1);
+        assert.equal(getResponseTelemetry(response)?.activeGeneration, null);
+        assert.equal(getResponseTelemetry(response)?.activeTransitionReason, null);
         assert.equal(kvStore.has(keyToString(["uos_ai", "paid_fallback", "v3", "request", keyId, requestId])), true);
       }
     );
@@ -4543,6 +4562,8 @@ Deno.test("openai: temporary free GLM cut uses only Surplus without paid fallbac
         assert.equal(telemetry.reasoning, routeCase.reasoningEffort);
         assert.equal(telemetry.providerRequestId, routeCase.requestId + "-provider");
         assert.deepEqual(telemetry.attemptedProviders, ["surplus"]);
+        assert.equal(telemetry.activeGeneration, null);
+        assert.equal(telemetry.activeTransitionReason, null);
         assert.equal(telemetry.firstCodexDispatchMs, null);
         assert.equal(telemetry.firstCodexHeadersMs, null);
         assert.equal(typeof telemetry.firstProviderDispatchMs, "number");
@@ -5957,11 +5978,22 @@ Deno.test("openai: Metered paid fallback routing matrix", async (t) => {
 
       for (const testCase of cases) {
         seedPaidFallbackKey(testCase.id, testCase.options);
-        let calls = 0;
+        // The primary 429 may still trigger a paid MODEL CATALOG lookup, so
+        // count Codex inference and paid inference separately instead of
+        // counting every fetch.
+        const codexResponsesUrl = "https://chatgpt.com/backend-api/codex/responses";
+        const recognizedCatalogUrls = ["https://api.openlux.ai/v1/models", "https://api.surplusintelligence.ai/v1/models"];
+        let codexInferenceCalls = 0;
+        const unexpectedTransports: string[] = [];
         const response = await withFetchMock(
-          () => {
-            calls += 1;
-            return authoritativeCodexQuotaResponse();
+          (url) => {
+            if (url === codexResponsesUrl) {
+              codexInferenceCalls += 1;
+              return authoritativeCodexQuotaResponse();
+            }
+            if (recognizedCatalogUrls.includes(url)) return Response.json({ data: [] });
+            unexpectedTransports.push(url);
+            return new Response(`unexpected paid or unrecognized transport ${url}`, { status: 500 });
           },
           () =>
             handleResponses(
@@ -5980,7 +6012,8 @@ Deno.test("openai: Metered paid fallback routing matrix", async (t) => {
             )
         );
         assert.equal(response.status, 429, testCase.id);
-        assert.equal(calls, 1);
+        assert.equal(codexInferenceCalls, 1, `${testCase.id}: exactly one Codex inference`);
+        assert.deepEqual(unexpectedTransports, [], `${testCase.id}: no paid inference or unrecognized transport`);
         assert.deepEqual(await response.json(), {
           error: {
             message: "Primary limited",
@@ -7539,18 +7572,29 @@ Deno.test("openai: Metered paid fallback routing matrix", async (t) => {
                 kvStore.set(authPoolKey, pool);
                 resetCodexAuthCacheForTest();
                 const credentialVersion = await sha256Hex(`${accountId}\u0000${account.access_token}\u0000${account.refresh_token}`);
+                const accountIdHash = await sha256Hex(`uos_ai\u0000codex_routing_account\u0000${accountId}`);
                 kvStore.set(routingKey, {
                   v: 2,
                   updated_at_ms: Date.now(),
+                  banked_reset_legacy_identity_unresolved: false,
                   slots: [
                     {
+                      account_id_hash: accountIdHash,
                       credential_version: credentialVersion,
                       quota_blocked_until_ms: Date.now() - 1,
                       quota_block_source: "header_retry_after",
+                      quota_blocked_classes: [],
+                      quota_blocks_by_class: {},
                       invalid_credential_version: null,
                       primary_used_percent: null,
                       secondary_used_percent: null,
+                      quota_signal_observed_at_ms: null,
+                      capacity_observed_at_ms: null,
+                      upstream_timeout_blocked_until_ms: null,
                       observed_reset_at_ms: Date.now() - 1,
+                      observed_reset_at_is_stable: false,
+                      banked_reset_generation_ambiguous: false,
+                      banked_reset_recovery_probe_pending: false,
                       generation: 1,
                       probe_lease: null,
                     },
@@ -10219,9 +10263,10 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
     const analyticsNow = 1_800_000_000_000;
     const authKey = keyToString(["ubq_ai", "codex_auth"]);
     const routingKey = keyToString(CODEX_ACCOUNT_ROUTING_KV_KEY);
+    const activeKey = keyToString(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY);
     const previousAuth = kvStore.get(authKey);
     const previousRouting = kvStore.get(routingKey);
-    const affinityKeys: string[] = [];
+    const previousActive = kvStore.get(activeKey);
     const now = Date.now();
     const accessToken = (label: string): string =>
       `${encodeJsonBase64Url({ alg: "none" })}.${encodeJsonBase64Url({ exp: Math.floor((now + 60 * 60_000) / 1_000) })}.${label}`;
@@ -10237,7 +10282,6 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
       account_id: "affinity-account-two",
       updated_at_ms: now,
     };
-    const preferredAccountHash = await sha256Hex(`uos_ai\u0000codex_routing_account\u0000${accountOne.account_id}`);
     const analyticsUsage = {
       input_tokens: 2048,
       input_tokens_details: { cached_tokens: 1024, cache_write_tokens: 512 },
@@ -10277,8 +10321,8 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
         }),
         handle: handleChatCompletions,
         expectsCacheOptionsWarning: true,
-        expectedAffinityOutcome: "preferred",
-        expectedAccountId: accountOne.account_id,
+        expectedActiveGeneration: 1,
+        expectedAccountId: accountTwo.account_id,
         expectedPromptCacheMode: "implicit",
         accounts: [accountTwo, accountOne],
       },
@@ -10295,7 +10339,7 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
         }),
         handle: handleResponses,
         expectsCacheOptionsWarning: false,
-        expectedAffinityOutcome: "remapped",
+        expectedActiveGeneration: 1,
         expectedAccountId: accountTwo.account_id,
         expectedPromptCacheMode: "unspecified",
         accounts: [accountTwo],
@@ -10306,14 +10350,13 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
       for (const [index, fixture] of requests.entries()) {
         const keyId = `affinity-analytics-${index}`;
         const principal = `api-key:${keyId}`;
-        const identity = await deriveCodexAccountAffinityIdentity(principal, "stable-analytics-key");
-        assert.ok(identity);
-        affinityKeys.push(keyToString(identity.kvKey));
         kvStore.set(authKey, { accounts: fixture.accounts, updated_at_ms: now } satisfies CodexAuthPoolState);
+        // Each principal fixture starts from a cold bootstrap so the first
+        // configured account is elected with active generation 1.
         kvStore.delete(routingKey);
+        kvStore.delete(activeKey);
         resetCodexAuthCacheForTest();
         resetCodexAccountRoutingForTest();
-        await recordCodexAccountAffinity(identity, preferredAccountHash, now);
 
         const forwarded: { body: Record<string, unknown> | null; accountId: string | null } = {
           body: null,
@@ -10342,7 +10385,8 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
         } else {
           assert.doesNotMatch(response.headers.get("x-uos-warning") ?? "", /prompt_cache_options_ignored/);
         }
-        assert.equal(getResponseTelemetry(response)?.affinityOutcome, fixture.expectedAffinityOutcome);
+        assert.equal(getResponseTelemetry(response)?.activeGeneration, fixture.expectedActiveGeneration);
+        assert.equal(getResponseTelemetry(response)?.activeTransitionReason, null);
         assert.equal(getResponseTelemetry(response)?.promptCacheKeyPresent, true);
         assert.equal(getResponseTelemetry(response)?.cachedInputTokens, 1024);
         assert.equal(getResponseTelemetry(response)?.cacheWriteInputTokens, 512);
@@ -10391,14 +10435,16 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
           }
         );
         assert.equal("affinityOutcome" in recordedAnalyticsEvent, false);
+        assert.equal("activeGeneration" in recordedAnalyticsEvent, false);
         await logged.body?.cancel();
       }
     } finally {
-      for (const affinityKey of affinityKeys) kvStore.delete(affinityKey);
       if (previousAuth === undefined) kvStore.delete(authKey);
       else kvStore.set(authKey, previousAuth);
       if (previousRouting === undefined) kvStore.delete(routingKey);
       else kvStore.set(routingKey, previousRouting);
+      if (previousActive === undefined) kvStore.delete(activeKey);
+      else kvStore.set(activeKey, previousActive);
       resetCodexAuthCacheForTest();
       resetCodexAccountRoutingForTest();
     }
@@ -10422,14 +10468,18 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
   await t.step("buffered Chat maps standard usage details", async () => {
     const response = await withFetchMock(
       () => completed(),
-      () =>
-        handleChatCompletions(
+      () => {
+        // Start from a cold active row so the single configured account
+        // bootstraps at active generation 1 for this fixture.
+        kvStore.delete(keyToString(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY));
+        return handleChatCompletions(
           new Request("https://ai.ubq.fi/v1/chat/completions", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ model: DEFAULT_TEST_MODEL, messages: [{ role: "user", content: "ping" }] }),
           })
-        )
+        );
+      }
     );
     assert.equal(response.status, 200);
     const body = (await response.json()) as { usage?: Record<string, unknown> };
@@ -10456,7 +10506,8 @@ Deno.test("openai: cache token usage reaches Chat clients and internal telemetry
       promptCacheMode: "unspecified",
       explicitBreakpointCount: 0,
       accountSlot: 1,
-      affinityOutcome: "none",
+      activeGeneration: 1,
+      activeTransitionReason: null,
       quotaUsedPercent: undefined,
       completed: true,
       semanticOutputObserved: true,

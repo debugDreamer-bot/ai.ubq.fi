@@ -18,6 +18,12 @@
 - Use this fixed inference waterfall, in cost order: eligible Codex subscription capacity first, Surplus Intelligence
   second, and OpenLux last. Advance to the next paid tier only after an authoritative quota or capacity signal; do not
   treat a transient timeout, stalled stream, network or read error, or upstream 5xx as quota exhaustion.
+- Route ordinary Codex inference through one durable global active subscription shared by every principal, key, and
+  model: bootstrap the first eligible configured account, keep it despite headroom, idle time, restarts, old per-key
+  affinities, reorder, or successful same-identity credential refresh, and move it only for authoritative
+  model-applicable quota or capacity exhaustion, a classified current-credential invalidity, or removal/replacement of
+  the account in the auth pool. Never restore a retired per-key affinity override or a capacity-balancing order, and
+  advance the provider waterfall only after a fresh strong proof that every current pool account is exhausted.
 - Production runs on `codex@vps.pavlovcik.com` in `/home/codex/repos/ubiquity/ai.ubq.fi`. Deno Deploy hosting is
   retired; do not deploy this service there.
 - Keep the service configuration in `ops/` and link its systemd files from `/etc/systemd/system/`. Keep secrets in the
