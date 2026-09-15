@@ -1318,15 +1318,28 @@ Deno.test("concurrent proactive refreshes share one OAuth exchange", async () =>
   const originalNow = Date.now;
   const originalDeployFlag = config.isDeploy;
   let refreshCalls = 0;
+  let inferenceCalls = 0;
   let releaseRefresh = (): void => {};
   const refreshGate = new Promise<void>((resolve) => {
     releaseRefresh = resolve;
   });
+  let releaseFirstRoutingRead = (): void => {};
+  const firstRoutingReadGate = new Promise<void>((resolve) => {
+    releaseFirstRoutingRead = resolve;
+  });
+  let routingReads = 0;
   Date.now = () => fixedStartMs;
   (config as { isDeploy: boolean }).isDeploy = true;
   kv.auth = pool(staleAuth("one"));
   kv.extra.clear();
   resetCodexAuthCacheForTest();
+  resetCodexAccountRoutingForTest();
+  // Hold only the first selector's routing read so every later caller queues on
+  // the admission tail; never wait for eight strong reads, which would deadlock.
+  kv.onRoutingRead = () => {
+    routingReads += 1;
+    if (routingReads === 1) return firstRoutingReadGate;
+  };
   globalThis.fetch = async (input) => {
     const url = requestUrl(input);
     if (url.includes("auth.openai.com/oauth/token")) {
@@ -1337,11 +1350,17 @@ Deno.test("concurrent proactive refreshes share one OAuth exchange", async () =>
         headers: { "Content-Type": "application/json" },
       });
     }
+    inferenceCalls += 1;
     return new Response("{}", { status: 200 });
   };
 
   try {
     const requests = Array.from({ length: 8 }, (_, index) => fetchCodexResponses({ input: `refresh-${index}` }));
+    for (let attempt = 0; attempt < 100 && routingReads === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(routingReads, 1, "only the first queued selector may reach the strong read");
+    releaseFirstRoutingRead();
     for (let attempt = 0; attempt < 100 && refreshCalls === 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
@@ -1349,12 +1368,64 @@ Deno.test("concurrent proactive refreshes share one OAuth exchange", async () =>
     releaseRefresh();
     const responses = await Promise.all(requests);
     assert.equal(refreshCalls, 1);
+    // Only non-200 responses are read, so a failure is diagnosable here without
+    // changing the test just to inspect its body.
+    const failedResponses: string[] = [];
+    for (const [index, response] of responses.entries()) {
+      if (response.status !== 200) failedResponses.push(`${index}: ${response.status} ${await response.text()}`);
+    }
     assert.deepEqual(
       responses.map((response) => response.status),
-      Array(8).fill(200)
+      Array(8).fill(200),
+      failedResponses.join("\n")
     );
+    assert.equal(inferenceCalls, 8, "every response is a distinct ordinary inference");
   } finally {
+    releaseFirstRoutingRead();
+    releaseRefresh();
+    kv.onRoutingRead = null;
     resetCodexAuthCacheForTest();
+    resetCodexAccountRoutingForTest();
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+    (config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
+  }
+});
+
+Deno.test("a failed strong selector read releases the admission queue for the next request", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const originalDeployFlag = config.isDeploy;
+  const accountIds: string[] = [];
+  Date.now = () => fixedStartMs;
+  (config as { isDeploy: boolean }).isDeploy = true;
+  kv.auth = pool(auth("one"));
+  kv.extra.clear();
+  resetCodexAuthCacheForTest();
+  resetCodexAccountRoutingForTest();
+  globalThis.fetch = (_input, init) => {
+    accountIds.push(new Headers(init?.headers).get("ChatGPT-Account-ID") ?? "missing");
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  kv.onRoutingRead = () => {
+    throw new Error("routing KV unavailable");
+  };
+
+  try {
+    const failed = await fetchCodexResponses({ input: "selector-failure" });
+    assert.equal(failed.status, 503);
+    await failed.arrayBuffer();
+
+    // The failed selector released its queue, so the next request may bootstrap.
+    kv.onRoutingRead = null;
+    const recovered = await fetchCodexResponses({ input: "selector-recovery" });
+    assert.equal(recovered.status, 200);
+    assert.deepEqual(accountIds, ["account-one"]);
+    await recovered.arrayBuffer();
+  } finally {
+    kv.onRoutingRead = null;
+    resetCodexAuthCacheForTest();
+    resetCodexAccountRoutingForTest();
     globalThis.fetch = originalFetch;
     Date.now = originalNow;
     (config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
