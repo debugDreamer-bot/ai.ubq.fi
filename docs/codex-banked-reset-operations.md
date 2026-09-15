@@ -42,27 +42,36 @@ Banked-reset selection is downstream of the durable Codex routing state:
    closed for redemption.
 3. A revised deadline, ambiguous generation, active recovery-probe lease, invalid credential, unmapped slot, stale
    fence, or unavailable KV prevents the cohort from being complete.
-4. A fresh strong routing read must account for every current auth-pool slot as either:
-   - a stable blocked account; or
-   - a healthy, non-probing sibling.
-5. Only stable blocked accounts reach inventory or redemption. Healthy siblings prove cohort completeness but are not
-   inventory-read or reset.
+4. A fresh strong routing read must prove every current auth-pool slot is authoritatively quota- or capacity-exhausted
+   under the same advertised expiry contract. A healthy, probing, unclassified, or invalid-credential account makes the
+   cohort incomplete, so no reset is spent: normal routing serves any eligible active account, and a retryable routing
+   error applies only when no ordinary account is eligible and the complete exhaustion proof is unavailable.
+5. Only stable blocked accounts reach inventory or redemption, and the inventory considers every one of them. The
+   original active-selection snapshot, the full auth pool, and the stored capacity observations are re-read and
+   compare-and-set fenced through inventory, arming, and consume.
 
-The request that first discovers a quota block still performs ordinary failover and may be served by a healthy sibling
-without any reset-provider call. On a later request, the persisted stable block is visible at initial routing; the
-blocked cohort is evaluated before ordinary healthy routing so an expiring credit can be tested.
+Ordinary eligible active capacity always wins: a request is served by the durable active subscription before any
+inventory, redemption, or recovery work, and reset recovery runs only when no ordinary configured account is eligible
+under the complete authoritative fences above. The request that first discovers a quota block still performs ordinary
+reselect/failover and may be served by a sibling without any reset-provider call; a relative `Retry-After` is
+authoritative for that ordinary transition even though it cannot mint a banked-reset fence. Because the serial active
+account is retained until an authoritative transition, the persisted blocked cohort is evaluated only when the whole
+pool is exhausted.
 
-Inventory reads have a fixed five-second deadline. Inventory failure or timeout skips reset work and leaves the healthy
-sibling available.
+Inventory reads have a fixed five-second deadline. Inventory failure or timeout skips reset work and leaves the ordinary
+retryable error in place. Malformed or unavailable durable routing state also fails retryably before dispatch; the
+gateway never guesses a sibling, deletes state, or advances the paid waterfall from an unproven cohort.
 
 The ordinary bounded `429` retry remains separate. A successful ordinary retry serves the request and never falls
-through to a reset.
+through to a reset. After an authoritative transition classification, an unchanged active account may still spend its
+one bounded short retry before inventory or redemption; any actual active switch discards that retry.
 
-After a verified reset, the original inference request is the one recovery probe against the reset account:
+After a verified reset is elected to the active selection, the original inference request is the one recovery probe
+against that account:
 
 - `2xx` returns directly and retains the normal completion probe until the response is explicitly completed.
-- Definitive `401`, `403`, or `429` may fall through once to a freshly revalidated sibling that was healthy before
-  preflight.
+- A definitive `401`, `403`, or `429` is returned; every account is exhausted, so there is no healthy sibling to fall
+  through to.
 - Any transport error or timeout may have dispatched upstream work, so it is rethrown and never replayed on a sibling.
 - Any other HTTP response is returned directly.
 
@@ -179,8 +188,9 @@ call the consume route directly. Ordinary inference traffic drives both phases:
 2. If one exact eligible credit is available, that request atomically writes one redacted decision and returns
    `live_armed`. It creates no redemption claim, reserves no daily capacity, sends no consume request, and starts no
    post-reset inference probe. Concurrent first evaluations deduplicate on the same decision and also do not consume.
-3. With a healthy sibling, the arm request continues through ordinary routing on that sibling. With every account
-   blocked, the arm request returns the ordinary quota-blocked response.
+3. The arm path runs only when every configured account is authoritatively exhausted, so the arm request returns the
+   ordinary quota-blocked response. A request that still has an eligible active subscription is served normally and
+   never reaches inventory.
 4. A later ordinary request strongly re-reads the persisted decision, repeats inventory and fence validation, and
    requires the exact selected account, credit hash, credit expiry, and episode fences to match.
 5. Only that later matching request may enter the unchanged durable claim/submission path, atomically reserve the daily
@@ -260,6 +270,6 @@ deno task test
 git diff --check
 ```
 
-The gateway tests cover partial-cohort shadow selection, persistent-live partial and all-blocked auto-arm, sequential
+The gateway tests cover complete-cohort shadow selection, persistent-live all-blocked auto-arm, sequential
 deduplication, exact decision-to-live credit matching, one terminal consume, concurrency and the daily cap, definitive
 probe fallback, transport no-replay, inventory timeout, fence and credit drift, and full-pool recovery.

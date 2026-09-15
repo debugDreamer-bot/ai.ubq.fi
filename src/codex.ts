@@ -1,28 +1,31 @@
 import { config } from "./config.ts";
 import {
   claimCodexRoutingProbe,
+  CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
   CODEX_ACCOUNT_ROUTING_KV_KEY,
-  type CodexBlockedRoutingAccount,
+  CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY,
+  type CodexActiveAccountSnapshot,
+  type CodexActiveAccountTransitionReason,
   type CodexProbeCircuit,
-  codexQuotaBlockForModel,
-  codexQuotaClassForModel,
+  electCodexResetRecoveryAccount,
   getCodexQuotaBlockFence,
+  isCodexActiveAccountSelectionCurrent,
+  isCodexActiveAccountSnapshotCurrent,
   isCodexQuotaBlockFenceCurrent,
   markCodexCredentialInvalid,
   markCodexQuotaBlocked,
   markCodexRecoveryProbeQuotaBlocked,
   markCodexSuccess,
-  parseCodexAccountRoutingState,
   reconcileCodexQuotaAfterStaleVerifiedReset,
   reconcileCodexQuotaAfterVerifiedReset,
   reconcileCodexRoutingAccount,
+  refreshCodexActiveAccountAdmission,
   releaseCodexRoutingProbe,
   resetCodexAccountRoutingForTest,
   type RouteSelection,
   type RoutingAccount,
   selectCodexRoutingAccounts,
   selectCodexRoutingAccountsStrong,
-  type StrongRouteSelection,
 } from "./codex_account_routing.ts";
 import {
   type CodexBankedResetConfig,
@@ -38,12 +41,6 @@ import {
 } from "./codex_banked_reset.ts";
 import { type CodexUsageResetProvider, createUpstreamCodexUsageResetProvider, unavailableCodexUsageResetProvider } from "./codex_banked_reset_provider.ts";
 import { type CodexModelsSnapshot, mergeCodexModelPromptCacheCapabilities, parseCodexClientVersion } from "./codex_models.ts";
-import {
-  type CodexAccountAffinityIdentity,
-  deriveCodexAccountAffinityIdentity,
-  readCodexAccountAffinity,
-  recordCodexAccountAffinity,
-} from "./codex_account_affinity.ts";
 import { getKv } from "./kv.ts";
 import { type ApiKeyProviderDispatch, ApiKeyQuotaDispatchError } from "./api_key_policy.ts";
 import { readBoundedResponseBody } from "./bounded_response_body.ts";
@@ -63,6 +60,8 @@ export const CODEX_QUOTA_BLOCKED_ERROR_CODE = "codex_quota_blocked";
 export const CODEX_UPSTREAM_DEGRADED_ERROR_CODE = "codex_upstream_degraded";
 export const CODEX_AUTH_REAUTH_WARNING = "codex_auth_reauthentication_required";
 export const CODEX_AUTH_REAUTH_MESSAGE = "The gateway's Codex auth.json needs re-authentication. Upload a fresh auth.json and retry.";
+/** Bounded one-account re-admissions after an authoritative transition signal. */
+const CODEX_ACTIVE_ADMISSION_RESEELECTION_LIMIT = 3;
 
 // Routing errors need to remain distinguishable to the gateway's fallback
 // adapter without adding gateway-only headers to OpenAI-compatible responses.
@@ -273,13 +272,14 @@ type CodexAuthAccountEntry = CodexAuthPoolEntry & {
 /** A routable account entry: `routing` is always present once a slot is selected. */
 type CodexDispatchAccountEntry = CodexAuthAccountEntry & { routing: RoutingAccount };
 
-export type CodexAccountAffinityOutcome = "none" | "preferred" | "preferred_unavailable" | "remapped";
-
-type CodexAccountAffinityDispatch = Readonly<{
-  identity: CodexAccountAffinityIdentity;
-  accountCohortHash: string;
-  priorAccountCohortHash: string | null;
-  preferredUnavailable: boolean;
+/**
+ * Safe response-local active-subscription telemetry. It is captured from the
+ * routing account that was actually admitted and never inferred later from
+ * mutable slot state. No raw account ids, keys or session metadata.
+ */
+export type CodexResponseActiveTelemetry = Readonly<{
+  activeGeneration: number | null;
+  activeTransitionReason: CodexActiveAccountTransitionReason | null;
 }>;
 
 type CodexRefreshLease = Readonly<{
@@ -295,8 +295,7 @@ const refreshesInFlight = new Map<string, Promise<CodexAuthState>>();
 const codexProbeByResponse = new WeakMap<Response, RoutingAccount>();
 const codexSlotByResponse = new WeakMap<Response, number>();
 const codexAccountIdByResponse = new WeakMap<Response, string>();
-const codexAccountAffinityDispatchByResponse = new WeakMap<Response, CodexAccountAffinityDispatch>();
-const codexAccountAffinityOutcomeByResponse = new WeakMap<Response, CodexAccountAffinityOutcome>();
+const codexActiveTelemetryByResponse = new WeakMap<Response, CodexResponseActiveTelemetry>();
 const codexTerminalOutcomeByResponse = new WeakSet<Response>();
 const codexProbeTransitionsInFlight = new Set<Promise<void>>();
 
@@ -305,20 +304,22 @@ const setCodexResponseAccountTelemetry = (response: Response, slot: number, acco
   codexAccountIdByResponse.set(response, accountId);
 };
 
-const setCodexResponseAffinityDispatch = (
-  response: Response,
-  identity: CodexAccountAffinityIdentity | null,
-  routing: RoutingAccount,
-  affinity: Readonly<{ priorAccountCohortHash: string | null; preferredUnavailable: boolean }>
-): void => {
-  if (identity === null) return;
-  codexAccountAffinityDispatchByResponse.set(response, {
-    identity,
-    accountCohortHash: routing.accountIdHash,
-    priorAccountCohortHash: affinity.priorAccountCohortHash,
-    preferredUnavailable: affinity.preferredUnavailable,
+const setCodexResponseActiveTelemetry = (response: Response, routing: RoutingAccount): void => {
+  if (routing.activeGeneration === undefined) return;
+  codexActiveTelemetryByResponse.set(response, {
+    activeGeneration: routing.activeGeneration,
+    activeTransitionReason: routing.activeTransitionReason ?? null,
   });
 };
+
+const inheritCodexResponseActiveTelemetry = (response: Response, source: Response): void => {
+  const telemetry = codexActiveTelemetryByResponse.get(source);
+  if (telemetry !== undefined) codexActiveTelemetryByResponse.set(response, telemetry);
+};
+
+/** Null fields mean the response was not admitted through a durable active decision. */
+export const getCodexResponseActiveTelemetry = (response: Response): CodexResponseActiveTelemetry =>
+  codexActiveTelemetryByResponse.get(response) ?? { activeGeneration: null, activeTransitionReason: null };
 
 const withCodexWarnings = (response: Response, warnings: readonly string[]): Response => {
   const headers = new Headers(response.headers);
@@ -346,10 +347,8 @@ const withCodexWarnings = (response: Response, warnings: readonly string[]): Res
   if (slot !== undefined) codexSlotByResponse.set(decorated, slot);
   const accountId = codexAccountIdByResponse.get(response);
   if (accountId !== undefined) codexAccountIdByResponse.set(decorated, accountId);
-  const affinityDispatch = codexAccountAffinityDispatchByResponse.get(response);
-  if (affinityDispatch) codexAccountAffinityDispatchByResponse.set(decorated, affinityDispatch);
-  const affinityOutcome = codexAccountAffinityOutcomeByResponse.get(response);
-  if (affinityOutcome) codexAccountAffinityOutcomeByResponse.set(decorated, affinityOutcome);
+  const activeTelemetry = codexActiveTelemetryByResponse.get(response);
+  if (activeTelemetry !== undefined) codexActiveTelemetryByResponse.set(decorated, activeTelemetry);
   const authWarning = codexAuthWarnings.get(response);
   if (authWarning !== undefined) codexAuthWarnings.set(decorated, authWarning);
   if (codexTerminalOutcomeByResponse.has(response)) codexTerminalOutcomeByResponse.add(decorated);
@@ -374,29 +373,6 @@ export const getCodexResponseAccountCohortId = async (response: Response): Promi
   return accountId === undefined ? null : await sha256Hex(`uos-prompt-cache-account-cohort-v1\u0000${accountId}`);
 };
 
-/** Isolate-local bounded result for terminal telemetry; it is never a response header. */
-export const getCodexResponseAffinityOutcome = (response: Response): CodexAccountAffinityOutcome =>
-  codexAccountAffinityOutcomeByResponse.get(response) ?? "none";
-
-const finalizeCodexResponseAffinity = (response: Response): Response => {
-  const dispatch = codexAccountAffinityDispatchByResponse.get(response);
-  if (!dispatch) return response;
-
-  let outcome: CodexAccountAffinityOutcome = "none";
-  if (dispatch.priorAccountCohortHash !== null) {
-    if (response.ok) {
-      outcome = dispatch.priorAccountCohortHash === dispatch.accountCohortHash ? "preferred" : "remapped";
-    } else if (dispatch.preferredUnavailable || response.status === 401 || response.status === 429) {
-      outcome = "preferred_unavailable";
-    } else if (dispatch.priorAccountCohortHash === dispatch.accountCohortHash) {
-      // A transient or 5xx response does not change the durable preference.
-      outcome = "preferred";
-    }
-  }
-  codexAccountAffinityOutcomeByResponse.set(response, outcome);
-  return response;
-};
-
 const takeCodexResponseProbe = (response: Response): RoutingAccount | null => {
   const probe = codexProbeByResponse.get(response);
   if (probe) codexProbeByResponse.delete(response);
@@ -407,14 +383,12 @@ const beginCodexResponseTerminalOutcome = (
   response: Response
 ): Readonly<{
   accountId: string | null;
-  affinityDispatch: CodexAccountAffinityDispatch | null;
   probe: RoutingAccount | null;
 }> | null => {
   if (codexTerminalOutcomeByResponse.has(response)) return null;
   codexTerminalOutcomeByResponse.add(response);
   return {
     accountId: codexAccountIdByResponse.get(response) ?? null,
-    affinityDispatch: codexAccountAffinityDispatchByResponse.get(response) ?? null,
     probe: takeCodexResponseProbe(response),
   };
 };
@@ -447,12 +421,7 @@ export const releaseCodexResponseProbe = async (response: Response): Promise<voi
 export const markCodexResponseCompleted = async (response: Response): Promise<void> => {
   const terminal = beginCodexResponseTerminalOutcome(response);
   if (!terminal) return;
-  await Promise.all([
-    terminal.probe ? completeCodexProbeTransition(markCodexSuccess(terminal.probe)) : Promise.resolve(),
-    response.ok && terminal.affinityDispatch
-      ? recordCodexAccountAffinity(terminal.affinityDispatch.identity, terminal.affinityDispatch.accountCohortHash)
-      : Promise.resolve(),
-  ]);
+  if (terminal.probe) await completeCodexProbeTransition(markCodexSuccess(terminal.probe));
   if (terminal.accountId !== null) {
     void recordCodexProviderHealth(terminal.accountId, "success", response.status, Date.now, codexProviderRequestId(response)).catch(() => {});
   }
@@ -1476,6 +1445,14 @@ class CodexBankedResetRetryFenceError extends Error {
   }
 }
 
+/** A dispatch admitted before a newer active selection must never reach transport. */
+class CodexActiveAccountFenceError extends Error {
+  constructor() {
+    super("Codex active-account admission was superseded before transport.");
+    this.name = "CodexActiveAccountFenceError";
+  }
+}
+
 const fetchCodexResponseWithAuth = async (
   auth: CodexAuthState,
   url: string,
@@ -1508,7 +1485,7 @@ const fetchCodexResponseWithAuth = async (
     });
   } catch (error) {
     if (error instanceof ApiKeyQuotaDispatchError) throw error;
-    if (error instanceof CodexBankedResetRetryFenceError) throw error;
+    if (error instanceof CodexBankedResetRetryFenceError || error instanceof CodexActiveAccountFenceError) throw error;
     const timedOut =
       deadline.signal.aborted ||
       (error instanceof Error && error.name === "TimeoutError") ||
@@ -1630,7 +1607,6 @@ const createCodexProviderDispatchCoordinator = (beforeDispatch: FetchCodexRespon
 };
 
 type PreparedCodexSubscriptionRequest = Readonly<{
-  affinityIdentity: CodexAccountAffinityIdentity | null;
   body: unknown;
   serializedBody: string;
   conversationIdentity: string;
@@ -1713,9 +1689,7 @@ const prepareCodexSubscriptionRequest = async (body: unknown, cacheScope: string
 
   const nativeSessionIdentity =
     promptCacheKey === null || cacheScope === null || cacheScope.length === 0 ? null : await deterministicCodexSessionIdentity(cacheScope, promptCacheKey);
-  const affinityIdentity = await deriveCodexAccountAffinityIdentity(cacheScope, promptCacheKey);
   return {
-    affinityIdentity,
     body: preparedBody,
     serializedBody: JSON.stringify(preparedBody),
     conversationIdentity: nativeSessionIdentity ?? crypto.randomUUID(),
@@ -1858,9 +1832,50 @@ const allCodexCredentialsInvalidResponse = (): Response =>
 
 /** A selection no configured credential can serve is answered before any dispatch setup. */
 const initialCodexSelectionResponse = (selection: RouteSelection): Response | null => {
+  if (selection.kind === "routing_unavailable") {
+    return routingErrorResponse(503, "Codex routing state is temporarily unavailable; retry the request.", "codex_auth_missing");
+  }
   if (selection.kind === "credentials_invalid") return allCodexCredentialsInvalidResponse();
   if (selection.kind === "upstream_blocked") return upstreamTimeoutCircuitResponse(selection.retryAtMs);
   return null;
+};
+
+type CodexSerialAdmissionDrivers = Readonly<{
+  runPendingShortRetry: () => Promise<Response | null>;
+  dispatchActive: () => Promise<Response | null>;
+  terminalTransportResponse: () => Promise<Response | null>;
+  hasQueuedRetry: () => boolean;
+  reselectionRequested: () => boolean;
+  advanceReselection: () => Promise<Response | null>;
+  exhaustedResponse: () => Promise<Response>;
+}>;
+
+/**
+ * The bounded one-account admission loop. Each pass runs a pending short retry,
+ * dispatches only the currently admitted global active account, and asks for a
+ * strong reselect after an authoritative exhaustion or final credential
+ * failure instead of walking a stale sibling list. Order matters: a short retry,
+ * then the active dispatch, then any terminal transport outcome, then a queued
+ * retry, then one reselection advance, and finally the exhausted response.
+ */
+const runCodexSerialAdmissionLoop = async (drivers: CodexSerialAdmissionDrivers): Promise<Response> => {
+  for (let reselections = 0; ;) {
+    const retried = await drivers.runPendingShortRetry();
+    if (retried) return retried;
+
+    const dispatched = await drivers.dispatchActive();
+    if (dispatched) return dispatched;
+
+    const terminalTransport = await drivers.terminalTransportResponse();
+    if (terminalTransport) return terminalTransport;
+
+    if (drivers.hasQueuedRetry()) continue;
+    if (!drivers.reselectionRequested() || reselections >= CODEX_ACTIVE_ADMISSION_RESEELECTION_LIMIT) break;
+    reselections += 1;
+    const advanced = await drivers.advanceReselection();
+    if (advanced) return advanced;
+  }
+  return await drivers.exhaustedResponse();
 };
 
 const fetchPreparedCodexResponses = async (
@@ -1871,31 +1886,10 @@ const fetchPreparedCodexResponses = async (
   await awaitPendingCodexProbeTransitions();
   const body = prepared.body;
   const requestedModel = requestedCodexModel(body);
-  let poolEntry = await getAuthPoolEntry();
-  let selected = await selectCodexRoutingAccounts(poolEntry.pool, poolEntry.pool.accounts, Date.now(), requestedModel);
+  let poolEntry = await getAuthPoolEntry(true, true);
+  let selected = await selectCodexRoutingAccountsStrong(poolEntry.pool, poolEntry.pool.accounts, Date.now(), requestedModel);
   const terminalSelection = initialCodexSelectionResponse(selected);
   if (terminalSelection) return terminalSelection;
-  const affinity = {
-    priorAccountCohortHash: null as string | null,
-    preferredUnavailable: false,
-  };
-  if (prepared.affinityIdentity !== null && selected.kind === "eligible") {
-    affinity.priorAccountCohortHash = await readCodexAccountAffinity(prepared.affinityIdentity);
-  }
-  const orderAffinedRoutingAccounts = (accounts: readonly RoutingAccount[]): readonly RoutingAccount[] => {
-    const preferredAccountCohortHash = affinity.priorAccountCohortHash;
-    if (preferredAccountCohortHash === null) return accounts;
-    const preferredIndex = accounts.findIndex((account) => account.accountIdHash === preferredAccountCohortHash && !account.probeRequired);
-    if (preferredIndex < 0) {
-      affinity.preferredUnavailable = true;
-      return accounts;
-    }
-    const [preferred] = accounts.slice(preferredIndex);
-    return [preferred, ...accounts.slice(0, preferredIndex), ...accounts.slice(preferredIndex + 1)];
-  };
-  if (selected.kind === "eligible") {
-    selected = { ...selected, accounts: orderAffinedRoutingAccounts(selected.accounts) };
-  }
   let accountEntries: CodexDispatchAccountEntry[] =
     selected.kind === "eligible" ? selected.accounts.map((routing) => ({ ...poolEntry, auth: routing.auth, routing })) : [];
   const url = `${config.codexBaseUrl}/responses`;
@@ -1952,12 +1946,41 @@ const fetchPreparedCodexResponses = async (
     }> | null;
   } = { candidate: null };
   const bankedResetCandidates = new Map<number, CodexBankedResetCandidate>();
-  let nonAuthoritative429Seen = false;
+  let activeReselectionRequested = false;
 
   /** The credentials and routing one attempt dispatches with; a refresh replaces both. */
   type CodexCredentialAttempt = { auth: CodexAuthState; routing: RoutingAccount };
-  type CodexAccountAttemptOutcome = Readonly<{ kind: "response"; response: Response } | { kind: "next_account" } | { kind: "stop" }>;
+  type CodexAccountAttemptOutcome =
+    | Readonly<{ kind: "response"; response: Response }>
+    | Readonly<{ kind: "next_account" }>
+    | Readonly<{ kind: "reselect_active" }>
+    | Readonly<{ kind: "stop" }>;
   type CodexRetryCandidate = NonNullable<(typeof retryState)["candidate"]>;
+
+  /**
+   * A short bounded retry captured by an authoritative quota classification.
+   * It survives the strong reselect only when the same opaque active identity
+   * and active generation are re-admitted; any real switch discards it. The
+   * holder keeps closure writes visible to control-flow analysis.
+   */
+  const preservedShortRetryState: {
+    current: Readonly<{ candidate: CodexRetryCandidate; accountIdHash: string; activeGeneration: number }> | null;
+  } = { current: null };
+
+  const requestActiveReselection = (options?: Readonly<{ preserveRetry?: boolean; routing?: RoutingAccount }>): void => {
+    activeReselectionRequested = true;
+    const candidate = retryState.candidate;
+    retryState.candidate = null;
+    const routing = options?.routing;
+    if (options?.preserveRetry === true && candidate !== null && routing !== undefined) {
+      const activeGeneration = routing.activeGeneration;
+      if (activeGeneration !== undefined && Number.isSafeInteger(activeGeneration)) {
+        preservedShortRetryState.current = { candidate, accountIdHash: routing.accountIdHash, activeGeneration };
+        return;
+      }
+    }
+    preservedShortRetryState.current = null;
+  };
 
   const noteCodexAuthFailure = (error: unknown): void => {
     authWarning ??= codexAuthWarningForError(error) ?? CODEX_AUTH_REAUTH_WARNING;
@@ -1966,6 +1989,28 @@ const fetchPreparedCodexResponses = async (
 
   const decorateAuthWarning = (response: Response): Response => (authWarning ? withCodexAuthWarning(response, authWarning) : response);
 
+  /**
+   * Paid fallback requires a fresh strong proof that every current pool
+   * account is authoritatively exhausted. A prior request-local proof is never
+   * reused: a reset, probe, credential change or pool rotation after the
+   * classification invalidates it.
+   */
+  const freshFullCohortExhaustedProof = async (): Promise<boolean> => {
+    try {
+      const currentPoolEntry = await getAuthPoolEntry(true, true);
+      const currentSelection = await selectCodexRoutingAccountsStrong(currentPoolEntry.pool, currentPoolEntry.pool.accounts, Date.now(), requestedModel);
+      return currentSelection.kind === "quota_blocked" && currentSelection.fullCohortExhausted;
+    } catch {
+      return false;
+    }
+  };
+
+  /** A freshly proven all-exhausted cohort keeps the authoritative quota marker; anything less stays retryable. */
+  const quotaBlockedOrRetryableResponse = async (retryAtMs: number | null = null): Promise<Response> =>
+    (await freshFullCohortExhaustedProof())
+      ? routingErrorResponse(429, "All configured Codex accounts are quota-blocked; retry after their next reset.", CODEX_QUOTA_BLOCKED_ERROR_CODE, retryAtMs)
+      : routingErrorResponse(429, "Codex capacity is temporarily unavailable; retry the request.", "codex_capacity_unavailable", retryAtMs);
+
   const authFailureResponse = (error: CodexError | null): Response => {
     const response = routingErrorResponse(
       401,
@@ -1973,6 +2018,31 @@ const fetchPreparedCodexResponses = async (
       error?.code === "refresh_token_reused" ? error.code : "codex_auth_invalid"
     );
     return decorateAuthWarning(response);
+  };
+
+  /**
+   * The selector linearizes every admission. Recheck the durable active,
+   * auth-pool, routing and capacity rows immediately before transport. The
+   * same-account probe claim or credential refresh this request performed
+   * refreshes only the fence fields; a concurrent active switch or pool
+   * rotation fails closed and asks for reselection.
+   */
+  const ensureActiveRoutingAdmissionCurrent = async (routing: RoutingAccount): Promise<void> => {
+    if (
+      routing.activeGeneration === undefined ||
+      !Number.isSafeInteger(routing.activeGeneration) ||
+      routing.activeGeneration < 1 ||
+      typeof routing.activePoolVersionstamp !== "string" ||
+      routing.activePoolVersionstamp.length === 0
+    ) {
+      throw new CodexActiveAccountFenceError();
+    }
+    try {
+      if (!(await refreshCodexActiveAccountAdmission(routing))) throw new CodexActiveAccountFenceError();
+    } catch (error) {
+      if (error instanceof CodexActiveAccountFenceError) throw error;
+      throw new CodexActiveAccountFenceError();
+    }
   };
 
   const refreshBankedResetCandidate = async (candidate: CodexBankedResetCandidate): Promise<CodexBankedResetCandidate | null> => {
@@ -2016,47 +2086,22 @@ const fetchPreparedCodexResponses = async (
     },
   });
 
-  type PartialBankedResetCohortFence = Readonly<{
-    authPool: CodexAuthPoolState;
-    healthyAccounts: readonly RoutingAccount[];
-    observedAtMs: number;
-  }>;
+  const activeSelectionFence = (candidate: CodexBankedResetCandidate) => ({
+    key: CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
+    isCurrent: (value: unknown): boolean =>
+      candidate.routing.activeGeneration !== undefined && isCodexActiveAccountSelectionCurrent(value, candidate.routing, candidate.routing.activeGeneration),
+  });
 
-  const partialCohortAuthIsCurrent = (value: unknown, cohort: PartialBankedResetCohortFence): boolean => {
-    const current = parseCodexAuthPool(value);
-    return (
-      current?.accounts.length === cohort.authPool.accounts.length &&
-      cohort.authPool.accounts.every((expected, slot) => {
-        const actual = current.accounts.at(slot);
-        return actual?.account_id === expected.account_id && sameCodexCredentials(actual, expected);
-      })
-    );
-  };
-
-  const partialCohortRoutingIsCurrent = (value: unknown, cohort: PartialBankedResetCohortFence): boolean => {
-    const current = parseCodexAccountRoutingState(value);
-    return (
-      current !== null &&
-      cohort.healthyAccounts.every((account) => {
-        const slot = current.slots.at(account.slot);
-        return (
-          slot?.account_id_hash === account.accountIdHash &&
-          slot.credential_version === account.credentialVersion &&
-          typeof account.routingGeneration === "number" &&
-          slot.generation === account.routingGeneration &&
-          slot.invalid_credential_version !== account.credentialVersion &&
-          (codexQuotaBlockForModel(slot, account.requestedModel)?.blocked_until_ms ?? 0) <= cohort.observedAtMs &&
-          (slot.upstream_timeout_blocked_until_ms ?? 0) <= cohort.observedAtMs &&
-          (slot.probe_lease?.circuit === "quota" &&
-          slot.probe_lease.quota_class !== undefined &&
-          slot.probe_lease.quota_class !== null &&
-          slot.probe_lease.quota_class !== codexQuotaClassForModel(account.requestedModel)
-            ? true
-            : (slot.probe_lease?.expires_at_ms ?? 0) <= cohort.observedAtMs)
-        );
-      })
-    );
-  };
+  /**
+   * Inventory, arming and consume bind to the active-selection row exactly as
+   * the strong decision observed it, including a validly absent row. The
+   * verified account is elected only after the consume, so an inactive
+   * sibling's credit can be considered without letting it take over.
+   */
+  const activeSnapshotFence = (snapshot: CodexActiveAccountSnapshot) => ({
+    key: CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
+    isCurrent: (value: unknown): boolean => isCodexActiveAccountSnapshotCurrent(value, snapshot),
+  });
 
   /**
    * This runs inside the transport's final dispatch hook, after any API-key
@@ -2072,26 +2117,62 @@ const fetchPreparedCodexResponses = async (
     }
   };
 
-  const resetFences = (candidate: CodexBankedResetCandidate, routingGeneration: number, partialCohort: PartialBankedResetCohortFence | null = null) => [
+  /**
+   * The exact full auth-pool and stored-capacity snapshots the strong
+   * quota-blocked decision observed. A positive capacity sample or any pool
+   * membership/credential/update change after preflight invalidates every
+   * pre-election reset fence, so an unnecessary consume cannot proceed.
+   */
+  type CodexResetCohortSnapshot = Readonly<{ poolJson: string; capacityJson: string }>;
+
+  const exactValueFence = (key: Deno.KvKey, expectedJson: string) => ({
+    key,
+    isCurrent: (value: unknown): boolean => JSON.stringify(value ?? null) === expectedJson,
+  });
+
+  const resetFences = (
+    candidate: CodexBankedResetCandidate,
+    routingGeneration: number,
+    originalActive: CodexActiveAccountSnapshot,
+    cohort: CodexResetCohortSnapshot
+  ) => [
     {
       key: CODEX_ACCOUNT_ROUTING_KV_KEY,
-      isCurrent: (value: unknown): boolean =>
-        isCodexQuotaBlockFenceCurrent(value, candidate.routing, candidate.quotaResetAtMs, routingGeneration) &&
-        (partialCohort === null || partialCohortRoutingIsCurrent(value, partialCohort)),
+      isCurrent: (value: unknown): boolean => isCodexQuotaBlockFenceCurrent(value, candidate.routing, candidate.quotaResetAtMs, routingGeneration),
     },
     {
       key: CODEX_AUTH_POOL_KV_KEY,
-      isCurrent: (value: unknown): boolean =>
-        authPoolFence(candidate).isCurrent(value) && (partialCohort === null || partialCohortAuthIsCurrent(value, partialCohort)),
+      isCurrent: (value: unknown): boolean => authPoolFence(candidate).isCurrent(value),
     },
+    activeSnapshotFence(originalActive),
+    exactValueFence(CODEX_AUTH_POOL_KV_KEY, cohort.poolJson),
+    exactValueFence(CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY, cohort.capacityJson),
   ];
 
-  const resetInput = (candidate: CodexBankedResetCandidate, routingGeneration: number, partialCohort: PartialBankedResetCohortFence | null = null) => ({
+  /** Post-election probe fences: the elected active row plus the candidate's auth proof. */
+  const electedResetFences = (candidate: CodexBankedResetCandidate, routingGeneration: number) => [
+    {
+      key: CODEX_ACCOUNT_ROUTING_KV_KEY,
+      isCurrent: (value: unknown): boolean => isCodexQuotaBlockFenceCurrent(value, candidate.routing, candidate.quotaResetAtMs, routingGeneration),
+    },
+    {
+      key: CODEX_AUTH_POOL_KV_KEY,
+      isCurrent: (value: unknown): boolean => authPoolFence(candidate).isCurrent(value),
+    },
+    activeSelectionFence(candidate),
+  ];
+
+  const resetInput = (
+    candidate: CodexBankedResetCandidate,
+    routingGeneration: number,
+    originalActive: CodexActiveAccountSnapshot,
+    cohort: CodexResetCohortSnapshot
+  ) => ({
     accountId: candidate.auth.account_id,
     credentialVersion: candidate.routing.credentialVersion,
     quotaResetAtMs: candidate.quotaResetAtMs,
     routingGeneration,
-    fences: resetFences(candidate, routingGeneration, partialCohort),
+    fences: resetFences(candidate, routingGeneration, originalActive, cohort),
     requestId: options.requestId ?? null,
     signal: options.signal,
   });
@@ -2180,111 +2261,55 @@ const fetchPreparedCodexResponses = async (
   type EvaluatedBlockedReset = Readonly<{
     candidate: CodexBankedResetCandidate;
     reset: Awaited<ReturnType<typeof reconcileCodexBankedReset>>;
-    recoveryProbe: RoutingAccount | null;
+    /** A verified record that predates the current routing generation. */
+    staleVerified: boolean;
+    /** The active-selection row observed before this reset transaction began. */
+    originalActive: CodexActiveAccountSnapshot;
   }>;
 
   type PreexistingBankedReset = Readonly<{ kind: "evaluated"; evaluated: EvaluatedBlockedReset } | { kind: "none" } | { kind: "blocked" }>;
 
-  /** Blocked accounts are only reported for the two routing kinds that qualify a cohort. */
-  const blockedRoutingAccounts = (routedPool: Awaited<ReturnType<typeof selectCodexRoutingAccountsStrong>>): readonly CodexBlockedRoutingAccount[] =>
-    routedPool.kind === "eligible" || routedPool.kind === "quota_blocked" ? routedPool.blockedAccounts : [];
-
-  /** The ordinary all-blocked path requires every configured account to be quota-blocked. */
-  const fullPoolCohortIsComplete = (routedPool: Awaited<ReturnType<typeof selectCodexRoutingAccountsStrong>>, pool: CodexAuthPoolState): boolean =>
-    routedPool.kind === "quota_blocked" && routedPool.blockedAccounts.length === pool.accounts.length;
-
-  /**
-   * The expiring-credit canary may instead evaluate a complete cohort made of
-   * stable blocked accounts plus healthy, non-probing siblings. Every configured
-   * slot must be covered exactly once; only the blocked cohort can reach
-   * inventory or redemption.
-   */
-  const partialCohortFence = (
-    routedPool: Awaited<ReturnType<typeof selectCodexRoutingAccountsStrong>>,
-    pool: CodexAuthPoolState,
-    blockedAccounts: readonly CodexBlockedRoutingAccount[]
-  ): PartialBankedResetCohortFence | null => {
-    const eligibleAccounts = routedPool.kind === "eligible" ? routedPool.accounts : [];
-    if (routedPool.kind !== "eligible") return null;
-    if (eligibleAccounts.some((account) => account.probeRequired)) return null;
-    const coveredSlots = [...eligibleAccounts.map((account) => account.slot), ...blockedAccounts.map((account) => account.slot)];
-    if (coveredSlots.length !== pool.accounts.length) return null;
-    if (new Set(coveredSlots).size !== pool.accounts.length) return null;
-    return { authPool: pool, healthyAccounts: eligibleAccounts, observedAtMs: Date.now() };
-  };
-
-  /**
-   * The ordinary all-blocked path requires the full pool; the expiring-credit
-   * canary may instead evaluate a complete cohort of stable blocked accounts
-   * plus healthy, non-probing siblings. Any other shape is invalid.
-   */
-  const bankedResetCohort = (
-    routedPool: Awaited<ReturnType<typeof selectCodexRoutingAccountsStrong>>,
-    pool: CodexAuthPoolState,
-    blockedAccounts: readonly CodexBlockedRoutingAccount[],
-    requireFullPool: boolean
-  ): Readonly<{ kind: "cohort"; partialCohort: PartialBankedResetCohortFence | null } | { kind: "invalid" }> => {
-    if (requireFullPool) {
-      return fullPoolCohortIsComplete(routedPool, pool) ? { kind: "cohort", partialCohort: null } : { kind: "invalid" };
-    }
-    const partialCohort = partialCohortFence(routedPool, pool, blockedAccounts);
-    return partialCohort ? { kind: "cohort", partialCohort } : { kind: "invalid" };
-  };
-
-  /** Two blocked candidates for one slot would make a cohort ambiguous. */
-  const localCandidatesCoverEveryBlockedSlot = (
-    localCandidates: readonly CodexBankedResetCandidate[],
-    blockedAccounts: readonly CodexBlockedRoutingAccount[]
-  ): boolean => new Set(localCandidates.map((candidate) => candidate.routing.slot)).size === blockedAccounts.length;
-
   /**
    * Preserve a pre-existing durable transaction before considering a new
    * shadow/live decision. A pending or rejected legacy transaction blocks a
-   * replacement spend; a verified one is returned for its single retry.
+   * replacement spend; a verified one is returned for its single retry. The
+   * recovery probe is acquired only after the verified account is elected.
    */
   const preexistingBankedReset = async (
     localCandidates: readonly CodexBankedResetCandidate[],
-    partialCohort: PartialBankedResetCohortFence | null
+    originalActive: CodexActiveAccountSnapshot,
+    cohort: CodexResetCohortSnapshot
   ): Promise<PreexistingBankedReset> => {
     for (const candidate of localCandidates) {
       const reset = await reconcileCodexBankedReset(
-        resetInput(candidate, candidate.routingGeneration, partialCohort),
+        resetInput(candidate, candidate.routingGeneration, originalActive, cohort),
         resetDependenciesForCandidate(candidate)
       );
-      if (reset.kind === "verified") return { kind: "evaluated", evaluated: { candidate, reset, recoveryProbe: null } };
+      if (reset.kind === "verified") {
+        return { kind: "evaluated", evaluated: { candidate, reset, staleVerified: false, originalActive } };
+      }
       if (reset.reason === "verified_routing_generation_stale") {
-        const recoveryProbe = await reconcileCodexQuotaAfterStaleVerifiedReset(candidate.routing, {
-          quotaResetAtMs: candidate.quotaResetAtMs,
-          routingGeneration: candidate.routingGeneration,
-          fences: [authPoolFence(candidate)],
-        });
-        if (!recoveryProbe) return { kind: "blocked" };
-        return { kind: "evaluated", evaluated: { candidate, reset, recoveryProbe } };
+        return { kind: "evaluated", evaluated: { candidate, reset, staleVerified: true, originalActive } };
       }
       if (reset.reason !== "no_existing_transaction") return { kind: "blocked" };
     }
     return { kind: "none" };
   };
 
-  /** The pooled evaluation only spends a reset for a slot this request owns. */
+  /** The pooled evaluation only spends a reset for a candidate in the proven cohort. */
   const selectedBankedResetCandidate = (
     evaluated: Awaited<ReturnType<typeof evaluateCodexBankedResetPool>>,
-    localCandidates: readonly CodexBankedResetCandidate[]
+    localCandidates: readonly CodexBankedResetCandidate[],
+    originalActive: CodexActiveAccountSnapshot
   ): EvaluatedBlockedReset | null => {
     if (!evaluated.selected || !evaluated.reset) return null;
     const selectedSlot = evaluated.selected.slot;
     const candidate = localCandidates.find((item) => item.routing.slot === selectedSlot);
-    return candidate ? { candidate, reset: evaluated.reset, recoveryProbe: null } : null;
+    return candidate ? { candidate, reset: evaluated.reset, staleVerified: false, originalActive } : null;
   };
 
-  /**
-   * Re-read the current pool before every banked-reset decision. The ordinary
-   * all-blocked path requires the full pool. The expiring-credit canary may
-   * instead evaluate a complete cohort containing stable blocked accounts plus
-   * healthy, non-probing siblings; only the blocked cohort can reach inventory
-   * or redemption.
-   */
-  const evaluateBlockedCohortBankedReset = async (requireFullPool: boolean): Promise<EvaluatedBlockedReset | null> => {
+  /** Re-read the all-exhausted pool before the one permitted banked-reset evaluation. */
+  const evaluateBlockedCohortBankedReset = async (): Promise<EvaluatedBlockedReset | null> => {
     if (probeUnavailable) return null;
     let currentPoolEntry: Awaited<ReturnType<typeof getAuthPoolEntry>>;
     try {
@@ -2296,17 +2321,24 @@ const fetchPreparedCodexResponses = async (
     if (routedPool.kind === "routing_unavailable") {
       logCodexRouting("codex_banked_reset_preflight", {
         request_id: options.requestId ?? null,
-        require_full_pool: requireFullPool ? "true" : "false",
+        require_full_pool: "true",
         outcome: "routing_unavailable",
         reason: "strong_routing_read_failed",
       });
       return null;
     }
-    const blockedAccounts = blockedRoutingAccounts(routedPool);
+    // Every current account must be authoritatively exhausted. A held recovery
+    // lease, an invalid credential, or unclassified state is not quota
+    // exhaustion and must not spend a credit.
+    if (routedPool.kind !== "quota_blocked" || !routedPool.fullCohortExhausted) return null;
+    const blockedAccounts = routedPool.blockedAccounts;
     if (!blockedAccounts.length) return null;
-    const cohort = bankedResetCohort(routedPool, currentPoolEntry.pool, blockedAccounts, requireFullPool);
-    if (cohort.kind === "invalid") return null;
-    const partialCohort = cohort.partialCohort;
+    if (routedPool.poolSnapshotJson === null || routedPool.capacitySnapshotJson === null) return null;
+    const cohort: CodexResetCohortSnapshot = { poolJson: routedPool.poolSnapshotJson, capacityJson: routedPool.capacitySnapshotJson };
+    const originalActive = routedPool.activeSnapshot;
+    // Consider every blocked account's credit inventory. The original active
+    // snapshot fences inventory, arming and consume; the selected account is
+    // elected only after its reset is verified.
     const localCandidates = blockedAccounts.map(
       (routing) =>
         ({
@@ -2317,27 +2349,26 @@ const fetchPreparedCodexResponses = async (
           routingGeneration: routing.routingGeneration,
         }) satisfies CodexBankedResetCandidate
     );
-    if (!localCandidatesCoverEveryBlockedSlot(localCandidates, blockedAccounts)) return null;
 
-    const preexisting = await preexistingBankedReset(localCandidates, partialCohort);
+    const preexisting = await preexistingBankedReset(localCandidates, originalActive, cohort);
     if (preexisting.kind === "blocked") return null;
     if (preexisting.kind === "evaluated") return preexisting.evaluated;
 
     const poolCandidates = localCandidates.map((candidate) => ({
       slot: candidate.routing.slot,
-      candidate: resetInput(candidate, candidate.routingGeneration, partialCohort),
+      candidate: resetInput(candidate, candidate.routingGeneration, originalActive, cohort),
       provider: resetDependenciesForCandidate(candidate).provider,
     }));
     const evaluated = await evaluateCodexBankedResetPool(poolCandidates, bankedResetDependencies);
     logCodexRouting("codex_banked_reset_preflight", {
       request_id: options.requestId ?? null,
-      require_full_pool: requireFullPool ? "true" : "false",
+      require_full_pool: "true",
       outcome: evaluated.kind,
       reason: evaluated.reason,
       candidate_count: poolCandidates.length,
       selected_slot: evaluated.selected === null ? null : evaluated.selected.slot + 1,
     });
-    return selectedBankedResetCandidate(evaluated, localCandidates);
+    return selectedBankedResetCandidate(evaluated, localCandidates, originalActive);
   };
 
   const fetchAttempt = async (
@@ -2345,7 +2376,8 @@ const fetchPreparedCodexResponses = async (
     auth: CodexAuthState,
     routing: RoutingAccount,
     phase: CodexAttemptPhase,
-    beforeTransport?: () => Promise<void>
+    beforeTransport?: () => Promise<void>,
+    activeAdmissionAlreadyFenced = false
   ): Promise<Response> => {
     attemptNumber += 1;
     transportState.started = false;
@@ -2356,17 +2388,28 @@ const fetchPreparedCodexResponses = async (
     };
     try {
       await providerDispatch.claim();
-      const response = await fetchCodexResponseWithAuth(auth, url, serializedBody, baseHeaders, options.signal, beforeTransport, () => {
-        providerDispatch.markTransportStarted();
-        transportState.started = true;
-        reportCodexResponseTiming(options.timing?.onDispatch);
-        upstreamAttempt.current = options.sentinelUpstreamRecorder?.startAttempt("chatgpt_codex") ?? null;
-      });
-      // Wrap before the response WeakMap account/affinity/health registration
+      const response = await fetchCodexResponseWithAuth(
+        auth,
+        url,
+        serializedBody,
+        baseHeaders,
+        options.signal,
+        async () => {
+          await beforeTransport?.();
+          if (!activeAdmissionAlreadyFenced) await ensureActiveRoutingAdmissionCurrent(routing);
+        },
+        () => {
+          providerDispatch.markTransportStarted();
+          transportState.started = true;
+          reportCodexResponseTiming(options.timing?.onDispatch);
+          upstreamAttempt.current = options.sentinelUpstreamRecorder?.startAttempt("chatgpt_codex") ?? null;
+        }
+      );
+      // Wrap before the response WeakMap account/health registration
       // so the wrapper is the canonical identity every consumer observes.
       const recordedResponse = upstreamAttempt.current ? upstreamAttempt.current.wrap(response) : response;
       setCodexResponseAccountTelemetry(recordedResponse, routing.slot + 1, auth.account_id);
-      setCodexResponseAffinityDispatch(recordedResponse, prepared.affinityIdentity, routing, affinity);
+      setCodexResponseActiveTelemetry(recordedResponse, routing);
       reportCodexResponseTiming(options.timing?.onHeaders);
       void recordCodexResponseHealth(auth.account_id, recordedResponse, auth);
       logCodexRouting("codex_attempt", {
@@ -2376,6 +2419,8 @@ const fetchPreparedCodexResponses = async (
         phase,
         status: recordedResponse.status,
         status_class: codexStatusClass(recordedResponse.status),
+        active_generation: routing.activeGeneration ?? null,
+        active_transition_reason: routing.activeTransitionReason ?? null,
       });
       return recordedResponse;
     } catch (error) {
@@ -2383,7 +2428,13 @@ const fetchPreparedCodexResponses = async (
       const signalReason = options.signal?.reason;
       const clientCancelled = options.signal?.aborted === true && !(signalReason instanceof Error && signalReason.name === "TimeoutError");
       const siblingTransportFailure = isCodexSiblingTransportFailure(error);
-      if (!(error instanceof CodexBankedResetRetryFenceError) && !(error instanceof ApiKeyQuotaDispatchError) && !siblingTransportFailure && !clientCancelled) {
+      if (
+        !(error instanceof CodexBankedResetRetryFenceError) &&
+        !(error instanceof CodexActiveAccountFenceError) &&
+        !(error instanceof ApiKeyQuotaDispatchError) &&
+        !siblingTransportFailure &&
+        !clientCancelled
+      ) {
         void recordCodexThrownHealth(accountEntry.auth.account_id, error);
       }
       logCodexRouting("codex_attempt", {
@@ -2393,6 +2444,8 @@ const fetchPreparedCodexResponses = async (
         phase,
         status: error instanceof CodexError ? error.status : null,
         status_class: error instanceof CodexBankedResetRetryFenceError ? "banked_reset_fenced" : codexErrorClass(error),
+        active_generation: routing.activeGeneration ?? null,
+        active_transition_reason: routing.activeTransitionReason ?? null,
       });
       throw error;
     }
@@ -2416,6 +2469,8 @@ const fetchPreparedCodexResponses = async (
         trigger,
         outcome: "succeeded",
         status_class: "2xx",
+        active_generation: routing.activeGeneration ?? null,
+        active_transition_reason: routing.activeTransitionReason ?? null,
       });
       return { auth: refreshed, routing: reconciled };
     } catch (error) {
@@ -2425,6 +2480,8 @@ const fetchPreparedCodexResponses = async (
         trigger,
         outcome: "failed",
         status_class: codexErrorClass(error),
+        active_generation: routing.activeGeneration ?? null,
+        active_transition_reason: routing.activeTransitionReason ?? null,
       });
       throw error;
     }
@@ -2432,14 +2489,15 @@ const fetchPreparedCodexResponses = async (
 
   const classify429 = async (accountEntry: CodexAuthAccountEntry, routing: RoutingAccount, auth: CodexAuthState, response: Response): Promise<Response> => {
     const disposition = await markCodexQuotaBlocked(routing, response);
-    const authoritativeQuotaEvidence = disposition.usageLimitReached && disposition.retryAtMs !== null && disposition.resetDeadlineIsStable;
+    // Ordinary exhaustion is a valid usage-limit classification with a known
+    // deadline, relative or absolute. A stable absolute deadline remains
+    // required only to mint a banked-reset candidate.
+    const ordinaryQuotaExhaustion = disposition.usageLimitReached && disposition.retryAtMs !== null;
     let candidateOutcome: "captured" | "ineligible" | "routing_fence_unavailable" = "ineligible";
-    if (authoritativeQuotaEvidence) {
+    if (ordinaryQuotaExhaustion) {
       candidateOutcome = await captureBankedResetCandidate(accountEntry, routing, auth, disposition);
     } else {
-      nonAuthoritative429Seen = true;
-      // A later ordinary/ambiguous 429 means this request did not establish
-      // that every failed account is genuinely quota-exhausted. Do not spend
+      // A generic 429 is not proof that the account is exhausted. Do not spend
       // a reset based on an older candidate in the same failover pass.
       bankedResetCandidates.clear();
     }
@@ -2452,6 +2510,8 @@ const fetchPreparedCodexResponses = async (
       reset_deadline_is_stable: disposition.resetDeadlineIsStable ? "true" : "false",
       reset_deadline_conflict: disposition.resetDeadlineConflict ? "true" : "false",
       candidate_outcome: candidateOutcome,
+      active_generation: routing.activeGeneration ?? null,
+      active_transition_reason: routing.activeTransitionReason ?? null,
     });
     const classifiedAtMs = Date.now();
     const retryAfterDelay = disposition.retryAtMs === null ? 0 : Math.max(0, disposition.retryAtMs - classifiedAtMs);
@@ -2475,11 +2535,22 @@ const fetchPreparedCodexResponses = async (
         retryState.candidate = candidate;
       }
     }
+    if (ordinaryQuotaExhaustion) {
+      // Authoritative exhaustion is a global transition reason. Its former
+      // short retry is preserved across the reselect only when the same active
+      // identity and generation are re-admitted.
+      requestActiveReselection({ preserveRetry: true, routing });
+    }
     return disposition.response;
   };
 
-  const authorizePaidFallbackForCompleteQuotaEvidence = (response: Response): Response => {
-    if (response.status === 429 && !nonAuthoritative429Seen && bankedResetCandidates.size > 0) {
+  /**
+   * Paid fallback requires a fresh strong full-current-cohort exhaustion proof.
+   * Captured banked-reset candidates are telemetry and redemption input only;
+   * they never authorize a paid tier.
+   */
+  const authorizePaidFallbackForCompleteQuotaEvidence = async (response: Response): Promise<Response> => {
+    if (response.status === 429 && (await freshFullCohortExhaustedProof())) {
       codexRoutingErrors.set(response, CODEX_QUOTA_BLOCKED_ERROR_CODE);
     }
     return response;
@@ -2532,11 +2603,12 @@ const fetchPreparedCodexResponses = async (
       // replayable normal 429 and never feed it back into reset selection.
       const disposition = await markCodexRecoveryProbeQuotaBlocked(retryCandidate.routing, retried);
       response = disposition.response;
-      if (!disposition.usageLimitReached || disposition.retryAtMs === null || !disposition.resetDeadlineIsStable) {
-        nonAuthoritative429Seen = true;
+      inheritCodexResponseActiveTelemetry(response, retried);
+      if (disposition.usageLimitReached && disposition.retryAtMs !== null) {
+        await captureBankedResetCandidate(retryCandidate.accountEntry, retryCandidate.routing, retryCandidate.auth, disposition);
+      } else {
         bankedResetCandidates.clear();
       }
-      setCodexResponseAffinityDispatch(response, prepared.affinityIdentity, retryCandidate.routing, affinity);
     } else if (!retried.ok) {
       await releaseCodexRoutingProbe(retryCandidate.routing);
     }
@@ -2547,21 +2619,37 @@ const fetchPreparedCodexResponses = async (
   };
 
   const runPostResetRetry = async (evaluated: EvaluatedBlockedReset, normalResponse: Response | null): Promise<Response | null> => {
-    const { candidate, reset } = evaluated;
+    const { candidate, reset, originalActive } = evaluated;
     const resetRecord = reset.record;
-    if (!resetRecord || (reset.kind !== "verified" && !evaluated.recoveryProbe)) {
+    if (!resetRecord || (reset.kind !== "verified" && !evaluated.staleVerified)) {
       return normalResponse;
     }
     await persistVerifiedCapacityReset(candidate, resetRecord);
-    const reconciled =
-      evaluated.recoveryProbe ??
-      (await reconcileCodexQuotaAfterVerifiedReset(candidate.routing, {
-        quotaResetAtMs: candidate.quotaResetAtMs,
-        routingGeneration: resetRecord.routing_generation,
-        fences: [authPoolFence(candidate)],
-      }));
+    // Elect the verified account before any recovery-probe acquisition or
+    // inference. The original active snapshot, the candidate's pool credential
+    // and quota fence, and the full-cohort exhaustion proof must all still hold.
+    const elected = await electCodexResetRecoveryAccount(candidate.routing, originalActive, candidate.quotaResetAtMs, evaluated.staleVerified);
+    if (!elected) return normalResponse;
+    const electedCandidate: CodexBankedResetCandidate = {
+      ...candidate,
+      routing: elected,
+      accountEntry: { ...candidate.accountEntry, auth: elected.auth, routing: elected },
+    };
+    const reconciled = evaluated.staleVerified
+      ? await reconcileCodexQuotaAfterStaleVerifiedReset(elected, {
+          quotaResetAtMs: candidate.quotaResetAtMs,
+          // The stale predicate proves the current circuit, not the ledger's
+          // older generation.
+          routingGeneration: candidate.routingGeneration,
+          fences: [authPoolFence(electedCandidate), activeSelectionFence(electedCandidate)],
+        })
+      : await reconcileCodexQuotaAfterVerifiedReset(elected, {
+          quotaResetAtMs: candidate.quotaResetAtMs,
+          routingGeneration: resetRecord.routing_generation,
+          fences: electedResetFences(electedCandidate, resetRecord.routing_generation),
+        });
     if (!reconciled) return normalResponse;
-    const refreshedCandidate = await refreshBankedResetCandidate(candidate);
+    const refreshedCandidate = await refreshBankedResetCandidate(electedCandidate);
     if (!refreshedCandidate) return normalResponse;
     const retryCandidate = withResetRecoveryProbe(refreshedCandidate, reconciled);
 
@@ -2574,8 +2662,13 @@ const fetchPreparedCodexResponses = async (
     });
     let retried: Response;
     try {
-      retried = await fetchAttempt(retryCandidate.accountEntry, retryCandidate.auth, retryCandidate.routing, "post_banked_reset", () =>
-        ensurePostResetRetryAuthCurrent(retryCandidate)
+      retried = await fetchAttempt(
+        retryCandidate.accountEntry,
+        retryCandidate.auth,
+        retryCandidate.routing,
+        "post_banked_reset",
+        () => ensurePostResetRetryAuthCurrent(retryCandidate),
+        true
       );
     } catch (error) {
       if (error instanceof CodexBankedResetRetryFenceError) return normalResponse;
@@ -2614,7 +2707,7 @@ const fetchPreparedCodexResponses = async (
       routing_generation: resetRecord.routing_generation,
       status: retried.status,
     });
-    return decorateAuthWarning(retried);
+    return decorateAuthWarning(await authorizePaidFallbackForCompleteQuotaEvidence(retried));
   };
 
   const redeemAndRetryOnce = async (normalResponse: Response): Promise<Response> => {
@@ -2622,113 +2715,21 @@ const fetchPreparedCodexResponses = async (
     // its recovery probe. Keep the normal quota response instead of spending
     // a reset that was inferred only from a sibling's 429.
     if (probeUnavailable) return normalResponse;
-    const evaluated = await evaluateBlockedCohortBankedReset(true);
+    const evaluated = await evaluateBlockedCohortBankedReset();
     if (!evaluated) return normalResponse;
     return (await runPostResetRetry(evaluated, normalResponse)) ?? normalResponse;
   };
 
-  const recoverBlockedReset = async (requireFullPool: boolean): Promise<Response | null> => {
-    const evaluated = await evaluateBlockedCohortBankedReset(requireFullPool);
+  const recoverBlockedReset = async (): Promise<Response | null> => {
+    const evaluated = await evaluateBlockedCohortBankedReset();
     return evaluated ? await runPostResetRetry(evaluated, null) : null;
   };
 
-  /** An all-blocked cohort still gets its one banked-reset chance before the quota block is reported. */
+  /** An all-exhausted cohort still gets its one banked-reset chance before the quota block is reported. */
   const exhaustedQuotaBlockedCohort = async (retryAtMs: number | null): Promise<Response> => {
-    const recovered = await recoverBlockedReset(true);
+    const recovered = await recoverBlockedReset();
     if (recovered) return recovered;
-    return routingErrorResponse(
-      429,
-      "All configured Codex accounts are quota-blocked; retry after their next reset.",
-      CODEX_QUOTA_BLOCKED_ERROR_CODE,
-      retryAtMs
-    );
-  };
-
-  /**
-   * Spend the expiring-credit canary once for a partially blocked cohort. A
-   * response the canary produced is either served as-is or kept as the
-   * definitive failure this request would otherwise lose.
-   */
-  const canaryForPartialCohort = async (): Promise<
-    Readonly<{ kind: "serve"; response: Response } | { kind: "definitive"; response: Response } | { kind: "none" }>
-  > => {
-    // A post-reset transport ambiguity may have dispatched upstream work, so a
-    // failure here propagates: ordinary no-replay semantics apply instead of
-    // trying a sibling.
-    const canary = await recoverBlockedReset(false);
-    if (canary?.ok) return { kind: "serve", response: canary };
-    if (!canary) return { kind: "none" };
-    if (canary.status === 401 || canary.status === 403 || canary.status === 429) return { kind: "definitive", response: canary };
-    return { kind: "serve", response: canary };
-  };
-
-  /**
-   * Classify the strong routing re-read taken after a partial-cohort canary. A
-   * definitive canary failure always wins over a less specific classification.
-   */
-  const classifyRefreshedSelection = (
-    refreshedSelection: StrongRouteSelection,
-    definitiveCanaryFailure: Response | null
-  ): Readonly<
-    | { kind: "dispatchable"; selection: Extract<RouteSelection, { kind: "eligible" }> }
-    | { kind: "respond"; response: Response }
-    | { kind: "fail"; error: CodexError }
-  > => {
-    if (refreshedSelection.kind === "routing_unavailable") {
-      if (definitiveCanaryFailure) return { kind: "respond", response: definitiveCanaryFailure };
-      return { kind: "fail", error: new CodexError("Codex routing state is unavailable after banked-reset preflight.", "codex_auth_missing", 503) };
-    }
-    if (refreshedSelection.kind === "upstream_blocked") {
-      if (definitiveCanaryFailure) return { kind: "respond", response: definitiveCanaryFailure };
-      return { kind: "respond", response: upstreamTimeoutCircuitResponse(refreshedSelection.retryAtMs) };
-    }
-    if (refreshedSelection.kind === "credentials_invalid") {
-      if (definitiveCanaryFailure) cancelResponseBody(definitiveCanaryFailure);
-      return { kind: "respond", response: allCodexCredentialsInvalidResponse() };
-    }
-    if (refreshedSelection.kind === "quota_blocked") {
-      if (definitiveCanaryFailure) cancelResponseBody(definitiveCanaryFailure);
-      // The cohort changed while the partial preflight was in flight. Do not
-      // start a second, now-all-blocked reset evaluation in the same request.
-      return {
-        kind: "respond",
-        response: routingErrorResponse(
-          429,
-          "All configured Codex accounts are quota-blocked; retry after their next reset.",
-          CODEX_QUOTA_BLOCKED_ERROR_CODE,
-          refreshedSelection.retryAtMs
-        ),
-      };
-    }
-    return { kind: "dispatchable", selection: refreshedSelection };
-  };
-
-  /**
-   * Partial-cohort preflight may await inventory, redemption, and a recovery
-   * probe. Do not dispatch ordinary fallback with the auth/routing snapshot
-   * captured before those operations: a sibling may now be blocked, rotated,
-   * invalid, reordered, or probing.
-   */
-  const revalidatePartialCohort = async (eligibleSelection: Extract<RouteSelection, { kind: "eligible" }>): Promise<Response | null> => {
-    const fallbackAccountIds = new Set(eligibleSelection.accounts.map((account) => account.auth.account_id));
-    const canary = await canaryForPartialCohort();
-    if (canary.kind === "serve") return canary.response;
-    const definitiveCanaryFailure = canary.kind === "definitive" ? canary.response : null;
-
-    poolEntry = await getAuthPoolEntry(true, true);
-    const refreshedSelection = await selectCodexRoutingAccountsStrong(poolEntry.pool, poolEntry.pool.accounts, Date.now(), requestedModel);
-    const classified = classifyRefreshedSelection(refreshedSelection, definitiveCanaryFailure);
-    if (classified.kind === "fail") throw classified.error;
-    if (classified.kind === "respond") return classified.response;
-    selected = classified.selection;
-    const refreshedFallbacks = orderAffinedRoutingAccounts(classified.selection.accounts.filter((account) => fallbackAccountIds.has(account.auth.account_id)));
-    if (!refreshedFallbacks.length) {
-      if (definitiveCanaryFailure) return definitiveCanaryFailure;
-      throw new CodexError("No originally healthy Codex fallback remains eligible after banked-reset preflight.", "codex_auth_missing", 503);
-    }
-    if (definitiveCanaryFailure) cancelResponseBody(definitiveCanaryFailure);
-    accountEntries = refreshedFallbacks.map((routing) => ({ ...poolEntry, auth: routing.auth, routing }));
-    return null;
+    return await quotaBlockedOrRetryableResponse(retryAtMs);
   };
 
   /**
@@ -2757,10 +2758,11 @@ const fetchPreparedCodexResponses = async (
     accountEntry: CodexDispatchAccountEntry,
     attempt: CodexCredentialAttempt,
     response: Response
-  ): Promise<Readonly<{ kind: "recovered"; response: Response } | { kind: "next_account" }>> => {
+  ): Promise<Readonly<{ kind: "recovered"; response: Response } | { kind: "reselect_active" }>> => {
     if (!responseIsCodexAuthFailure(attempt.auth, response)) return { kind: "recovered", response };
     if (refreshedSlots.has(attempt.routing.slot)) {
       await markCodexCredentialInvalid(attempt.routing);
+      requestActiveReselection();
       authWarning ??= CODEX_AUTH_REAUTH_WARNING;
       return { kind: "recovered", response };
     }
@@ -2772,15 +2774,17 @@ const fetchPreparedCodexResponses = async (
       const retried = await fetchAttempt(accountEntry, attempt.auth, attempt.routing, "post_refresh");
       if (responseIsCodexAuthFailure(attempt.auth, retried)) {
         await markCodexCredentialInvalid(attempt.routing);
+        requestActiveReselection();
         authWarning ??= CODEX_AUTH_REAUTH_WARNING;
       }
       return { kind: "recovered", response: retried };
     } catch (error) {
       if (error instanceof CodexError && error.status === 401) {
         await markCodexCredentialInvalid(attempt.routing);
+        requestActiveReselection();
         noteCodexAuthFailure(error);
         lastError = error;
-        return { kind: "next_account" };
+        return { kind: "reselect_active" };
       }
       throw error;
     }
@@ -2788,7 +2792,7 @@ const fetchPreparedCodexResponses = async (
 
   /**
    * Classify a completed attempt: a quota answer is recorded before the
-   * telemetry and affinity fences, an auth or quota status keeps the response
+   * telemetry fences, an auth or quota status keeps the response
    * for a possible banked reset, and a success is served.
    */
   const classifyAccountAttemptResponse = async (
@@ -2800,7 +2804,7 @@ const fetchPreparedCodexResponses = async (
     if (current.status === 429) {
       current = await classify429(accountEntry, attempt.routing, attempt.auth, current);
       setCodexResponseAccountTelemetry(current, attempt.routing.slot + 1, attempt.auth.account_id);
-      setCodexResponseAffinityDispatch(current, prepared.affinityIdentity, attempt.routing, affinity);
+      inheritCodexResponseActiveTelemetry(current, response);
     } else if (!current.ok) {
       await releaseCodexRoutingProbe(attempt.routing);
     }
@@ -2847,8 +2851,16 @@ const fetchPreparedCodexResponses = async (
     lastError = error;
     if (error instanceof CodexError && error.status === 401) {
       await markCodexCredentialInvalid(routing);
+      requestActiveReselection();
       noteCodexAuthFailure(error);
-      return { kind: "next_account" };
+      return { kind: "reselect_active" };
+    }
+    if (error instanceof CodexActiveAccountFenceError) {
+      // The admission never reached transport, so its half-open lease is
+      // released before the bounded loop re-elects the current active account.
+      await releaseCodexRoutingProbe(routing);
+      requestActiveReselection();
+      return { kind: "reselect_active" };
     }
     if (isCodexSiblingTransportFailure(error)) return await absorbSiblingTransportFailure(error, routing);
     await releaseCodexRoutingProbe(routing);
@@ -2870,19 +2882,23 @@ const fetchPreparedCodexResponses = async (
       }
       const response = await fetchAttempt(accountEntry, attempt.auth, attempt.routing, "initial");
       const recovered = await recoverCodexAuthFailure(accountEntry, attempt, response);
-      if (recovered.kind === "next_account") return { kind: "next_account" };
+      if (recovered.kind === "reselect_active") return { kind: "reselect_active" };
       return await classifyAccountAttemptResponse(accountEntry, attempt, recovered.response);
     } catch (error) {
       return await handleAccountAttemptFailure(error, attempt.routing);
     }
   };
 
-  /** Dispatch the selected accounts in order until one serves the request. */
+  /** Dispatch the one admitted active account until it serves the request. */
   const dispatchEligibleAccounts = async (): Promise<Response | null> => {
     for (const accountEntry of accountEntries) {
       const outcome = await attemptCodexAccount(accountEntry);
       if (outcome.kind === "next_account") continue;
       if (outcome.kind === "stop") break;
+      // An authoritative exhaustion or final credential failure asks the
+      // bounded admission loop to re-elect the current global active account
+      // instead of walking a stale sibling list.
+      if (outcome.kind === "reselect_active") return null;
       return outcome.response;
     }
     return null;
@@ -2913,9 +2929,7 @@ const fetchPreparedCodexResponses = async (
 
   /** An expired two-second retry window spends a banked reset instead, or reports the quota block. */
   const redeemOrReportQuotaBlocked = async (): Promise<Response> =>
-    lastResponse
-      ? await redeemAndRetryOnce(lastResponse)
-      : routingErrorResponse(429, "All configured Codex accounts are temporarily quota blocked.", CODEX_QUOTA_BLOCKED_ERROR_CODE);
+    lastResponse ? await redeemAndRetryOnce(lastResponse) : await quotaBlockedOrRetryableResponse();
 
   /**
    * A two-second retry is only worthwhile while the account is still inside its
@@ -2937,7 +2951,7 @@ const fetchPreparedCodexResponses = async (
       if (!claimed) {
         return {
           kind: "respond",
-          response: lastResponse ?? routingErrorResponse(429, "All configured Codex accounts are temporarily quota blocked.", CODEX_QUOTA_BLOCKED_ERROR_CODE),
+          response: lastResponse ?? (await quotaBlockedOrRetryableResponse()),
         };
       }
       attempt.routing = claimed;
@@ -2999,16 +3013,15 @@ const fetchPreparedCodexResponses = async (
     if (current.status === 429) {
       const disposition = await markCodexQuotaBlocked(attempt.routing, current);
       current = disposition.response;
-      if (disposition.usageLimitReached && disposition.retryAtMs !== null && disposition.resetDeadlineIsStable) {
+      if (disposition.usageLimitReached && disposition.retryAtMs !== null) {
         await captureBankedResetCandidate(candidate.accountEntry, attempt.routing, attempt.auth, disposition);
       } else {
-        nonAuthoritative429Seen = true;
-        // The ordinary bounded retry gave a non-qualifying answer. It is not
-        // evidence that a banked reset is safe to spend.
+        // The ordinary bounded retry gave a generic answer. It is not evidence
+        // that a banked reset is safe to spend.
         bankedResetCandidates.clear();
       }
       setCodexResponseAccountTelemetry(current, attempt.routing.slot + 1, attempt.auth.account_id);
-      setCodexResponseAffinityDispatch(current, prepared.affinityIdentity, attempt.routing, affinity);
+      inheritCodexResponseActiveTelemetry(current, response);
     } else if (!current.ok) {
       // A 401/403 says this retrying account cannot serve, but does not erase
       // a separately verified quota-exhaustion candidate from another slot.
@@ -3021,7 +3034,7 @@ const fetchPreparedCodexResponses = async (
     // inference request. A captured exhaustion observation from before that
     // retry is no longer a reason to spend a reset or issue another request.
     if (current.ok) return decorateAuthWarning(current);
-    return decorateAuthWarning(authorizePaidFallbackForCompleteQuotaEvidence(await redeemAndRetryOnce(current)));
+    return decorateAuthWarning(await authorizePaidFallbackForCompleteQuotaEvidence(await redeemAndRetryOnce(current)));
   };
 
   /** The one permitted ordinary two-second retry for the captured candidate. */
@@ -3033,6 +3046,8 @@ const fetchPreparedCodexResponses = async (
       request_id: options.requestId ?? null,
       slot: candidate.routing.slot + 1,
       delay_ms: ready.delayMs,
+      active_generation: candidate.routing.activeGeneration ?? null,
+      active_transition_reason: candidate.routing.activeTransitionReason ?? null,
     });
     if (lastResponse) cancelResponseBody(lastResponse);
     let response: Response;
@@ -3055,35 +3070,108 @@ const fetchPreparedCodexResponses = async (
    */
   const exhaustedCodexDispatchResponse = async (): Promise<Response> => {
     if (lastResponse) {
-      return decorateAuthWarning(authorizePaidFallbackForCompleteQuotaEvidence(await redeemAndRetryOnce(lastResponse)));
+      return decorateAuthWarning(await authorizePaidFallbackForCompleteQuotaEvidence(await redeemAndRetryOnce(lastResponse)));
     }
     if (authFailureState.error) return authFailureResponse(authFailureState.error);
     if (lastError instanceof CodexError && lastError.status === 401) return authFailureResponse(lastError);
     if (probeUnavailable) {
-      return routingErrorResponse(429, "All configured Codex accounts are temporarily quota blocked.", CODEX_QUOTA_BLOCKED_ERROR_CODE);
+      // A held recovery lease is retryable, not proof of quota exhaustion.
+      return await quotaBlockedOrRetryableResponse();
     }
     throw dispatchFailureAsError(lastError, () => new CodexError("Codex auth pool is empty.", "codex_auth_missing", 503));
   };
-
-  if (selected.kind === "eligible" && selected.blockedAccounts.length) {
-    const revalidated = await revalidatePartialCohort(selected);
-    if (revalidated) return revalidated;
-  }
 
   if (selected.kind === "quota_blocked") {
     return await exhaustedQuotaBlockedCohort(selected.retryAtMs);
   }
 
-  const dispatched = await dispatchEligibleAccounts();
-  if (dispatched) return dispatched;
+  /** A captured short bounded retry runs before any new dispatch or reset. */
+  const runPendingShortRetry = async (): Promise<Response | null> => {
+    const candidate = retryState.candidate;
+    if (candidate === null) return null;
+    retryState.candidate = null;
+    try {
+      return await runTwoSecondRetryCandidate(candidate);
+    } catch (error) {
+      if (!(error instanceof CodexActiveAccountFenceError)) throw error;
+      // A concurrent transition superseded this request's admitted account;
+      // re-admit the current global active instead of surfacing the fence.
+      requestActiveReselection();
+      return null;
+    }
+  };
 
-  const terminalTransport = await terminalTransportOutcome();
-  if (terminalTransport) return terminalTransport;
+  /** The active identity and generation the latest strong reselect observed. */
+  const reselectedActiveIdentity = (): Readonly<{ accountIdHash: string | undefined; generation: number | undefined }> | null => {
+    if (selected.kind === "eligible") {
+      const active = selected.accounts[0];
+      return { accountIdHash: active.accountIdHash, generation: active.activeGeneration };
+    }
+    if (selected.kind === "quota_blocked") {
+      const active = selected.activeSnapshot.selection;
+      return { accountIdHash: active?.account_id_hash, generation: active?.generation };
+    }
+    return null;
+  };
 
-  const retryCandidate = retryState.candidate;
-  if (retryCandidate) return await runTwoSecondRetryCandidate(retryCandidate);
+  /**
+   * Restore a preserved short retry only when the strong reselect re-admitted
+   * the same opaque active identity and generation; any real switch discards it.
+   */
+  const restorePreservedShortRetry = (): boolean => {
+    const preserved = preservedShortRetryState.current;
+    preservedShortRetryState.current = null;
+    if (preserved === null) return false;
+    const currentActive = reselectedActiveIdentity();
+    if (currentActive === null) return false;
+    if (currentActive.accountIdHash !== preserved.accountIdHash || currentActive.generation !== preserved.activeGeneration) return false;
+    // Same active opaque identity and generation: the unchanged account may
+    // still spend its one bounded retry before any reset or redemption.
+    retryState.candidate = preserved.candidate;
+    return true;
+  };
 
-  return await exhaustedCodexDispatchResponse();
+  /**
+   * One strong reselection advance: reload the pool, rebuild the single-entry
+   * admission, and return a terminal response or null to resume the loop.
+   */
+  const advanceActiveReselection = async (): Promise<Response | null> => {
+    activeReselectionRequested = false;
+    try {
+      poolEntry = await getAuthPoolEntry(true, true);
+      selected = await selectCodexRoutingAccountsStrong(poolEntry.pool, poolEntry.pool.accounts, Date.now(), requestedModel);
+    } catch {
+      return routingErrorResponse(503, "Codex routing state is temporarily unavailable; retry the request.", "codex_auth_missing");
+    }
+    if (selected.kind === "credentials_invalid" && authFailureState.error) {
+      // Preserve the request-local actionable credential error (for example a
+      // reused refresh token) instead of replacing it with the generic
+      // all-credentials-invalid response.
+      return authFailureResponse(authFailureState.error);
+    }
+    const reselectedTerminal = initialCodexSelectionResponse(selected);
+    if (reselectedTerminal) return reselectedTerminal;
+    if (restorePreservedShortRetry()) return null;
+    if (selected.kind === "quota_blocked") {
+      // A request that already holds the upstream quota answer keeps that
+      // actionable body; a cold all-blocked cohort reports the routing error.
+      if (lastResponse) return await exhaustedCodexDispatchResponse();
+      return await exhaustedQuotaBlockedCohort(selected.retryAtMs);
+    }
+    if (selected.kind !== "eligible") return await exhaustedCodexDispatchResponse();
+    accountEntries = selected.accounts.map((routing) => ({ ...poolEntry, auth: routing.auth, routing }));
+    return null;
+  };
+
+  return await runCodexSerialAdmissionLoop({
+    runPendingShortRetry,
+    dispatchActive: dispatchEligibleAccounts,
+    terminalTransportResponse: terminalTransportOutcome,
+    hasQueuedRetry: () => retryState.candidate !== null,
+    reselectionRequested: () => activeReselectionRequested,
+    advanceReselection: advanceActiveReselection,
+    exhaustedResponse: exhaustedCodexDispatchResponse,
+  });
 };
 
 export const fetchCodexResponses = async (body: unknown, options: FetchCodexResponsesOptions = {}): Promise<Response> => {
@@ -3091,7 +3179,7 @@ export const fetchCodexResponses = async (body: unknown, options: FetchCodexResp
   const providerDispatch = createCodexProviderDispatchCoordinator(options.beforeDispatch);
   try {
     const response = await fetchPreparedCodexResponses(prepared, options, providerDispatch);
-    return finalizeCodexResponseAffinity(withCodexWarnings(response, prepared.warnings));
+    return withCodexWarnings(response, prepared.warnings);
   } finally {
     await providerDispatch.cancelBeforeTransport();
   }

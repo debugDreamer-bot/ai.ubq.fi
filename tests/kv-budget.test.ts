@@ -327,7 +327,9 @@ const { DEFAULT_KERNEL_POLICY_LIMIT_KEY, DEFAULT_KERNEL_POLICY_WINDOW_KEY } = aw
 const { paidFallbackRequestV3Key } = await import("../src/paid_fallback_ledger.ts");
 const { setStreamFirstEventDeadlineMsForTest } = await import("../src/inference_deadline.ts");
 const { loadRuntimeConfig, RUNTIME_CONFIG_CACHE_TTL_MS, RUNTIME_CONFIG_V2_KEY, resetRuntimeConfigCacheForTest } = await import("../src/runtime_config.ts");
-const { resetCodexAuthCacheForTest } = await import("../src/codex.ts");
+const { CODEX_AUTH_POOL_KV_KEY, resetCodexAuthCacheForTest } = await import("../src/codex.ts");
+const { CODEX_ACCOUNT_ROUTING_KV_KEY, CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY } =
+  await import("../src/codex_account_routing.ts");
 const { fetchMeteredModels, resetMeteredModelsCacheForTest } = await import("../src/metered.ts");
 const { resetSurplusModelsCacheForTest } = await import("../src/surplus.ts");
 const { getCodexProviderHealth, resetProviderHealthThrottleForTest } = await import("../src/provider_health.ts");
@@ -999,10 +1001,18 @@ Deno.test("V3 admission reclaims expired reservations and preserves dispatch ide
 Deno.test("V3 dispatch CAS failure prevents a provider fetch and exhausted quota does not block models", async () => {
   const { token, policy } = await prepareApiKeyInference("d", "dispatch-cas", 1);
   const originalFetch = globalThis.fetch;
+  // A models request may legitimately discover paid catalogs even for a
+  // quota-exhausted key, so count inference transports separately from the
+  // recognized OpenLux/Surplus catalog lookups instead of counting every fetch.
+  const recognizedCatalogUrls = ["https://api.openlux.ai/v1/models", "https://api.surplusintelligence.ai/v1/models"];
   let fetchCalls = 0;
-  globalThis.fetch = () => {
+  let inferenceTransports = 0;
+  globalThis.fetch = (input) => {
     fetchCalls += 1;
-    return Promise.resolve(sse());
+    const url = new Request(input).url;
+    if (recognizedCatalogUrls.includes(url)) return Promise.resolve(Response.json({ data: [] }));
+    inferenceTransports += 1;
+    return Promise.resolve(new Response(`unexpected inference transport ${url}`, { status: 500 }));
   };
   try {
     // Reservation retries five conflicts, then fails closed before openai.ts
@@ -1011,6 +1021,7 @@ Deno.test("V3 dispatch CAS failure prevents a provider fetch and exhausted quota
     const unavailable = await handler(request(token));
     assert.equal(unavailable.status, 503);
     assert.equal(fetchCalls, 0);
+    assert.equal(inferenceTransports, 0);
 
     kv.failNextCommits = 0;
     kv.values.set(encodeKey(apiKeyUsageV3WindowKey(policy)), { ...makeApiKeyUsageWindowV3(policy), committed_requests: 1 });
@@ -1020,7 +1031,7 @@ Deno.test("V3 dispatch CAS failure prevents a provider fetch and exhausted quota
       })
     );
     assert.equal(models.status, 200);
-    assert.equal(fetchCalls, 0);
+    assert.equal(inferenceTransports, 0, "an exhausted quota must not dispatch an inference transport for /v1/models");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2062,12 +2073,20 @@ Deno.test("KV budget: warm kernel inference writes no ordinary usage aggregates"
     kv.resetCounts();
     assert.equal((await handleResponses(kernelRequest(), kernelContext)).status, 200);
     assert.equal(kv.writes, 0);
+    // The durable active selection, auth pool, routing state, and capacity
+    // observations must be read strongly for admission and final dispatch
+    // fencing; nothing else may be read on this warm path.
+    const allowedReadKeys = [
+      ["uos_ai", "debug_routing", "v1"],
+      ["uos_ai", "removed_provider_failover", "circuit", "v1"],
+      CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
+      CODEX_AUTH_POOL_KV_KEY,
+      CODEX_ACCOUNT_ROUTING_KV_KEY,
+      CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY,
+    ];
     assert.ok(
-      kv.readKeys.every(
-        (key) =>
-          JSON.stringify(key) === JSON.stringify(["uos_ai", "debug_routing", "v1"]) ||
-          JSON.stringify(key) === JSON.stringify(["uos_ai", "removed_provider_failover", "circuit", "v1"])
-      )
+      kv.readKeys.every((key) => allowedReadKeys.some((allowed) => JSON.stringify(key) === JSON.stringify(allowed))),
+      `unexpected warm-kernel reads: ${kv.readKeys.map((key) => JSON.stringify(key)).join(", ")}`
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -2149,7 +2168,8 @@ Deno.test("terminal inference telemetry includes resolved defaults and response 
       explicit_breakpoint_count: 0,
       account_slot: 1,
       account_cohort_id: await sha256Hex("uos-prompt-cache-account-cohort-v1\0acct-1"),
-      affinity_outcome: "none",
+      active_generation: 1,
+      active_transition_reason: null,
       provider_request_id: null,
       fallback_reason: null,
       semantic_output_observed: null,

@@ -90,6 +90,7 @@ const {
 } = await import("../src/codex_catalog.ts");
 const { resetCodexAuthCacheForTest } = await import("../src/codex.ts");
 const { handleModels } = await import("../src/openai.ts");
+const { config } = await import("../src/config.ts");
 const { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS, resetMeteredModelsCacheForTest, setMeteredModelsFetchForTest } = await import("../src/metered.ts");
 const { fetchSurplusModels, resetSurplusModelsCacheForTest, SURPLUS_MODELS_CACHE_TTL_MS } = await import("../src/surplus.ts");
 const { loadRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } = await import("../src/runtime_config.ts");
@@ -596,17 +597,38 @@ Deno.test("codex catalog: gzip chunks are bounded and integrity failures force a
   first.value = corrupted;
 
   const originalFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = () => {
-    calls += 1;
-    return Promise.resolve(new Response("unavailable", { status: 503 }));
+  // The paid catalogs are a legitimate fallback here, but the Codex refresh
+  // itself must happen exactly once. Count it separately from the recognized
+  // paid catalog lookups instead of counting every fetch.
+  const codexModelsUrl = `${config.codexBaseUrl}/models`;
+  const recognizedPaidCatalogUrls = ["https://api.openlux.ai/v1/models", "https://api.surplusintelligence.ai/v1/models"];
+  const fetchedUrls: string[] = [];
+  let codexRefreshCalls = 0;
+  resetMeteredModelsCacheForTest();
+  resetSurplusModelsCacheForTest();
+  globalThis.fetch = (input) => {
+    const url = fetchUrl(input);
+    fetchedUrls.push(url);
+    if (url.startsWith(`${codexModelsUrl}?client_version=`)) {
+      codexRefreshCalls += 1;
+      return Promise.resolve(new Response("unavailable", { status: 503 }));
+    }
+    if (recognizedPaidCatalogUrls.includes(url)) {
+      return Promise.resolve(Response.json({ data: [] }));
+    }
+    // Unrecognized URLs and inference endpoints are rejected outright.
+    return Promise.resolve(new Response(`unexpected fetch ${url}`, { status: 500 }));
   };
   try {
     const response = await handleCodexCatalogModels(request(version), version);
     assert.equal(response.status, 502);
-    assert.equal(calls, 1);
+    assert.equal(codexRefreshCalls, 1, "a corrupted cached body forces exactly one Codex catalog refresh");
+    const unexpectedUrls = fetchedUrls.filter((url) => !url.startsWith(`${codexModelsUrl}?client_version=`) && !recognizedPaidCatalogUrls.includes(url));
+    assert.deepEqual(unexpectedUrls, [], `unexpected fetches: ${fetchedUrls.join(", ")}`);
   } finally {
     globalThis.fetch = originalFetch;
+    resetMeteredModelsCacheForTest();
+    resetSurplusModelsCacheForTest();
   }
 });
 

@@ -26,7 +26,8 @@ const terminalLine = (overrides: Record<string, unknown> = {}): string =>
     prompt_cache_key_present: false,
     prompt_cache_mode: "unspecified",
     account_slot: null,
-    affinity_outcome: "none",
+    active_generation: null,
+    active_transition_reason: null,
     stream: false,
     stream_terminal_type: "response.completed",
     git_sha: "0123456789abcdef",
@@ -244,15 +245,18 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     prompt_cache_key_present: true,
     prompt_cache_mode: "explicit",
     account_slot: 1,
-    affinity_outcome: "preferred",
+    active_generation: 1,
+    active_transition_reason: null,
   });
   const preferredUnavailable = terminalLine({
     model: "gpt-preferred-unavailable-secret",
-    affinity_outcome: "preferred_unavailable",
+    active_generation: null,
+    active_transition_reason: "quota_exhausted",
   });
   const remapped = terminalLine({
     model: "gpt-remapped-secret",
-    affinity_outcome: "remapped",
+    active_generation: 2,
+    active_transition_reason: "account_removed_or_replaced",
   });
   const invalidCompleted = terminalLine({
     model: "gpt-invalid-secret",
@@ -264,7 +268,8 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     prompt_cache_key_present: false,
     prompt_cache_mode: "implicit",
     account_slot: 3,
-    affinity_outcome: "none",
+    active_generation: 3,
+    active_transition_reason: null,
   });
   const failedWithUsage = terminalLine({
     status: 502,
@@ -278,7 +283,8 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     prompt_cache_key_present: true,
     prompt_cache_mode: "explicit",
     account_slot: 2,
-    affinity_outcome: "failover",
+    active_generation: null,
+    active_transition_reason: "credential_invalid",
   });
   const failedWithoutUsage = terminalLine({
     status: 504,
@@ -293,7 +299,8 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     prompt_cache_key_present: false,
     prompt_cache_mode: "unspecified",
     account_slot: null,
-    affinity_outcome: "none",
+    active_generation: null,
+    active_transition_reason: null,
   });
   const incompleteWithUsage = terminalLine({
     route: "chat.completions",
@@ -308,7 +315,8 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     prompt_cache_key_present: false,
     prompt_cache_mode: "legacy_retention",
     account_slot: 3,
-    affinity_outcome: "shadow_only",
+    active_generation: 3,
+    active_transition_reason: "quota_exhausted",
   });
 
   const report = analyzeStage0CacheTelemetryLines([
@@ -347,13 +355,15 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     unassigned_terminal_events: 3,
     distinct_assigned_slots: 3,
   });
-  assert.deepEqual(outcomes.affinity_outcome_totals, {
-    none: 2,
-    preferred: 1,
-    preferred_unavailable: 1,
-    remapped: 1,
-    failover: 1,
-    shadow_only: 1,
+  assert.deepEqual(outcomes.active_generation_summary, {
+    assigned_terminal_events: 4,
+    unassigned_terminal_events: 3,
+  });
+  assert.deepEqual(outcomes.active_transition_reason_totals, {
+    none: 3,
+    quota_exhausted: 2,
+    credential_invalid: 1,
+    account_removed_or_replaced: 1,
   });
 
   const failedCohort = outcomes.cohorts.find((cohort) => cohort.outcome === "failed" && cohort.usage_telemetry_status_totals.missing === 1);
@@ -527,7 +537,13 @@ Deno.test("Stage 0 cache telemetry analyzer fails closed without echoing request
   assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ prompt_cache_mode: "unknown" })]), /invalid prompt_cache_mode field/);
   assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ account_slot: -1 })]), /invalid account_slot field/);
   assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ account_cohort_id: "not-a-sha256-digest" })]), /invalid account_cohort_id field/);
-  assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ affinity_outcome: "sticky" })]), /invalid affinity_outcome field/);
+  assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ active_generation: 0 })]), /invalid active_generation field/);
+  assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ active_transition_reason: "sticky" })]), /invalid active_transition_reason field/);
+  assert.throws(
+    () => analyzeStage0CacheTelemetryLines([terminalLine({ active_transition_reason: "none" })]),
+    /invalid active_transition_reason field/,
+    "string none is only the aggregate null bucket, never a wire reason"
+  );
   assert.throws(() => analyzeStage0CacheTelemetryLines([terminalLine({ stream: "true" })]), /invalid stream field/);
   assert.throws(() => analyzeStage0CacheTelemetryLines([JSON.stringify({ message: terminalLine() })]), /must use raw log text or a string body envelope/);
   assert.throws(() => analyzeStage0CacheTelemetryLines([`untrusted prefix ${terminalLine()}`]), /must begin with the canonical terminal marker/);

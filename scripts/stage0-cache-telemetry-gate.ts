@@ -33,8 +33,10 @@ const INFERENCE_PROVIDER_VALUES = ["chatgpt_codex", "metered", "surplus"] as con
 const INFERENCE_PROVIDERS = new Set(INFERENCE_PROVIDER_VALUES);
 const PROMPT_CACHE_MODE_VALUES = ["implicit", "explicit", "legacy_retention", "unspecified"] as const;
 const PROMPT_CACHE_MODES = new Set(PROMPT_CACHE_MODE_VALUES);
-const AFFINITY_OUTCOME_VALUES = ["none", "preferred", "preferred_unavailable", "remapped", "failover", "shadow_only"] as const;
-const AFFINITY_OUTCOMES = new Set(AFFINITY_OUTCOME_VALUES);
+const ACTIVE_TRANSITION_REASON_VALUES = ["quota_exhausted", "credential_invalid", "account_removed_or_replaced"] as const;
+/** `none` is only the report bucket for a null wire reason, never a wire value. */
+const ACTIVE_TRANSITION_REASON_KEYS = ["none", ...ACTIVE_TRANSITION_REASON_VALUES] as const;
+const ACTIVE_TRANSITION_REASONS = new Set(ACTIVE_TRANSITION_REASON_VALUES);
 const INFERENCE_TERMINAL_OUTCOMES = ["completed", "failed", "incomplete", "cancelled"] as const;
 const MAX_MODEL_LABEL_CHARS = 128;
 const TERMINAL_ROUTES = new Set(["responses", "chat.completions", "embeddings", "embeddings.jobs.create", "embeddings.jobs.get"] as const);
@@ -46,7 +48,7 @@ type TerminalRoute = "responses" | "chat.completions" | "embeddings" | "embeddin
 type InferenceRoute = "responses" | "chat.completions";
 type InferenceTerminalOutcome = (typeof INFERENCE_TERMINAL_OUTCOMES)[number];
 type PromptCacheMode = "implicit" | "explicit" | "legacy_retention" | "unspecified";
-type AffinityOutcome = (typeof AFFINITY_OUTCOME_VALUES)[number];
+type ActiveTransitionReason = "quota_exhausted" | "credential_invalid" | "account_removed_or_replaced" | null;
 type StreamTerminalType = "response.completed" | "response.failed" | "response.incomplete" | "error" | "eof" | "cancelled" | "deadline";
 
 type ReleaseIdentity = Readonly<{
@@ -80,7 +82,8 @@ type TerminalEvent = Readonly<{
   prompt_cache_mode: PromptCacheMode;
   account_slot: number | null;
   account_cohort_id: string | null;
-  affinity_outcome: AffinityOutcome;
+  active_generation: number | null;
+  active_transition_reason: ActiveTransitionReason;
   stream: boolean | null;
   release: ReleaseIdentity;
   inference_outcome: InferenceTerminalOutcome | null;
@@ -218,7 +221,11 @@ export type InferenceTerminalOutcomesReport = Readonly<{
     unassigned_terminal_events: number;
     distinct_assigned_slots: number;
   }>;
-  affinity_outcome_totals: Readonly<Record<AffinityOutcome, number>>;
+  active_generation_summary: Readonly<{
+    assigned_terminal_events: number;
+    unassigned_terminal_events: number;
+  }>;
+  active_transition_reason_totals: Readonly<Record<(typeof ACTIVE_TRANSITION_REASON_KEYS)[number], number>>;
   cohorts: readonly InferenceOutcomeCohortReport[];
 }>;
 
@@ -540,12 +547,22 @@ const optionalAccountCohortId = (record: Record<string, unknown>, lineNumber: nu
   return record.account_cohort_id;
 };
 
-const requireAffinityOutcome = (record: Record<string, unknown>, lineNumber: number): AffinityOutcome => {
-  const outcome = requireNonEmptyString(record, "affinity_outcome", lineNumber);
-  if (!AFFINITY_OUTCOMES.has(outcome as AffinityOutcome)) {
-    return fail(lineNumber, "terminal event has an invalid affinity_outcome field");
+const requireActiveGeneration = (record: Record<string, unknown>, lineNumber: number): number | null => {
+  if (!hasOwn(record, "active_generation")) return fail(lineNumber, "terminal event has an invalid active_generation field");
+  const value = record.active_generation;
+  if (value === null) return null;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  return fail(lineNumber, "terminal event has an invalid active_generation field");
+};
+
+const requireActiveTransitionReason = (record: Record<string, unknown>, lineNumber: number): ActiveTransitionReason => {
+  if (!hasOwn(record, "active_transition_reason")) return fail(lineNumber, "terminal event has an invalid active_transition_reason field");
+  const value = record.active_transition_reason;
+  if (value === null) return null;
+  if (typeof value === "string" && ACTIVE_TRANSITION_REASONS.has(value as (typeof ACTIVE_TRANSITION_REASON_VALUES)[number])) {
+    return value as ActiveTransitionReason;
   }
-  return outcome as AffinityOutcome;
+  return fail(lineNumber, "terminal event has an invalid active_transition_reason field");
 };
 
 const requireNullableBoolean = (record: Record<string, unknown>, key: string, lineNumber: number): boolean | null => {
@@ -655,7 +672,8 @@ const parseTerminalEvent = (line: string, lineNumber: number): TerminalEvent | n
   const promptCacheMode = requirePromptCacheMode(parsed, lineNumber);
   const accountSlot = requireAccountSlot(parsed, lineNumber);
   const accountCohortId = optionalAccountCohortId(parsed, lineNumber);
-  const affinityOutcome = requireAffinityOutcome(parsed, lineNumber);
+  const activeGeneration = requireActiveGeneration(parsed, lineNumber);
+  const activeTransitionReason = requireActiveTransitionReason(parsed, lineNumber);
   const stream = requireNullableBoolean(parsed, "stream", lineNumber);
   const release: ReleaseIdentity = {
     git_sha: requireGitSha(parsed, lineNumber),
@@ -691,7 +709,8 @@ const parseTerminalEvent = (line: string, lineNumber: number): TerminalEvent | n
     prompt_cache_mode: promptCacheMode,
     account_slot: accountSlot,
     account_cohort_id: accountCohortId,
-    affinity_outcome: affinityOutcome,
+    active_generation: activeGeneration,
+    active_transition_reason: activeTransitionReason,
     stream,
     release,
     inference_outcome: inferenceOutcome,
@@ -861,7 +880,9 @@ class Stage0CacheTelemetryAccumulator {
   #assignedAccountSlotEvents = 0;
   #unassignedAccountSlotEvents = 0;
   #assignedAccountSlots = new Set<number>();
-  #affinityOutcomeTotals = new Map<AffinityOutcome, number>();
+  #assignedActiveGenerationEvents = 0;
+  #unassignedActiveGenerationEvents = 0;
+  #activeTransitionReasonTotals = new Map<(typeof ACTIVE_TRANSITION_REASON_KEYS)[number], number>();
   #inferenceOutcomeCohorts = new Map<string, MutableInferenceOutcomeCohort>();
 
   addLine(line: string, lineNumber: number): void {
@@ -990,7 +1011,12 @@ class Stage0CacheTelemetryAccumulator {
       this.#assignedAccountSlotEvents = addSafely(this.#assignedAccountSlotEvents, 1, lineNumber);
       this.#assignedAccountSlots.add(event.account_slot);
     }
-    increment(this.#affinityOutcomeTotals, event.affinity_outcome, lineNumber);
+    increment(this.#activeTransitionReasonTotals, event.active_transition_reason ?? "none", lineNumber);
+    if (event.active_generation === null) {
+      this.#unassignedActiveGenerationEvents = addSafely(this.#unassignedActiveGenerationEvents, 1, lineNumber);
+    } else {
+      this.#assignedActiveGenerationEvents = addSafely(this.#assignedActiveGenerationEvents, 1, lineNumber);
+    }
 
     const key = JSON.stringify([provider, model, route, event.stream, outcome, streamTerminalType]);
     const existingCohort = this.#inferenceOutcomeCohorts.get(key);
@@ -1188,7 +1214,11 @@ class Stage0CacheTelemetryAccumulator {
           unassigned_terminal_events: this.#unassignedAccountSlotEvents,
           distinct_assigned_slots: this.#assignedAccountSlots.size,
         },
-        affinity_outcome_totals: toFixedCounts(AFFINITY_OUTCOME_VALUES, this.#affinityOutcomeTotals),
+        active_generation_summary: {
+          assigned_terminal_events: this.#assignedActiveGenerationEvents,
+          unassigned_terminal_events: this.#unassignedActiveGenerationEvents,
+        },
+        active_transition_reason_totals: toFixedCounts(ACTIVE_TRANSITION_REASON_KEYS, this.#activeTransitionReasonTotals),
         cohorts: inferenceOutcomeCohorts,
       },
     };

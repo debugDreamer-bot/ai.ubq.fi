@@ -356,7 +356,19 @@ Deno.test("usage optimization fixture records per-auth KV commands, atomic commi
     assert.ok(uosSuccess.commands > 0, "UOS allowlist activity must remain measurable");
     assert.ok(adminSuccess.commands > 0, "admin allowlist activity must remain measurable");
     assert.equal(retry.serialized_request_bytes, bytes(JSON.stringify(retryBody)) * 2);
-    assert.equal(disconnect.atomic_commits, 2, "a post-dispatch disconnect must retain the V3 reservation and dispatch commits");
+    assert.equal(
+      disconnect.atomic_commits,
+      3,
+      "a post-dispatch disconnect retains the V3 reservation and dispatch commits plus the serial active-account admission CAS"
+    );
+    const disconnectV3Commits = kv.commands.filter(
+      (record) =>
+        record.scenario === "bounded_api_key:client_disconnect" &&
+        record.command === "atomic.commit" &&
+        record.atomicResult === "committed" &&
+        record.keys.some((key) => key[0] === "uos_ai" && key[1] === "api_key_usage" && key[2] === "v3")
+    );
+    assert.equal(disconnectV3Commits.length, 2, "the disconnect path writes the V3 reservation and dispatch exactly once each");
     assert.ok(concurrent.atomic_commits >= 2, "concurrent admission must retain the winning reservation and dispatch");
     assert.equal(
       kv.commands.some(
