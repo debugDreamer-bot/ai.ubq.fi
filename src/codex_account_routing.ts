@@ -3061,6 +3061,37 @@ const commitCodexSerialAdmission = async (
 };
 
 /**
+ * FIFO admission tail per KV instance. Concurrent routing admissions in one
+ * isolate otherwise snapshot the same pre-bootstrap rows and exhaust their
+ * three CAS attempts as conflicts, so only the short strong-selection and
+ * same-identity fence decisions are serialized; auth refresh, transport,
+ * inference, and streams stay concurrent. Stored promises are release-only and
+ * never reject.
+ */
+const admissionTails = new WeakMap<Deno.Kv, Promise<void>>();
+
+/**
+ * Run one short routing-admission action under the per-KV FIFO tail. This
+ * caller's release-only promise is installed before it waits, and is always
+ * released, so a failure can never poison later callers.
+ */
+const withCodexAdmission = async <T>(kv: Deno.Kv, action: () => Promise<T>): Promise<T> => {
+  const priorAdmission = admissionTails.get(kv) ?? Promise.resolve();
+  let releaseAdmission = (): void => {};
+  const admissionRelease = new Promise<void>((resolve) => {
+    releaseAdmission = resolve;
+  });
+  admissionTails.set(kv, admissionRelease);
+  try {
+    await priorAdmission;
+    return await action();
+  } finally {
+    releaseAdmission();
+    if (admissionTails.get(kv) === admissionRelease) admissionTails.delete(kv);
+  }
+};
+
+/**
  * Every ordinary admission strongly reads the active selection, auth pool,
  * and routing state. A missing active row is the one bootstrap case; any
  * malformed or unavailable durable state fails before upstream dispatch.
@@ -3074,24 +3105,26 @@ const selectSerialCodexRoutingAccounts = async (
   try {
     const kv = await getKv();
     if (!kv) return { kind: "routing_unavailable" };
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const rows = await readStrongCodexRoutingRows(kv);
-      const prepared = await prepareCodexSerialAdmissionRows(rows, now, model);
-      if (prepared === null) return { kind: "routing_unavailable" };
-      const decision = serialSelectionDecision(
-        prepared.active,
-        prepared.durablePool,
-        prepared.evaluations,
-        prepared.poolVersionstamp,
-        now,
-        prepared.poolSnapshotJson,
-        prepared.capacitySnapshotJson
-      );
-      if (decision === null) return { kind: "routing_unavailable" };
-      if (!(await commitCodexSerialAdmission(kv, rows, prepared, decision))) continue;
-      return decision.selection;
-    }
-    return { kind: "routing_unavailable" };
+    return await withCodexAdmission(kv, async (): Promise<RouteSelection> => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const rows = await readStrongCodexRoutingRows(kv);
+        const prepared = await prepareCodexSerialAdmissionRows(rows, now, model);
+        if (prepared === null) return { kind: "routing_unavailable" };
+        const decision = serialSelectionDecision(
+          prepared.active,
+          prepared.durablePool,
+          prepared.evaluations,
+          prepared.poolVersionstamp,
+          now,
+          prepared.poolSnapshotJson,
+          prepared.capacitySnapshotJson
+        );
+        if (decision === null) return { kind: "routing_unavailable" };
+        if (!(await commitCodexSerialAdmission(kv, rows, prepared, decision))) continue;
+        return decision.selection;
+      }
+      return { kind: "routing_unavailable" };
+    });
   } catch {
     return { kind: "routing_unavailable" };
   }
@@ -3335,26 +3368,28 @@ export const refreshCodexActiveAccountAdmission = async (account: RoutingAccount
   try {
     const kv = await getKv();
     if (!kv) return false;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const rows = await readStrongCodexRoutingRows(kv);
-      const prepared = await prepareCodexActiveAccountAdmissionRefresh(account, rows);
-      if (prepared.kind === "reject") return false;
-      if (prepared.kind === "current") return true;
-      const committed = await kv
-        .atomic()
-        .check(rows.activeEntry)
-        .check(rows.authEntry)
-        .check(rows.routingEntry)
-        .check(rows.capacityEntry)
-        .set(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, prepared.next)
-        .commit();
-      if (!committed.ok) continue;
-      return true;
-    }
+    return await withCodexAdmission(kv, async (): Promise<boolean> => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const rows = await readStrongCodexRoutingRows(kv);
+        const prepared = await prepareCodexActiveAccountAdmissionRefresh(account, rows);
+        if (prepared.kind === "reject") return false;
+        if (prepared.kind === "current") return true;
+        const committed = await kv
+          .atomic()
+          .check(rows.activeEntry)
+          .check(rows.authEntry)
+          .check(rows.routingEntry)
+          .check(rows.capacityEntry)
+          .set(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, prepared.next)
+          .commit();
+        if (!committed.ok) continue;
+        return true;
+      }
+      return false;
+    });
   } catch {
     return false;
   }
-  return false;
 };
 
 const selectCodexRoutingAccountsFromState = async (
