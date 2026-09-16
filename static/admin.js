@@ -196,6 +196,7 @@ const viewTabPubkeys = mustGet("view-tab-pubkeys");
 const viewTabDefaults = mustGet("view-tab-defaults");
 const viewTabProviders = mustGet("view-tab-providers");
 const viewTabErrors = mustGet("view-tab-errors");
+const viewTabModels = mustGet("view-tab-models");
 
 const viewLoading = mustGet("view-loading");
 const viewKeys = mustGet("view-keys");
@@ -205,10 +206,14 @@ const viewPubkeys = mustGet("view-pubkeys");
 const viewDefaults = mustGet("view-defaults");
 const viewProviders = mustGet("view-providers");
 const viewErrors = mustGet("view-errors");
-
+const viewModels = mustGet("view-models");
 const errorsBadge = mustGet("errors-badge");
 const errorsUpdated = mustGet("errors-updated");
 const errorsList = mustGet("errors-list");
+
+const modelsWhitelistInput = mustGet("models-whitelist-input");
+const modelsWhitelistSave = mustGet("models-whitelist-save");
+const modelsWhitelistBadge = mustGet("models-whitelist-badge");
 
 const providerCapacityBadge = mustGet("provider-capacity-badge");
 const providerCapacityUpdated = mustGet("provider-capacity-updated");
@@ -6899,6 +6904,8 @@ const VIEW_HASH_ALIASES = new Map([
   ["view-defaults", "defaults"],
   ["providers", "providers"],
   ["view-providers", "providers"],
+  ["models", "models"],
+  ["view-models", "models"],
   ["errors", "errors"],
   ["view-errors", "errors"],
   ["auth", "session"],
@@ -6967,6 +6974,7 @@ const viewTabs = {
   users: viewTabUsers,
   kernel: viewTabKernel,
   pubkeys: viewTabPubkeys,
+  models: viewTabModels,
   defaults: viewTabDefaults,
   errors: viewTabErrors,
 };
@@ -6977,6 +6985,7 @@ const viewSections = {
   users: viewUsers,
   kernel: viewKernel,
   pubkeys: viewPubkeys,
+  models: viewModels,
   defaults: viewDefaults,
   providers: viewProviders,
   errors: viewErrors,
@@ -7226,6 +7235,9 @@ const loadAdminView = (view) => {
   }
   if (view === "pubkeys") {
     void ensureKernelPubKeysLoaded();
+  }
+  if (view === "models") {
+    void loadModelsWhitelist();
   }
   if (view === "providers") {
     void loadProviders();
@@ -7982,6 +7994,81 @@ const loadDefaults = async (options = {}) => {
     renderMeteredQuotaDiagnostics(null);
   }
 };
+
+let modelsWhitelistLoadedAt = 0;
+
+const setModelsWhitelistBadge = (state, text) => {
+  modelsWhitelistBadge.dataset.state = state;
+  modelsWhitelistBadge.textContent = text;
+};
+
+const loadModelsWhitelist = async () => {
+  const token = getAdminToken();
+  if (!token && sessionStatus !== "authenticated") {
+    setModelsWhitelistBadge("bad", "Missing token");
+    return;
+  }
+  try {
+    const headers = { "Cache-Control": "no-cache" };
+    if (token) headers["Authorization"] = "Bearer " + token;
+    const response = await fetch(apiUrl("/admin/models/whitelist"), { headers });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      setModelsWhitelistBadge("bad", "Failed to load");
+      console.error("whitelist load failed:", response.status, text);
+      return;
+    }
+    const body = await response.json();
+    const ids = body?.data?.model_ids;
+    if (Array.isArray(ids)) {
+      modelsWhitelistInput.value = ids.join("\n");
+    } else {
+      modelsWhitelistInput.value = "";
+    }
+    modelsWhitelistLoadedAt = Date.now();
+    setModelsWhitelistBadge("ok", "Loaded");
+  } catch (error) {
+    if (modelsWhitelistLoadedAt) {
+      setModelsWhitelistBadge("unknown", "Offline");
+      return;
+    }
+    setModelsWhitelistBadge("bad", "Offline");
+    console.error("whitelist load error:", error);
+  }
+};
+
+const saveModelsWhitelist = async () => {
+  const token = getAdminToken();
+  if (!token) {
+    setModelsWhitelistBadge("bad", "Missing token");
+    return;
+  }
+  setModelsWhitelistBadge("busy", "Saving...");
+  try {
+    const raw = modelsWhitelistInput.value;
+    const modelIds = raw
+      .split(/[\r\n]+/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const response = await fetch(apiUrl("/admin/models/whitelist"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ model_ids: modelIds }),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      setModelsWhitelistBadge("bad", "Failed to save");
+      console.error("whitelist save failed:", response.status, text);
+      return;
+    }
+    setModelsWhitelistBadge("ok", "Saved");
+  } catch (error) {
+    setModelsWhitelistBadge("bad", "Save error");
+    console.error("whitelist save error:", error);
+  }
+};
+
+modelsWhitelistSave.addEventListener("click", saveModelsWhitelist);
 
 const saveDefaults = async () => {
   if (!defaultsLoaded) return;
