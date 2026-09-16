@@ -661,6 +661,26 @@
             </div>
           </article>
         </section>
+        <section id="view-models" data-view="models" data-layout="grid" role="tabpanel"
+          aria-labelledby="view-tab-models" hidden>
+          <article data-card aria-labelledby="card-models">
+            <header>
+              <h2 id="card-models">Model Whitelist</h2>
+              <p>When non-empty, only whitelisted model IDs appear on model-list endpoints. An empty list shows all models. This does not block inference.</p>
+            </header>
+            <div data-card-body>
+              <label data-field>
+                <span data-label>Whitelisted model IDs</span>
+                <textarea id="models-whitelist-input" rows="8" placeholder="gpt-5.4-codex&#10;gpt-5.6-sol"
+                  style="font-family:monospace;font-size:0.875rem;width:100%"></textarea>
+              </label>
+              <div data-layout="row">
+                <button id="models-whitelist-save" type="button">Save</button>
+                <span id="models-whitelist-badge" data-badge data-state="unknown">Idle</span>
+              </div>
+            </div>
+          </article>
+        </section>
       </main>
 
       <section id="view-session" data-auth-widget aria-label="Admin authentication" aria-expanded="false">
