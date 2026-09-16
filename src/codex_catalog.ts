@@ -16,6 +16,7 @@ import { openaiError } from "./http.ts";
 import { getKv } from "./kv.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY, type RuntimeConfigV2 } from "./runtime_config.ts";
 import { getString, isRecord, sha256Hex } from "./utils.ts";
+import { DEEPSEEK_FLASH_MODEL, DEEPSEEK_OFFICIAL_MODEL_IDS, readDeepSeekApiKey } from "./deepseek.ts";
 import { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS } from "./metered.ts";
 import type { recordSentinelProviderDegradationFromEnvironment } from "./sentinel_incident_outbox.ts";
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "./surplus.ts";
@@ -684,6 +685,71 @@ const uniqueResponsesModels = <
   });
 };
 
+/**
+ * Codex catalog records for the DeepSeek official route.
+ *
+ * The official API is Chat Completions only, but the Responses adapter
+ * (`src/deepseek_responses.ts`) serves `/v1/responses`, so both ids are
+ * advertised as Responses-capable. `deepseek-v4-flash` is the interchangeable
+ * legacy id, and both are listed here so the picker shows them and no request
+ * falls back to "model metadata not found" defaults.
+ */
+const deepSeekOfficialCodexModels = (): Record<string, unknown>[] => {
+  if (!readDeepSeekApiKey()) return [];
+  return DEEPSEEK_OFFICIAL_MODEL_IDS.map((id) => {
+    const context = recentModelContextFor(id);
+    return {
+      slug: id,
+      display_name: id === DEEPSEEK_FLASH_MODEL ? "DeepSeek Flash" : "DeepSeek Flash (legacy id)",
+      description: "DeepSeek official API (DeepSeek-V4.1-Flash) served by this gateway.",
+      owned_by: "deepseek",
+      supported_endpoint_types: ["openai-response", "openai-chat"],
+      supported_reasoning_levels: [
+        { effort: "none", description: "Disable thinking mode" },
+        { effort: "low", description: "Thinking effort: low" },
+        { effort: "high", description: "Thinking effort: high" },
+        { effort: "max", description: "Thinking effort: maximum" },
+      ],
+      default_reasoning_level: "high",
+      ...(context
+        ? {
+            model_class: context.model_class,
+            context_window: context.context_window_tokens,
+            max_context_window: context.max_context_window_tokens,
+            auto_compact_token_limit: context.auto_compact_token_limit_tokens,
+            effective_context_window_percent: context.effective_context_window_percent,
+          }
+        : {}),
+      shell_type: "shell_command",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 1,
+      availability_nux: null,
+      upgrade: null,
+      base_instructions: "",
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: null,
+      web_search_tool_type: "text",
+      truncation_policy: { mode: "tokens", limit: 10000 },
+      supports_parallel_tool_calls: false,
+      experimental_supported_tools: [],
+    };
+  });
+};
+
+/**
+ * Appends the official ids that the stored catalog does not already advertise.
+ * A discovery source may already publish the legacy alias with equivalent
+ * tiers, and replacing it would churn that record for no behavioral gain.
+ */
+const withDeepSeekOfficialModels = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
+  const configured = deepSeekOfficialCodexModels();
+  if (!configured.length) return [...models];
+  const present = new Set(models.map((model) => getString(model.slug) ?? getString(model.id) ?? ""));
+  return [...models, ...configured.filter((model) => !present.has(String(model.slug)))];
+};
+
 /** Trimmed model slugs advertised by a catalog body, in their stored order. */
 const catalogModelIds = (models: readonly unknown[]): Set<string> => {
   const ids = models
@@ -726,7 +792,7 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   if (metered) refreshExpiredModelList(nowMs, metered.updated_at_ms, METERED_MODELS_CACHE_TTL_MS, fetchMeteredModels);
   if (surplus) refreshExpiredModelList(nowMs, surplus.updated_at_ms, SURPLUS_MODELS_CACHE_TTL_MS, fetchSurplusModels);
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
-  if (!paidModels.length) return catalogOnlyResponse(catalog, req, headers);
+  if (!paidModels.length && !readDeepSeekApiKey()) return catalogOnlyResponse(catalog, req, headers);
   const parsed = {
     ...catalog.parsed,
     models: [...(Array.isArray(catalog.parsed.models) ? catalog.parsed.models : [])],
@@ -737,6 +803,9 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
     parsed.models.push(meteredCodexModelRecord(model));
     seen.add(model.id);
   }
+  // The official ids are appended first so an operator whitelist still has the
+  // final say over every advertised model, this route included.
+  parsed.models = withDeepSeekOfficialModels(parsed.models);
   const catalogKv = await getKv();
   const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
   parsed.models = filterWhitelistedCatalogModels(parsed.models, catalogWhitelist);
@@ -752,10 +821,11 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
 const meteredCatalogResponse = async (): Promise<Response | null> => {
   const [metered, surplus] = await Promise.all([fetchMeteredModels({ force: true }), fetchSurplusModels({ force: true })]);
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
-  if (!paidModels.length) return null;
+  const configured = deepSeekOfficialCodexModels();
+  if (!paidModels.length && !configured.length) return null;
   return new Response(
     JSON.stringify({
-      models: paidModels.map(meteredCodexModelRecord),
+      models: withDeepSeekOfficialModels(paidModels.map(meteredCodexModelRecord)),
     }),
     {
       status: 200,

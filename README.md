@@ -406,6 +406,7 @@ positive-integer output caps, not quota or health indicators. Their transport be
 | Responses to Codex                            | `max_output_tokens` is forwarded as `max_output_tokens`.                                                                                                  |
 | Chat Completions to Cerebras (`gpt-oss-120b`) | `max_completion_tokens` is forwarded unchanged to Cerebras.                                                                                               |
 | Chat Completions to DeepSeek official         | `max_completion_tokens` is translated to DeepSeek's documented `max_tokens`.                                                                              |
+| Responses to DeepSeek official                | `max_output_tokens` is translated to DeepSeek's documented `max_tokens`.                                                                                  |
 | Paid fallback (Metered or Surplus)            | The provider uses its Responses API, so Chat `max_completion_tokens` arrives as `max_output_tokens`, and Responses `max_output_tokens` remains unchanged. |
 
 Do not swap these fields between endpoints: Chat Completions accepts `max_completion_tokens`, while Responses accepts
@@ -432,16 +433,14 @@ describe the shared server-side `CEREBRAS_API_KEY` capacity, not a per-user UOS 
 upstream statuses. DeepSeek publishes no equivalent capacity headers (its limits are concurrency based and surface as
 HTTP `429`), so the gateway forwards none for that provider.
 
-### DeepSeek official (Chat Completions only)
+### DeepSeek official
 
 `deepseek-flash` and its interchangeable legacy id `deepseek-v4-flash` are both sent to DeepSeek's official API at
 `https://api.deepseek.com/chat/completions` using the server-side `DEEPSEEK_API_KEY`. Both ids are advertised in
-`/v1/models` and `/uos/models/capabilities`, and both reach the API as the canonical `deepseek-flash` model; the
-response echoes that canonical id. Other DeepSeek-named catalog models (for example `deepseek-v4-pro`) keep their
-existing catalog-proven provider.
-
-This route is scoped to `/v1/chat/completions`. `/v1/responses` continues to serve those ids through the catalog
-provider waterfall, because the gateway has no Responses adapter for the official API.
+`/v1/models`, `/uos/models/capabilities` and the Codex-native model catalog, and both reach the API as the canonical
+`deepseek-flash` model; the response echoes that canonical id. Other DeepSeek-named catalog models (for example
+`deepseek-v4-pro`) keep their existing catalog-proven provider. A missing `DEEPSEEK_API_KEY` fails with
+`503 deepseek_api_key_missing` before any provider dispatch.
 
 Reasoning follows the official contract: thinking mode is enabled by default at `high`, `reasoning_effort` accepts
 `none` (which disables thinking), `low`, `high` and `max`, and the Codex `ultra` preset is sent upstream as `max`. The
@@ -449,8 +448,24 @@ chain of thought is relayed 1:1 as `reasoning_content` in both buffered response
 
 Streaming is native rather than downgraded. A `stream: true` request relays the official SSE chunks as they arrive, so
 no `x-uos-warning` is returned; DeepSeek's documented `: keep-alive` comment frames are relayed verbatim, and usage
-rides the final content chunk exactly as the provider sends it. A missing `DEEPSEEK_API_KEY` fails with
-`503 deepseek_api_key_missing` before any provider dispatch.
+rides the final content chunk exactly as the provider sends it.
+
+#### Responses API adapter
+
+The official API speaks only Chat Completions, while the Codex CLI speaks only the Responses API, so `/v1/responses`
+translates both directions for these two ids. The gateway:
+
+- maps `input` messages, `instructions`, flat and `namespace`-grouped `tools`, `tool_choice` and `parallel_tool_calls`
+  onto the Chat contract, translating `max_output_tokens` to `max_tokens` and `reasoning.effort` to `reasoning_effort`;
+- labels a flattened namespace function with its namespace on a name collision and maps the name back on the returned
+  call, because the provider accepts only `[a-zA-Z0-9_-]{1,128}` function names;
+- drops tool types the API cannot serve, such as `web_search`, rather than pretending to offer them;
+- rejects a request it cannot translate faithfully (`text.format` other than `text` or `json_object`, an unknown input
+  item type) with `invalid_request_error` before any provider dispatch;
+- emits `response.created` through `response.completed`, including `function_call` items and their argument deltas.
+
+Multi-turn tool use round-trips: a `function_call` plus its `function_call_output` become an assistant turn carrying
+`tool_calls` followed by the tool result, which is the only shape the Chat contract accepts.
 
 ## Admin: upload/validate Codex auth.json
 
