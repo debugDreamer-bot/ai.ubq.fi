@@ -208,17 +208,35 @@ const providerRequestIdHeaderValue = (value: string | null): string | null => {
   return requestId;
 };
 
+/**
+ * Provider-native correlation headers. The gateway never reflects them: it
+ * exposes one bounded `x-uos-provider-request-id` whose value has already
+ * passed the gateway sanitizer.
+ *
+ * Every header a provider reader accepts must be listed here, or that
+ * provider's own spelling can survive to the client.
+ * `getCerebrasProviderRequestId` reads the first four spellings and
+ * `getDeepSeekProviderRequestId` reads `x-request-id`, `x-ds-request-id` and
+ * `x-deepseek-request-id`.
+ */
+export const PROVIDER_NATIVE_CORRELATION_HEADERS = [
+  "x-request-id",
+  "x-api-request-id",
+  "x-oneapi-request-id",
+  "x-cerebras-request-id",
+  "x-ds-request-id",
+  "x-deepseek-request-id",
+  "x-uos-provider-request-id",
+] as const;
+
+export const scrubProviderNativeCorrelationHeaders = (headers: Headers): void => {
+  for (const header of PROVIDER_NATIVE_CORRELATION_HEADERS) headers.delete(header);
+};
+
 const withProviderRequestId = (response: Response, providerRequestId: string | null): Response => {
   const requestId = providerRequestIdHeaderValue(providerRequestId);
   const headers = new Headers(response.headers);
-  // Never reflect provider-native correlation headers. Expose one bounded UOS
-  // header whose value has already passed the gateway sanitizer.
-  headers.delete("x-request-id");
-  headers.delete("x-api-request-id");
-  headers.delete("x-oneapi-request-id");
-  headers.delete("x-cerebras-request-id");
-  headers.delete("x-deepseek-request-id");
-  headers.delete("x-uos-provider-request-id");
+  scrubProviderNativeCorrelationHeaders(headers);
   if (requestId) headers.set("x-uos-provider-request-id", requestId);
   return new Response(response.body, {
     status: response.status,
