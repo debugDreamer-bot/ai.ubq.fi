@@ -48,6 +48,7 @@ import {
 } from "./deepseek.ts";
 import { getCatalogClientVersion, handleCodexCatalogModels } from "./codex_catalog.ts";
 import { CODEX_CHATGPT_PROMPT_CACHE_PROVIDER, normalizePromptCacheCapabilities, type PromptCacheControls } from "./codex_models.ts";
+import { loadCodexModelsWhitelist, filterWhitelistedModelList, filterWhitelistedModelMap } from "./codex_models_whitelist.ts";
 import { type ApiKeyProviderDispatch, ApiKeyQuotaDispatchError, type ApiKeyUsageReservation } from "./api_key_policy.ts";
 import { DEFAULT_REASONING_EFFORT, normalizeReasoningEffort, type ReasoningEffort } from "./defaults.ts";
 import { BOUNDED_RESPONSE_BODY_MAX_BYTES, BOUNDED_RESPONSE_BODY_TIMEOUT_MS, readBoundedResponseBody } from "./bounded_response_body.ts";
@@ -7553,7 +7554,11 @@ export const handleModels = async (req?: Request): Promise<Response> => {
     });
   }
 
-  return json(200, { object: "list", data: merged }, { "x-uos-upstream": snapshotUpstreamSource(snapshot) });
+  const modelsKv = await getKv();
+  const whitelist = modelsKv ? await loadCodexModelsWhitelist(modelsKv) : null;
+  const filtered = filterWhitelistedModelList(merged, whitelist);
+
+  return json(200, { object: "list", data: filtered }, { "x-uos-upstream": snapshotUpstreamSource(snapshot) });
 };
 
 type PublicModelProvider = Readonly<{
@@ -7653,9 +7658,13 @@ export const handlePublicModelCatalog = async (): Promise<Response> => {
     });
   }
 
+  const catalogKv = await getKv();
+  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
+  const allCatalogEntries = [...models.values()].sort((left, right) => left.id.localeCompare(right.id));
+  const filteredCatalogEntries = filterWhitelistedModelMap(allCatalogEntries, catalogWhitelist);
   return json(200, {
     object: "uos.model_catalog",
-    data: [...models.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    data: filteredCatalogEntries,
     sources: {
       codex: {
         status: catalogAvailabilityStatus(normalized),
@@ -7728,11 +7737,15 @@ export const handleModelCapabilities = async (): Promise<Response> => {
   // fallback is replaced by the capabilities of the route it actually uses.
   data = withConfiguredDeepSeekCapabilities(data);
 
+  const capabilitiesKv = await getKv();
+  const capabilitiesWhitelist = capabilitiesKv ? await loadCodexModelsWhitelist(capabilitiesKv) : null;
+  const filteredData = filterWhitelistedModelList(data, capabilitiesWhitelist);
+
   return json(
     200,
     {
       object: "list",
-      data,
+      data: filteredData,
       upstream_provider: "codex_chatgpt",
       source: snapshot?.source ?? "stored_codex_models",
       client_version: snapshot?.client_version ?? null,

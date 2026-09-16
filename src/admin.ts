@@ -92,6 +92,7 @@ import { acquireKernelDefaultWindowCutover, type KernelDefaultWindowCutoverGuard
 import { listKernelPolicyQueue } from "./kernel_policy_queue.ts";
 import { defaultIncludeLegacyForProfile, importKvMigrationLines, type KvMigrationProfile, validateKvMigrationTarget } from "./kv_migration.ts";
 import { getKv } from "./kv.ts";
+import { loadCodexModelsWhitelist, storeCodexModelsWhitelist } from "./codex_models_whitelist.ts";
 import { listCodexResetShadowDecisions } from "./codex_banked_reset.ts";
 import {
   assertPromptCacheScopeExperimentTelemetryBaseline,
@@ -604,6 +605,37 @@ export const handleAdminCodexPromptsPurge = async (): Promise<Response> => {
   }
 
   return json(200, { deleted });
+};
+
+export const handleAdminCodexModelsWhitelistGet = async (): Promise<Response> => {
+  const kv = await getKv();
+  if (!kv) {
+    return openaiError(500, "Deno KV is not available; cannot read model whitelist", "server_error");
+  }
+  const whitelist = await loadCodexModelsWhitelist(kv);
+  if (!whitelist) {
+    return json(200, { ok: true, data: { model_ids: [], updated_at_ms: 0 } });
+  }
+  return json(200, { ok: true, data: { model_ids: [...whitelist.model_ids], updated_at_ms: whitelist.updated_at_ms } });
+};
+
+export const handleAdminCodexModelsWhitelistSet = async (req: Request): Promise<Response> => {
+  const kv = await getKv();
+  if (!kv) {
+    return openaiError(500, "Deno KV is not available; cannot store model whitelist", "server_error");
+  }
+  const raw = await readJsonBody(req);
+  if (!raw || !isRecord(raw)) return openaiError(400, "Invalid JSON body", "invalid_request_error");
+  const rawIds = raw.model_ids;
+  if (!Array.isArray(rawIds)) {
+    return openaiError(400, "model_ids must be an array", "invalid_request_error");
+  }
+  const modelIds = rawIds.map((id: unknown) => (typeof id === "string" ? id.trim() : "")).filter((id: string) => id.length > 0);
+  const stored = await storeCodexModelsWhitelist(kv, modelIds);
+  if (!stored) {
+    return openaiError(500, "Deno KV is not available; cannot persist model whitelist", "server_error");
+  }
+  return json(200, { ok: true, stored: true, model_ids: modelIds, updated_at_ms: Date.now() });
 };
 
 const parseBooleanParam = (url: URL, name: string): boolean | null => {

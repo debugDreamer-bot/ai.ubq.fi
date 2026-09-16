@@ -1,4 +1,5 @@
 import { CODEX_AUTH_POOL_KV_KEY, CODEX_MODELS_KV_KEY, type CodexModelsSnapshot, fetchCodexModels, preserveCodexDefaultModel } from "./codex.ts";
+import { loadCodexModelsWhitelist, filterWhitelistedCatalogModels } from "./codex_models_whitelist.ts";
 import {
   CODEX_CHATGPT_PROMPT_CACHE_PROVIDER,
   compareCodexClientVersions,
@@ -736,6 +737,9 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
     parsed.models.push(meteredCodexModelRecord(model));
     seen.add(model.id);
   }
+  const catalogKv = await getKv();
+  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
+  parsed.models = filterWhitelistedCatalogModels(parsed.models, catalogWhitelist);
   const body = JSON.stringify(parsed);
   const etag = await catalogBodyEtag(body, catalog);
   if (etag) headers.set("ETag", etag);
