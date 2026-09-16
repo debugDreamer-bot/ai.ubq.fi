@@ -3386,6 +3386,17 @@ export const storeCodexModelsSnapshot = async (snapshot: CodexModelsSnapshot): P
       defaultModel: preserveCodexDefaultModel(nextSnapshot, currentRuntime?.default_model),
       defaultReasoningEffort: currentRuntime?.default_reasoning_effort,
     });
+
+    // Guard: refuse to overwrite a populated catalog with empty models.
+    // A failed upstream /models probe must not nuke the serving catalog.
+    if (
+      currentEntry.value &&
+      Array.isArray(currentEntry.value.models) &&
+      currentEntry.value.models.length > 0 &&
+      (!Array.isArray(nextSnapshot.models) || nextSnapshot.models.length === 0)
+    ) {
+      return false;
+    }
     const commit = await kv
       .atomic()
       .check(currentEntry)
