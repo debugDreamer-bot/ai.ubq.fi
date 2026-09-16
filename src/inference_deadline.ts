@@ -3,15 +3,22 @@ export const OPENAI_DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60_000;
 export const OPENAI_FLEX_REQUEST_TIMEOUT_MS = 15 * 60_000;
 
 /**
- * Cloudflare's default proxy-read timeout is 125 seconds. Return stream
- * headers and the first SSE event before that edge limit. Once semantic output
- * starts, do not leave a client on a silent stream for several minutes.
+ * Wall-clock budget for one inference attempt: provider dispatch, response
+ * headers and the first SSE event must all arrive inside it. Once semantic
+ * output starts, STREAM_INACTIVITY_DEADLINE_MS bounds the gaps between later
+ * events instead. Both were raised from the original 125-second Cloudflare
+ * proxy-read bound to 30 minutes so a long agent turn is not cut off at that
+ * edge limit.
  */
 export const STREAM_FIRST_EVENT_DEADLINE_MS = 1_800_000;
 export const STREAM_FAILOVER_RESERVE_MS = 15_000;
 export const STREAM_INACTIVITY_DEADLINE_MS = 1_800_000;
 
-/** Buffered responses must finish before Cloudflare's 125-second read limit. */
+/**
+ * Buffered inference shares the stream first-event budget. It is not bounded by
+ * the original 125-second Cloudflare read limit; the caller's own request
+ * signal still caps the whole request.
+ */
 export const INFERENCE_DEADLINE_MS = STREAM_FIRST_EVENT_DEADLINE_MS;
 export const BUFFERED_INFERENCE_DEADLINE_MS = INFERENCE_DEADLINE_MS;
 

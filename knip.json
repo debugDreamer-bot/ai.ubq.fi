@@ -46,6 +46,9 @@
     ],
     "src/metered.ts": [
       "duplicates"
+    ],
+    "src/codex_models_whitelist.ts": [
+      "files"
     ]
   }
 }
