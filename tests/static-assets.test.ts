@@ -233,8 +233,10 @@ Deno.test("published guidance documents endpoint-specific output caps and reposi
     assert.match(publishedText, /Responses to Codex[\s\S]*`max_output_tokens` is forwarded as `max_output_tokens`/);
     assert.match(publishedText, /Chat Completions to Cerebras \(`gpt-oss-120b`\)[\s\S]*forwarded unchanged/);
     assert.match(publishedText, /Chat Completions to DeepSeek official[\s\S]*translated to DeepSeek's documented `max_tokens`/);
-    assert.match(publishedText, /DeepSeek official \(Chat Completions only\)[\s\S]*https:\/\/api\.deepseek\.com\/chat\/completions/);
-    assert.match(publishedText, /DeepSeek official \(Chat Completions only\)[\s\S]*deepseek_api_key_missing/);
+    assert.match(publishedText, /DeepSeek official[\s\S]*https:\/\/api\.deepseek\.com\/chat\/completions/);
+    assert.match(publishedText, /DeepSeek official[\s\S]*deepseek_api_key_missing/);
+    assert.match(publishedText, /Responses to DeepSeek official[\s\S]*`max_output_tokens` is translated to DeepSeek's documented `max_tokens`/);
+    assert.match(publishedText, /Responses API[\s\S]*tool_calls/);
     assert.match(publishedText, /Paid fallback \(Metered or Surplus\)[\s\S]*Chat `max_completion_tokens` arrives as `max_output_tokens`/);
     assert.match(publishedText, /Do not swap these fields between endpoints/);
   }

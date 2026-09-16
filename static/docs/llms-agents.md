@@ -434,20 +434,28 @@ positive-integer output caps, not quota or health indicators. Their transport be
 | Responses to Codex                            | `max_output_tokens` is forwarded as `max_output_tokens`.                                                                                                  |
 | Chat Completions to Cerebras (`gpt-oss-120b`) | `max_completion_tokens` is forwarded unchanged to Cerebras.                                                                                               |
 | Chat Completions to DeepSeek official         | `max_completion_tokens` is translated to DeepSeek's documented `max_tokens`.                                                                              |
+| Responses to DeepSeek official                | `max_output_tokens` is translated to DeepSeek's documented `max_tokens`.                                                                                  |
 | Paid fallback (Metered or Surplus)            | The provider uses its Responses API, so Chat `max_completion_tokens` arrives as `max_output_tokens`, and Responses `max_output_tokens` remains unchanged. |
 
 Do not swap these fields between endpoints: Chat Completions accepts `max_completion_tokens`, while Responses accepts
 `max_output_tokens`. The paid-fallback cap limits generated output; it does not report the provider's remaining paid
 capacity.
 
-### DeepSeek official (Chat Completions only)
+### DeepSeek official
 
 `deepseek-flash` and its interchangeable legacy id `deepseek-v4-flash` both route to DeepSeek's official API at
 `https://api.deepseek.com/chat/completions` using the server-side `DEEPSEEK_API_KEY`, and both reach the API as the
 canonical `deepseek-flash` model, which is also the id echoed in responses. Their catalog rows report
 `upstream_provider: "deepseek"`, tiers `none`/`low`/`high`/`max`, and a `high` default. Other DeepSeek-named catalog
-models (for example `deepseek-v4-pro`) keep their existing catalog-proven provider, and `/v1/responses` continues to
-serve these ids through the waterfall because the gateway has no Responses adapter for the official API.
+models (for example `deepseek-v4-pro`) keep their existing catalog-proven provider.
+
+Both ids are also served on `/v1/responses` through a translation adapter, because the Codex CLI speaks only the
+Responses API while the official API speaks only Chat Completions. `input`, `instructions`, flat and `namespace`-grouped
+`tools`, `tool_choice` and `parallel_tool_calls` are mapped onto the Chat contract; `max_output_tokens` becomes
+`max_tokens` and `reasoning.effort` becomes `reasoning_effort`. Namespaced functions are flattened (a collision takes
+its namespace as a prefix and is mapped back on the returned call), tool types the API cannot serve such as `web_search`
+are dropped, and a request that cannot be translated faithfully is rejected with `invalid_request_error` before
+dispatch. Multi-turn tool use round-trips as an assistant turn carrying `tool_calls` followed by the tool result.
 
 Streaming is native rather than downgraded: `stream: true` relays the official SSE chunks as they arrive with no
 `x-uos-warning`, `: keep-alive` comment frames pass through verbatim, and usage rides the final content chunk exactly as

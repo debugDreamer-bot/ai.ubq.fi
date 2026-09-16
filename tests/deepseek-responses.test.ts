@@ -1,0 +1,267 @@
+import assert from "node:assert/strict";
+
+import {
+  createDeepSeekResponsesStreamTranslator,
+  encodeResponsesEvent,
+  type DeepSeekResponsesEcho,
+  toDeepSeekChatMessages,
+  toDeepSeekResponsesChatBody,
+  toDeepSeekResponsesPayload,
+  toResponsesUsage,
+} from "../src/deepseek_responses.ts";
+
+const echo: DeepSeekResponsesEcho = { tools: undefined, tool_choice: undefined, parallel_tool_calls: true, instructions: null };
+
+const chatCompletion = (message: Record<string, unknown>, usage: Record<string, unknown> = { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 }) => ({
+  id: "chatcmpl-1",
+  object: "chat.completion",
+  created: 1_780_000_000,
+  model: "deepseek-flash",
+  choices: [{ index: 0, message, finish_reason: "stop" }],
+  usage,
+});
+
+const chatChunk = (delta: Record<string, unknown>, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+  id: "chatcmpl-stream",
+  object: "chat.completion.chunk",
+  created: 1_780_000_001,
+  model: "deepseek-flash",
+  choices: [{ index: 0, delta, finish_reason: null, ...extra }],
+});
+
+const eventTypes = (events: readonly Record<string, unknown>[]): string[] => events.map((event) => String(event.type));
+
+Deno.test("deepseek responses: maps Responses input onto Chat messages", () => {
+  const result = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "be terse" }] },
+      { type: "reasoning", summary: [] },
+      { type: "function_call", name: "get_date", arguments: "{}", call_id: "call_1" },
+      { type: "function_call", name: "get_weather", arguments: '{"city":"x"}', call_id: "call_2" },
+      { type: "function_call_output", call_id: "call_1", output: "2026-09-16" },
+      { type: "function_call_output", call_id: "call_2", output: { temp: 7 } },
+    ],
+    "system prompt"
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "hi" },
+    // DeepSeek, like OpenAI Chat, has no developer role.
+    { role: "system", content: "be terse" },
+    // Consecutive calls collapse into one assistant turn.
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "get_date", arguments: "{}" } },
+        { id: "call_2", type: "function", function: { name: "get_weather", arguments: '{"city":"x"}' } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "2026-09-16" },
+    { role: "tool", tool_call_id: "call_2", content: '{"temp":7}' },
+  ]);
+});
+
+Deno.test("deepseek responses: rejects input shapes it cannot translate", () => {
+  const badRole = toDeepSeekChatMessages([{ type: "message", role: "system", content: "x" }], null);
+  assert.equal(badRole.ok, false);
+  const badType = toDeepSeekChatMessages([{ type: "computer_call", call_id: "c" }], null);
+  assert.equal(badType.ok, false);
+  const badContent = toDeepSeekChatMessages([{ type: "message", role: "user", content: [{ type: "input_audio" }] }], null);
+  assert.equal(badContent.ok, false);
+});
+
+Deno.test("deepseek responses: flattens namespaced tools and drops what the API cannot serve", () => {
+  const result = toDeepSeekResponsesChatBody(
+    {
+      input: "hi",
+      max_output_tokens: 256,
+      reasoning: { effort: "ultra" },
+      text: { format: { type: "json_object" } },
+      tool_choice: { type: "function", name: "now" },
+      parallel_tool_calls: false,
+      tools: [
+        { type: "web_search" },
+        { type: "function", name: "now", description: "top level", parameters: { type: "object" } },
+        {
+          type: "namespace",
+          name: "clock",
+          tools: [
+            { type: "function", name: "now", description: "current time", parameters: { type: "object" }, strict: false },
+            { type: "function", name: "sleep", parameters: { type: "object" } },
+          ],
+        },
+      ],
+    },
+    "deepseek-v4-flash",
+    false
+  );
+  assert.equal(result.ok, true);
+  const { body, toolNames } = result.value;
+  assert.equal(body.model, "deepseek-flash");
+  assert.equal(body.max_tokens, 256);
+  // The Codex `ultra` preset is the documented `max` tier upstream.
+  assert.equal(body.reasoning_effort, "max");
+  assert.deepEqual(body.response_format, { type: "json_object" });
+  assert.equal(body.parallel_tool_calls, false);
+  assert.deepEqual(body.messages, [{ role: "user", content: "hi" }]);
+  const tools = body.tools as { function: { name: string } }[];
+  assert.deepEqual(
+    tools.map((tool) => tool.function.name),
+    ["now", "clock_now", "sleep"]
+  );
+  // A disambiguated name maps back to the name the client asked for.
+  assert.equal(toolNames.get("clock_now"), "now");
+  assert.deepEqual(body.tool_choice, { type: "function", function: { name: "now" } });
+});
+
+Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
+  const schema = toDeepSeekResponsesChatBody({ input: "hi", text: { format: { type: "json_schema", name: "x" } } }, "deepseek-flash", false);
+  assert.equal(schema.ok, false);
+  assert.equal(schema.param, "text.format.type");
+  const tokens = toDeepSeekResponsesChatBody({ input: "hi", max_output_tokens: 0 }, "deepseek-flash", false);
+  assert.equal(tokens.ok, false);
+  assert.equal(tokens.param, "max_output_tokens");
+  const model = toDeepSeekResponsesChatBody({ input: "hi" }, "gpt-5.6-sol", false);
+  assert.equal(model.ok, false);
+  assert.equal(model.param, "model");
+  const empty = toDeepSeekResponsesChatBody({ input: [] }, "deepseek-flash", false);
+  assert.equal(empty.ok, false);
+});
+
+Deno.test("deepseek responses: streaming requests ask the provider for usage", () => {
+  const result = toDeepSeekResponsesChatBody({ input: "hi" }, "deepseek-flash", true);
+  assert.equal(result.ok, true);
+  assert.equal(result.value.body.stream, true);
+  assert.deepEqual(result.value.body.stream_options, { include_usage: true });
+});
+
+Deno.test("deepseek responses: builds a completed Responses object from a Chat completion", () => {
+  const payload = toDeepSeekResponsesPayload(
+    chatCompletion({
+      role: "assistant",
+      content: "42",
+      reasoning_content: "because",
+      tool_calls: [{ id: "call_9", type: "function", function: { name: "clock_now", arguments: "{}" } }],
+    }),
+    "deepseek-v4-flash",
+    "resp_test",
+    echo,
+    new Map([["clock_now", "now"]])
+  );
+  assert.equal(payload.object, "response");
+  assert.equal(payload.status, "completed");
+  assert.equal(payload.model, "deepseek-v4-flash");
+  const output = payload.output as Record<string, unknown>[];
+  assert.deepEqual(
+    output.map((item) => item.type),
+    ["reasoning", "message", "function_call"]
+  );
+  assert.deepEqual(output[1].content, [{ type: "output_text", text: "42", annotations: [] }]);
+  assert.equal(output[2].name, "now");
+  assert.equal(output[2].call_id, "call_9");
+  assert.deepEqual(payload.usage, {
+    input_tokens: 10,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 4,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 14,
+  });
+});
+
+Deno.test("deepseek responses: usage translation rejects incomplete provider usage", () => {
+  assert.equal(toResponsesUsage({ prompt_tokens: 1 }), null);
+  assert.equal(toResponsesUsage(null), null);
+  assert.deepEqual(toResponsesUsage({ prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 }), {
+    input_tokens: 1,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 2,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 3,
+  });
+});
+
+Deno.test("deepseek responses: stream translator emits the Responses event sequence", () => {
+  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_stream", echo, 1_780_000_000);
+  const events: Record<string, unknown>[] = [];
+  events.push(...translator.push(chatChunk({ role: "assistant", reasoning_content: "think " })));
+  events.push(...translator.push(chatChunk({ content: "Hel" })));
+  events.push(...translator.push(chatChunk({ content: "lo" }, { finish_reason: "stop" })));
+  events.push(...translator.push({ ...chatChunk({}), usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } }));
+  events.push(...translator.finish());
+
+  assert.deepEqual(eventTypes(events), [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.completed",
+  ]);
+  const completed = events.at(-1) as { response: Record<string, unknown> };
+  assert.equal(completed.response.status, "completed");
+  assert.deepEqual(completed.response.usage, {
+    input_tokens: 7,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 3,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 10,
+  });
+  const output = completed.response.output as Record<string, unknown>[];
+  assert.deepEqual(
+    output.map((item) => item.type),
+    ["reasoning", "message"]
+  );
+});
+
+Deno.test("deepseek responses: stream translator accumulates fragmented tool calls", () => {
+  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_tools", echo, 1_780_000_000);
+  const events: Record<string, unknown>[] = [];
+  events.push(
+    ...translator.push(chatChunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: "" } }] }))
+  );
+  events.push(...translator.push(chatChunk({ tool_calls: [{ index: 0, function: { arguments: '{"cmd":' } }] })));
+  events.push(...translator.push(chatChunk({ tool_calls: [{ index: 0, function: { arguments: '"ls"}' } }] }, { finish_reason: "tool_calls" })));
+  events.push(...translator.finish());
+
+  assert.deepEqual(eventTypes(events), [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.done",
+    "response.output_item.done",
+    "response.completed",
+  ]);
+  const done = events.find((event) => event.type === "response.output_item.done") as { item: Record<string, unknown> };
+  assert.deepEqual(done.item, {
+    id: "resp_tools_fc_0",
+    type: "function_call",
+    status: "completed",
+    call_id: "call_1",
+    name: "shell",
+    arguments: '{"cmd":"ls"}',
+  });
+});
+
+Deno.test("deepseek responses: stream translator is idempotent at the terminal", () => {
+  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_once", echo, 1_780_000_000);
+  assert.deepEqual(eventTypes(translator.finish()), ["response.created", "response.in_progress", "response.completed"]);
+  assert.deepEqual(translator.finish(), []);
+});
+
+Deno.test("deepseek responses: encodes named SSE frames", () => {
+  assert.equal(
+    encodeResponsesEvent({ type: "response.completed", response: { id: "resp_1" } }),
+    'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'
+  );
+});

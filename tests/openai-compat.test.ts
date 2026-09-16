@@ -2479,7 +2479,7 @@ Deno.test("openai: configured DeepSeek official models are discoverable and repl
         owned_by: "deepseek",
         display_name: id === DEEPSEEK_FLASH_MODEL ? "DeepSeek Flash" : "DeepSeek Flash (legacy id)",
         upstream_provider: "deepseek",
-        supported_endpoints: ["/v1/chat/completions"],
+        supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
         supported_reasoning_levels: ["none", "low", "high", "max"],
         default_reasoning_effort: "high",
         reasoning_effort_wire_map: { ultra: "max" },
@@ -5058,8 +5058,8 @@ Deno.test("openai: temporary free GLM cut uses only Surplus without paid fallbac
   }
 });
 
-Deno.test("openai: DeepSeek Flash tool requests route directly to catalog-proven Surplus", async () => {
-  const model = "deepseek-v4-flash";
+Deno.test("openai: paid-only catalog models route directly to catalog-proven Surplus", async () => {
+  const model = "deepseek-v3.2";
   const keyId = "dynamic-deepseek-surplus-tools";
   const requestId = `request-${keyId}`;
   const originalMeteredApiKey = Deno.env.get("METERED_API_KEY");
@@ -5236,7 +5236,7 @@ Deno.test("openai: DeepSeek Flash tool requests route directly to catalog-proven
 });
 
 Deno.test("openai: direct paid admission failures do not enter removed-provider recovery", async () => {
-  const model = "deepseek-v4-flash";
+  const model = "deepseek-v3.2";
   const keyId = "dynamic-deepseek-admission-stop";
   const requestId = `request-${keyId}`;
   const originalMeteredApiKey = Deno.env.get("METERED_API_KEY");
@@ -5322,7 +5322,7 @@ Deno.test("openai: direct paid admission failures do not enter removed-provider 
 });
 
 Deno.test("openai: unknown paid-model routing honors catalog refresh backoff", async () => {
-  const model = "deepseek-v4-flash";
+  const model = "deepseek-v3.2";
   const originalMeteredApiKey = Deno.env.get("METERED_API_KEY");
   const originalSurplusApiKey = Deno.env.get("SURPLUS_API_KEY");
   const originalDateNow = Date.now;
@@ -5418,7 +5418,7 @@ Deno.test("openai: unknown paid-model routing honors catalog refresh backoff", a
 });
 
 Deno.test("openai: dynamic tool requests reject unverified Surplus capability before transport", async () => {
-  const model = "deepseek-v4-flash";
+  const model = "deepseek-v3.2";
   const keyId = "dynamic-deepseek-unverified-tools";
   const requestId = `request-${keyId}`;
   const originalMeteredApiKey = Deno.env.get("METERED_API_KEY");
@@ -14041,6 +14041,192 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
   } finally {
     restoreApiKey();
     setDeepSeekFetchTimeoutMsForTest(null);
+  }
+});
+
+Deno.test("openai: DeepSeek official Responses adapter serves the Codex wire protocol", async (t) => {
+  const envKey = "DEEPSEEK_API_KEY";
+  const fakeApiKey = "deepseek-test-key";
+  const originalApiKey = Deno.env.get(envKey);
+  const responsesBody = (body: Record<string, unknown>): Request =>
+    new Request("https://ai.ubq.fi/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const chatCompletion = (message: Record<string, unknown>): Record<string, unknown> => ({
+    id: "deepseek-responses-1",
+    object: "chat.completion",
+    created: 1_780_000_100,
+    model: DEEPSEEK_FLASH_MODEL,
+    choices: [{ index: 0, message, finish_reason: "stop" }],
+    usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14, prompt_cache_hit_tokens: 0 },
+  });
+  const responsesEvents = (text: string): Record<string, unknown>[] =>
+    text
+      .split("\n\n")
+      .filter((frame) => frame.startsWith("event: "))
+      .map((frame) => JSON.parse(frame.split("\ndata: ")[1]) as Record<string, unknown>);
+
+  Deno.env.set(envKey, fakeApiKey);
+  try {
+    await t.step("translates a Responses request before the Codex catalog lookup", async () => {
+      const upstreamCalls: { url: string; body: Record<string, unknown> }[] = [];
+      const response = await withFetchMock(
+        (url, bodyText) => {
+          upstreamCalls.push({ url, body: JSON.parse(String(bodyText)) as Record<string, unknown> });
+          return Response.json(
+            chatCompletion({
+              role: "assistant",
+              content: "42",
+              reasoning_content: "because",
+              tool_calls: [{ id: "call_7", type: "function", function: { name: "clock_now", arguments: "{}" } }],
+            })
+          );
+        },
+        () =>
+          handleResponses(
+            responsesBody({
+              model: "deepseek-v4-flash",
+              instructions: "Be terse.",
+              input: [
+                { type: "message", role: "user", content: [{ type: "input_text", text: "what time is it?" }] },
+                { type: "function_call", name: "clock_now", arguments: "{}", call_id: "call_7" },
+                { type: "function_call_output", call_id: "call_7", output: "noon" },
+              ],
+              max_output_tokens: 512,
+              reasoning: { effort: "ultra" },
+              tools: [{ type: "namespace", name: "clock", tools: [{ type: "function", name: "clock_now", parameters: { type: "object" } }] }],
+            })
+          )
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(upstreamCalls.length, 1);
+      assert.equal(upstreamCalls[0].url, DEEPSEEK_CHAT_COMPLETIONS_URL);
+      assert.deepEqual(upstreamCalls[0].body, {
+        model: DEEPSEEK_FLASH_MODEL,
+        stream: false,
+        messages: [
+          { role: "system", content: "Be terse." },
+          { role: "user", content: "what time is it?" },
+          { role: "assistant", content: null, tool_calls: [{ id: "call_7", type: "function", function: { name: "clock_now", arguments: "{}" } }] },
+          { role: "tool", tool_call_id: "call_7", content: "noon" },
+        ],
+        max_tokens: 512,
+        reasoning_effort: "max",
+        tools: [{ type: "function", function: { name: "clock_now", parameters: { type: "object" } } }],
+      });
+
+      assert.equal(response.headers.get("x-uos-upstream"), "deepseek");
+      const payload = (await response.json()) as Record<string, unknown>;
+      assert.equal(payload.object, "response");
+      assert.equal(payload.status, "completed");
+      assert.equal(payload.model, "deepseek-v4-flash");
+      assert.equal(payload.instructions, "Be terse.");
+      assert.deepEqual(
+        (payload.output as Record<string, unknown>[]).map((item) => item.type),
+        ["reasoning", "message", "function_call"]
+      );
+      assert.deepEqual(payload.usage, {
+        input_tokens: 9,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens: 5,
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 14,
+      });
+      const telemetry = getResponseTelemetry(response);
+      assert.equal(telemetry?.provider, "deepseek");
+      assert.equal(telemetry.reasoning, "max");
+      assert.deepEqual(telemetry.attemptedProviders, ["deepseek"]);
+    });
+
+    await t.step("streams the Responses event sequence from Chat chunks", async () => {
+      const chunk = (delta: Record<string, unknown>, extra: Record<string, unknown> = {}): string =>
+        `data: ${JSON.stringify({
+          id: "deepseek-responses-stream",
+          object: "chat.completion.chunk",
+          created: 1_780_000_101,
+          model: DEEPSEEK_FLASH_MODEL,
+          choices: [{ index: 0, delta, finish_reason: null, ...extra }],
+        })}\n\n`;
+      const response = await withFetchMock(
+        () =>
+          sseResponse([
+            chunk({ role: "assistant", reasoning_content: "thinking" }),
+            chunk({ content: "po" }),
+            chunk({ content: "ng" }, { finish_reason: "stop" }),
+            `data: ${JSON.stringify({
+              id: "deepseek-responses-stream",
+              object: "chat.completion.chunk",
+              created: 1_780_000_101,
+              model: DEEPSEEK_FLASH_MODEL,
+              choices: [],
+              usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 },
+            })}\n\n`,
+            "data: [DONE]\n\n",
+          ]),
+        () =>
+          handleResponses(responsesBody({ model: DEEPSEEK_FLASH_MODEL, input: "hi", stream: true }), {
+            keyId: null,
+            kernelRepo: null,
+            kernelOrg: null,
+            requestId: "deepseek-responses-stream",
+            startedAtMs: Date.now(),
+            startedAtMonotonicMs: performance.now(),
+          })
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("Content-Type"), "text/event-stream");
+      assert.equal(response.headers.get("x-uos-upstream"), "deepseek");
+      const events = responsesEvents(await response.text());
+      assert.deepEqual(
+        events.map((event) => event.type),
+        [
+          "response.created",
+          "response.in_progress",
+          "response.output_item.added",
+          "response.content_part.added",
+          "response.output_text.delta",
+          "response.output_text.delta",
+          "response.output_text.done",
+          "response.content_part.done",
+          "response.output_item.done",
+          "response.completed",
+        ]
+      );
+      const completed = events.at(-1) as { response: Record<string, unknown> };
+      assert.equal(completed.response.status, "completed");
+      assert.deepEqual(completed.response.usage, {
+        input_tokens: 9,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens: 5,
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 14,
+      });
+      const telemetry = getResponseTelemetry(response);
+      assert.equal(telemetry?.stream, true);
+      assert.equal(telemetry.streamTerminalType, "response.completed");
+      assert.equal(typeof telemetry.firstSemanticCommitmentMs, "number");
+    });
+
+    await t.step("rejects an untranslatable Responses field before provider dispatch", async () => {
+      let dispatchCalls = 0;
+      const response = await withFetchMock(
+        () => {
+          dispatchCalls += 1;
+          throw new Error("an untranslatable Responses request must not dispatch");
+        },
+        () => handleResponses(responsesBody({ model: DEEPSEEK_FLASH_MODEL, input: "hi", text: { format: { type: "json_schema", name: "x", schema: {} } } }))
+      );
+      assert.equal(dispatchCalls, 0);
+      assert.equal(response.status, 400);
+      assert.equal(((await response.json()) as { error?: { param?: string } }).error?.param, "text.format.type");
+    });
+  } finally {
+    if (originalApiKey === undefined) Deno.env.delete(envKey);
+    else Deno.env.set(envKey, originalApiKey);
   }
 });
 
