@@ -602,12 +602,14 @@ const applyCodexModelContextWindowFields = (item: Record<string, unknown>, norma
 const applyCodexModelReasoningFields = (item: Record<string, unknown>, normalized: Record<string, unknown>): void => {
   const defaultReasoning = item.default_reasoning_level === null ? "none" : normalizeReasoningEffort(item.default_reasoning_level);
   if (defaultReasoning) normalized.default_reasoning_level = defaultReasoning;
-  // Every non-empty advertised tier is preserved: the uploaded catalog is the
-  // source of truth, and `none` is the only gateway-known special case.
+  // Every non-empty advertised tier is preserved verbatim, and no tier is added:
+  // the upstream rejects values it does not support (`gpt-6-astra` answers a
+  // `reasoning.effort: "none"` request with a 400 naming low..max), so advertising
+  // a tier the catalog omits is a claim the endpoint will refuse. A null entry in
+  // the upstream list still means `none`, which is the upstream's own value.
   const rawLevels = item.supported_reasoning_levels;
   if (!Array.isArray(rawLevels)) return;
   const levels = rawLevels.map(reasoningLevelEffort).filter((entry): entry is ReasoningEffort => entry !== null);
-  if (!levels.includes("none")) levels.unshift("none");
   if (levels.length) normalized.supported_reasoning_levels = levels;
   const wireMap = deriveReasoningEffortWireMap(rawLevels);
   if (Object.keys(wireMap).length) normalized.reasoning_effort_wire_map = wireMap;

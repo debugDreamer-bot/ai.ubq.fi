@@ -745,7 +745,8 @@ Deno.test("admin codex auth stores live upstream model catalog as source of trut
     );
     assert.equal(stored.models[0]?.supported_in_api, false);
     assert.equal(stored.models[0]?.default_reasoning_level, "high");
-    assert.deepEqual(stored.models[0]?.supported_reasoning_levels, ["none", "low", "medium", "high", "xhigh", "max", "ultra"]);
+    // The live upstream list is stored verbatim: no tier is invented for it.
+    assert.deepEqual(stored.models[0]?.supported_reasoning_levels, ["low", "medium", "high", "xhigh", "max", "ultra"]);
     assert.deepEqual(stored.models[0]?.reasoning_effort_wire_map, { ultra: "max" });
     assert.equal(stored.models[1]?.visibility, "hide");
     assert.equal(stored.models[1]?.supported_in_api, true);

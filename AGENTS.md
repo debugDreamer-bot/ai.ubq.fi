@@ -8,11 +8,13 @@
 - Treat Codex CLI compatibility as a first-class gateway contract for `/v1/responses`. Accept fields emitted by
   supported Codex CLI versions through explicit compatibility extensions that remain separate from the official OpenAI
   schema allowlists and drift checks; do not present those extensions as official OpenAI fields.
-- Treat the uploaded Codex CLI model catalog as the source of truth for reasoning tier strings other than `none`.
-  Preserve every non-empty advertised tier and do not enforce a hard-coded tier allowlist or tier membership check.
-- Treat `none` as the sole gateway-known reasoning special case and expose it even when the uploaded catalog omits it.
-  Normalize null efforts in upstream model metadata to `none`, preserve `none` verbatim at the Codex upstream request
-  boundary, and never translate an explicit no-reasoning request to an omitted field or `null`.
+- Treat the uploaded Codex CLI model catalog as the source of truth for reasoning tier strings. Preserve every non-empty
+  advertised tier verbatim and do not enforce a hard-coded tier allowlist or tier membership check.
+- Never advertise a reasoning tier a source omitted. The endpoint rejects values its catalog does not list
+  (`gpt-6-astra` answers `reasoning.effort: "none"` with a 400 naming low..max), so an injected tier is a promise the
+  gateway cannot keep. Normalize a null effort in upstream metadata to `none`, because that null is the upstream's own
+  no-reasoning value, and preserve `none` verbatim at the Codex upstream request boundary: never translate an explicit
+  no-reasoning request to an omitted field or `null`. A model no source describes still defaults to `none` alone.
 - Mirror Codex CLI wire translation for advanced presets: send `ultra` upstream as `max`. Treat Codex's automatic
   multi-agent delegation for `ultra` as client-side orchestration, not as a distinct upstream reasoning effort.
 - Use this fixed inference waterfall, in cost order: eligible Codex subscription capacity first, Surplus Intelligence

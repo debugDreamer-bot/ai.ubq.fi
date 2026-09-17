@@ -2022,7 +2022,7 @@ Deno.test("openai: default reasoning level is accepted when supported levels are
   }
 });
 
-Deno.test("openai: none remains a gateway special case when snapshot levels omit it", async () => {
+Deno.test("openai: snapshot levels are advertised verbatim and an explicit none is still forwarded as none", async () => {
   const snapshotKey = keyToString(TEST_CODEX_MODELS_KEY);
   const previousSnapshot = kvStore.get(snapshotKey);
 
@@ -2050,7 +2050,8 @@ Deno.test("openai: none remains a gateway special case when snapshot levels omit
     const capabilitiesPayload = (await capabilitiesResponse.json()) as {
       data?: { supported_reasoning_levels?: string[] }[];
     };
-    assert.deepEqual(capabilitiesPayload.data?.[0]?.supported_reasoning_levels, ["none", "low", "medium", "high", "xhigh"]);
+    // No tier is invented: the upstream rejects an effort its catalog omits.
+    assert.deepEqual(capabilitiesPayload.data?.[0]?.supported_reasoning_levels, ["low", "medium", "high", "xhigh"]);
 
     let recordedBody: Record<string, unknown> | null = null;
     const chatResponse = await withFetchMock(

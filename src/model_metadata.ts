@@ -39,8 +39,6 @@ export type ModelMetadataHint = Readonly<{
   effective_context_window_percent?: number | null;
   supported_reasoning_levels?: readonly unknown[] | null;
   default_reasoning_effort?: unknown;
-  /** True when the source states reasoning cannot be disabled, such as OpenRouter's `mandatory`. */
-  reasoning_mandatory?: boolean;
 }>;
 
 export type ResolvedModelMetadata = Readonly<{
@@ -98,21 +96,20 @@ const openRouterHint = (metadata: OpenRouterModelMetadata): ModelMetadataHint =>
   max_context_window_tokens: metadata.max_context_window_tokens,
   supported_reasoning_levels: metadata.reasoning?.supported_efforts ?? null,
   default_reasoning_effort: metadata.reasoning?.default_effort ?? null,
-  reasoning_mandatory: metadata.reasoning?.mandatory ?? false,
 });
 
 /**
- * `none` is the gateway's one reasoning special case: it is offered whenever a
- * source advertises any tier and does not declare reasoning mandatory, so a
- * client can always ask for no reasoning on a model that allows it.
+ * Advertised tiers pass through verbatim, plus the source's own default level when
+ * it did not list it. No tier is invented: the upstream rejects an effort its
+ * catalog omits (`gpt-6-astra` refuses `none`), so a fabricated tier is a promise
+ * the endpoint breaks with a 400.
  */
-const withNoneAndDefault = (
+const withDefaultLevel = (
   advertised: readonly ReasoningEffort[],
-  defaultLevel: ReasoningEffort | null,
-  mandatory: boolean
+  defaultLevel: ReasoningEffort | null
 ): { levels: readonly ReasoningEffort[]; defaultLevel: ReasoningEffort | null } => {
   if (!advertised.length) return { levels: [], defaultLevel };
-  const levels = !mandatory && !advertised.includes("none") ? ["none", ...advertised] : [...advertised];
+  const levels = [...advertised];
   return { levels: defaultLevel && !levels.includes(defaultLevel) ? [...levels, defaultLevel] : levels, defaultLevel };
 };
 
@@ -208,11 +205,7 @@ const reasoningFrom = (codex: ModelMetadataHint | null, provider: ModelMetadataH
     ["openrouter", enrichment],
   ];
   for (const [source, hint] of candidates) {
-    const resolved = withNoneAndDefault(
-      advertisedReasoningLevels(hint?.supported_reasoning_levels),
-      normalizeReasoningEffort(hint?.default_reasoning_effort),
-      hint?.reasoning_mandatory === true
-    );
+    const resolved = withDefaultLevel(advertisedReasoningLevels(hint?.supported_reasoning_levels), normalizeReasoningEffort(hint?.default_reasoning_effort));
     if (resolved.levels.length) return { ...resolved, source };
   }
   return { levels: [], defaultLevel: null, source: "unknown" };
