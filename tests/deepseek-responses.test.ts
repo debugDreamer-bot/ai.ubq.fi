@@ -119,6 +119,97 @@ Deno.test("deepseek responses: flattens namespaced tools and drops what the API 
   assert.deepEqual(body.tool_choice, { type: "function", function: { name: "now" } });
 });
 
+Deno.test("deepseek responses: replays reasoning on tool turns because the provider requires it", () => {
+  // A tool-bearing request whose historical assistant turn omits
+  // `reasoning_content` is rejected by the provider with HTTP 400:
+  // "The `reasoning_content` in the thinking mode must be passed back to the API."
+  const withoutReasoning = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "run echo hi" }] },
+        { type: "function_call", name: "shell", arguments: '{"cmd":"echo hi"}', call_id: "call_1" },
+        { type: "function_call_output", call_id: "call_1", output: "hi" },
+      ],
+      tools: [{ type: "function", name: "shell", parameters: { type: "object" } }],
+    },
+    "deepseek-flash",
+    false
+  );
+  assert.equal(withoutReasoning.ok, true);
+  assert.deepEqual(withoutReasoning.value.body.messages, [
+    { role: "user", content: "run echo hi" },
+    {
+      role: "assistant",
+      content: null,
+      reasoning_content: "",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"echo hi"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "hi" },
+  ]);
+});
+
+Deno.test("deepseek responses: carries the client's echoed reasoning onto its assistant turn", () => {
+  const withReasoning = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "run echo hi" }] },
+        {
+          type: "reasoning",
+          id: "rs_1",
+          summary: [
+            { type: "summary_text", text: "I should call " },
+            { type: "summary_text", text: "the shell tool." },
+          ],
+        },
+        { type: "function_call", name: "shell", arguments: '{"cmd":"echo hi"}', call_id: "call_1" },
+        { type: "function_call_output", call_id: "call_1", output: "hi" },
+      ],
+      tools: [{ type: "function", name: "shell", parameters: { type: "object" } }],
+    },
+    "deepseek-flash",
+    false
+  );
+  assert.equal(withReasoning.ok, true);
+  const messages = withReasoning.value.body.messages as Record<string, unknown>[];
+  assert.equal(messages[1].reasoning_content, "I should call the shell tool.");
+  assert.deepEqual(messages[1].tool_calls, [{ id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"echo hi"}' } }]);
+});
+
+Deno.test("deepseek responses: a reasoning item also rides a plain assistant message", () => {
+  const withMessage = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "message", role: "user", content: "hi" },
+        { type: "reasoning", content: [{ type: "reasoning_text", text: "Because." }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] },
+        { type: "message", role: "user", content: "again" },
+      ],
+    },
+    "deepseek-flash",
+    false
+  );
+  assert.equal(withMessage.ok, true);
+  const messages = withMessage.value.body.messages as Record<string, unknown>[];
+  assert.equal(messages[1].reasoning_content, "Because.");
+});
+
+Deno.test("deepseek responses: reasoning is never invented without tools", () => {
+  const withoutTools = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "message", role: "user", content: "hi" },
+        { type: "function_call", name: "shell", arguments: "{}", call_id: "call_1" },
+        { type: "function_call_output", call_id: "call_1", output: "hi" },
+      ],
+    },
+    "deepseek-flash",
+    false
+  );
+  assert.equal(withoutTools.ok, true);
+  const messages = withoutTools.value.body.messages as Record<string, unknown>[];
+  assert.equal("reasoning_content" in messages[1], false);
+});
+
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
   const schema = toDeepSeekResponsesChatBody({ input: "hi", text: { format: { type: "json_schema", name: "x" } } }, "deepseek-flash", false);
   assert.equal(schema.ok, false);

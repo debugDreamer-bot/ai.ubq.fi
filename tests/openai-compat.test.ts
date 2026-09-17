@@ -14110,7 +14110,14 @@ Deno.test("openai: DeepSeek official Responses adapter serves the Codex wire pro
         messages: [
           { role: "system", content: "Be terse." },
           { role: "user", content: "what time is it?" },
-          { role: "assistant", content: null, tool_calls: [{ id: "call_7", type: "function", function: { name: "clock_now", arguments: "{}" } }] },
+          // The provider requires replayed reasoning on a tool-bearing request, so
+          // a historical tool turn without captured reasoning carries an empty string.
+          {
+            role: "assistant",
+            content: null,
+            reasoning_content: "",
+            tool_calls: [{ id: "call_7", type: "function", function: { name: "clock_now", arguments: "{}" } }],
+          },
           { role: "tool", tool_call_id: "call_7", content: "noon" },
         ],
         max_tokens: 512,
