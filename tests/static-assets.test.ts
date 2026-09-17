@@ -312,16 +312,17 @@ Deno.test("public agent-readiness pages and crawl artifacts are registered", () 
   }
 });
 
-Deno.test("admin provider view places capacity history before current providers", () => {
+Deno.test("admin analytics view places capacity history before current providers", () => {
   const listIndex = adminHtml.indexOf('id="provider-capacity-list"');
   const chartIndex = adminHtml.indexOf('id="provider-capacity-chart"');
   assert.ok(chartIndex >= 0);
   assert.ok(listIndex > chartIndex);
 
-  assert.match(adminHtml, /id="card-provider-capacity">Providers/);
+  assert.match(adminHtml, /id="card-provider-capacity">Provider analytics/);
+  assert.match(adminHtml, /id="view-tab-analytics"[\s\S]*?>\s*Analytics\s*</);
   assert.doesNotMatch(adminHtml, /Fifteen-minute capacity, cached-input, and cache-write history/);
-  assert.match(adminHtml, /admin\.css\?v=20260917-model-picker-v1/);
-  assert.match(adminHtml, /admin\.js\?v=20260917-model-picker-v1/);
+  assert.match(adminHtml, /admin\.css\?v=20260917-provider-picker-v1/);
+  assert.match(adminHtml, /admin\.js\?v=20260917-provider-picker-v1/);
   assert.doesNotMatch(adminHtml, /removed_provider-failover|debug-routing/);
   assert.doesNotMatch(adminScript, /RemovedProviderFailover|refresh=live/);
   assert.match(adminScript, /fetch\(apiUrl\("\/admin\/providers\/capacity"\)/);

@@ -299,15 +299,16 @@ Deno.test("the public and admin catalogs are built by one shared unfiltered snap
   // public catalog must still apply the whitelist to the very same snapshot.
   const publicHandler = /export const handlePublicModelCatalog = async \(\): Promise<Response> => \{([\s\S]*?)\n\};/.exec(openaiSource)?.[1] ?? "";
   assert.notEqual(publicHandler, "", "handlePublicModelCatalog must stay declared");
-  assert.match(publicHandler, /const catalog = await buildModelCatalogSnapshot\(\);/);
-  assert.match(publicHandler, /filterWhitelistedModelMap\(catalog\.models, catalogWhitelist\)/);
-  assert.match(publicHandler, /sources: catalog\.sources/);
+  assert.match(publicHandler, /const \[catalog, selection\] = await Promise\.all\(\[buildModelCatalogSnapshot\(\), loadProviderSelectionCached\(\)\]\);/);
+  assert.match(publicHandler, /filterWhitelistedModelMap\(filterCatalogEntriesByProviderSelection\(catalog\.models, selection\), catalogWhitelist\)/);
+  assert.match(publicHandler, /sources: selectedCatalogSources\(catalog\.sources, selection\)/);
 
   const adminHandler = /export const handleAdminModelsCatalogGet = async \(([\s\S]*?)\n\};/.exec(adminSource)?.[1] ?? "";
   assert.notEqual(adminHandler, "", "handleAdminModelsCatalogGet must stay declared");
   assert.match(adminHandler, /const buildCatalog = dependencies\.buildCatalog \?\? buildModelCatalogSnapshot;/);
   assert.match(adminHandler, /models: catalog\.models/);
   assert.doesNotMatch(adminHandler, /filterWhitelisted/, "the picker must not hide the models it can re-enable");
+  assert.doesNotMatch(adminHandler, /filterCatalogEntriesByProviderSelection/, "a switched-off provider's models must stay pickable");
 });
 
 Deno.test("the Models tab renders checkbox tools instead of a free-text whitelist", () => {
@@ -367,4 +368,50 @@ Deno.test("the Models tab renders checkbox tools instead of a free-text whitelis
   assert.match(modelsScript, /source\?\.configured !== false/);
   assert.match(modelsScript, /deepseek: "DeepSeek"/);
   assert.match(modelsScript, /cerebras: "Cerebras"/);
+});
+
+Deno.test("the Providers tab renders a provider picker next to the Analytics tab", () => {
+  assert.match(adminHtml, /id="providers-selection-list" data-provider-picker/);
+  assert.match(adminHtml, /id="view-analytics"[\s\S]*?id="provider-capacity-chart"/, "the analytics view keeps the capacity chart");
+  assert.match(adminHtml, /id="view-providers"[\s\S]*?id="providers-selection-list"/, "the providers view owns the picker");
+  assert.match(adminHtml, /id="view-tab-analytics"/);
+  assert.match(adminScript, /analytics: viewTabAnalytics/);
+  assert.match(adminScript, /analytics: viewAnalytics/);
+
+  for (const id of [
+    "providers-selection-search",
+    "providers-selection-sort",
+    "providers-selection-only-active",
+    "providers-selection-check-all",
+    "providers-selection-uncheck-all",
+    "providers-selection-invert",
+    "providers-selection-discard",
+    "providers-selection-reload",
+    "providers-selection-save",
+    "providers-selection-badge",
+    "providers-selection-summary",
+    "providers-selection-warning",
+  ]) {
+    assert.match(adminHtml, new RegExp(`id="${id}"`), `${id} must be rendered`);
+    assert.match(adminScript, new RegExp(`mustGet\\("${id}"\\)`), `${id} must be wired`);
+  }
+  for (const tier of ["all", "subscription", "paid", "direct"]) {
+    assert.match(adminHtml, new RegExp(`data-provider-tier="${tier}"`), `${tier} needs a filter chip`);
+  }
+  for (const provider of ["codex", "openlux", "surplus", "deepseek", "cerebras"]) {
+    assert.match(adminScript, new RegExp(`id: "${provider}"`), `${provider} needs a roster entry`);
+  }
+
+  assert.match(adminScript, /fetch\(apiUrl\("\/admin\/providers\/selection"\), \{/);
+  assert.match(adminScript, /method: "POST"/);
+  assert.match(adminScript, /dataset\.providerToggle/);
+  assert.match(adminScript, /if \(providersHasUnsavedChanges\(\) && options\.force !== true\)/);
+
+  // The routing contract the panel has to explain: nothing checked is a removed
+  // filter, not a gateway with every provider switched off.
+  assert.match(adminHtml, /Saving an empty selection removes the filter/);
+  assert.match(adminScript, /providersSelectionSave\.disabled = saving \|\| !unsaved \|\| providersSelectionIsEmpty\(\)/);
+  assert.match(adminScript, /providersEmptyWarning/);
+  // The waterfall order is fixed, so the picker must never claim to reorder it.
+  assert.match(adminHtml, /The waterfall order itself never changes/);
 });
