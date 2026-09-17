@@ -443,11 +443,12 @@ capacity.
 
 ### DeepSeek official
 
-`deepseek-flash` and its interchangeable legacy id `deepseek-v4-flash` both route to DeepSeek's official API at
-`https://api.deepseek.com/chat/completions` using the server-side `DEEPSEEK_API_KEY`, and both reach the API as the
-canonical `deepseek-flash` model, which is also the id echoed in responses. Their catalog rows report
-`upstream_provider: "deepseek"`, tiers `none`/`low`/`high`/`max`, and a `high` default. Other DeepSeek-named catalog
-models (for example `deepseek-v4-pro`) keep their existing catalog-proven provider.
+Every model the official API publishes routes to `https://api.deepseek.com/chat/completions` using the server-side
+`DEEPSEEK_API_KEY`: `deepseek-flash`, its interchangeable legacy id `deepseek-v4-flash` (both reach the API as the
+canonical `deepseek-flash` model, which is the id echoed in responses), and `deepseek-v4-pro`, which is sent and echoed
+as itself. Their catalog rows report `upstream_provider: "deepseek"`, tiers `none`/`low`/`high`/`max`, and a `high`
+default. Catalog rows list every provider that publishes an id; the operator's whitelist selection, not the catalog
+builder, decides which models the gateway advertises.
 
 Both ids are also served on `/v1/responses` through a translation adapter, because the Codex CLI speaks only the
 Responses API while the official API speaks only Chat Completions. `input`, `instructions`, flat and `namespace`-grouped
