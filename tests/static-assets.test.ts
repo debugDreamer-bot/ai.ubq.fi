@@ -247,6 +247,21 @@ Deno.test("published guidance documents endpoint-specific output caps and reposi
   assert.match(llmsFullText, /deno task upload:auth --url https:\/\/ai\.ubq\.fi --auth-json ~\/\.codex\/auth\.json/);
 });
 
+Deno.test("admin console every rendered tab declares an access requirement", () => {
+  // `canAccessView` returns false for a view with no `VIEW_REQUIREMENTS` entry,
+  // so a tab added to the markup without one is dead for every role.
+  const requirements = /const VIEW_REQUIREMENTS = \{([\s\S]*?)\n\};/.exec(adminScript)?.[1] ?? "";
+  assert.notEqual(requirements, "", "VIEW_REQUIREMENTS must be declared");
+  const declared = new Set([...requirements.matchAll(/^\s{2}([a-z-]+):/gm)].map((match) => match[1]));
+  const tabs = [...adminHtml.matchAll(/id="view-tab-([a-z-]+)"/g)].map((match) => match[1]);
+  assert.notEqual(tabs.length, 0, "the admin console must render tabs");
+  for (const tab of tabs) {
+    // `session` is the signed-out shell, handled before the requirement lookup.
+    if (tab === "session") continue;
+    assert.equal(declared.has(tab), true, `admin tab '${tab}' declares no access requirement`);
+  }
+});
+
 Deno.test("models page labels provider counts as catalog entries, not inference availability", () => {
   assert.match(modelsHtml, /Model catalog/);
   assert.match(modelsHtml, /Availability and quota vary by provider/);
