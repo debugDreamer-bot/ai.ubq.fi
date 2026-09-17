@@ -701,7 +701,7 @@ const deepSeekOfficialCodexModels = (): Record<string, unknown>[] => {
     return {
       slug: id,
       display_name: id === DEEPSEEK_FLASH_MODEL ? "DeepSeek Flash" : "DeepSeek Flash (legacy id)",
-      description: "DeepSeek official API (DeepSeek-V4.1-Flash) served by this gateway.",
+      description: "DeepSeek official API (deepseek-flash) served by this gateway.",
       owned_by: "deepseek",
       supported_endpoint_types: ["openai-response", "openai-chat"],
       supported_reasoning_levels: [

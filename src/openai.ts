@@ -9600,7 +9600,7 @@ const handleDeepSeekResponses = async (req: Request, rawRecord: Record<string, u
 
   const translated = toDeepSeekResponsesChatBody(rawRecord, modelRaw, clientWantsStream);
   if (!translated.ok) return openaiError(400, translated.message, "invalid_request_error", { param: translated.param });
-  const { body: chatBody, toolNames } = translated.value;
+  const { body: chatBody, toolNames, customToolNames } = translated.value;
 
   const echo: DeepSeekResponsesEcho = {
     tools: rawRecord.tools,
@@ -9635,6 +9635,7 @@ const handleDeepSeekResponses = async (req: Request, rawRecord: Record<string, u
       createdAtSeconds,
       echo,
       toolNames,
+      customToolNames,
       providerRequestId,
       usageContext,
       downstreamSignal,
@@ -9657,7 +9658,7 @@ const handleDeepSeekResponses = async (req: Request, rawRecord: Record<string, u
 
   providerRequestId ??= normalizeDeepSeekProviderRequestId(completion.value.id);
   if (usageContext?.responseTelemetry) usageContext.responseTelemetry.providerRequestId = providerRequestId;
-  const payload = toDeepSeekResponsesPayload(completion.value, modelRaw, responseId, echo, toolNames);
+  const payload = toDeepSeekResponsesPayload(completion.value, modelRaw, responseId, echo, toolNames, customToolNames);
   const usage = extractChatUsageTokens(completion.value.usage);
   await recordCompletionUsage(usageContext, usage);
   recordStreamTerminalType(usageContext, "response.completed");
@@ -9678,6 +9679,7 @@ const streamDeepSeekResponses = (
   createdAtSeconds: number,
   echo: DeepSeekResponsesEcho,
   toolNames: ReadonlyMap<string, string>,
+  customToolNames: ReadonlySet<string>,
   providerRequestId: string | null,
   usageContext: UsageContext | undefined,
   downstreamSignal: AbortSignal,
@@ -9689,7 +9691,7 @@ const streamDeepSeekResponses = (
   headers.set("Cache-Control", "no-cache");
 
   const iterator = iterateDeepSeekChatCompletionStream(upstream, DEEPSEEK_FLASH_MODEL, { signal: requestSignal });
-  const translator = createDeepSeekResponsesStreamTranslator(requestedModel, responseId, echo, createdAtSeconds, toolNames);
+  const translator = createDeepSeekResponsesStreamTranslator(requestedModel, responseId, echo, createdAtSeconds, toolNames, customToolNames);
   const state = { settled: false, cancelled: false, semantic: false, usage: null as UsageTokens | null };
 
   const settleTerminal = (terminalType: ResponseStreamTerminalType): void => {
