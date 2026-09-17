@@ -22,7 +22,7 @@ import { CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT, resolvedAutoCompactTokenLimit }
  * context window by the shared 85%-or-50k-reserve rule, which is arithmetic, not
  * per-model knowledge.
  */
-export type ModelMetadataSource = "codex_upload" | "provider_discovery" | "openrouter" | "unknown";
+export type ModelMetadataSource = "codex_upload" | "codex_subscription" | "provider_discovery" | "openrouter" | "unknown";
 
 /**
  * What a single source claims about a model, in upstream vocabulary: Codex
@@ -53,6 +53,13 @@ export type ResolvedModelMetadata = Readonly<{
 
 export type ModelMetadataSources = Readonly<{
   codex?: ModelMetadataHint | null;
+  /**
+   * The conservative Codex-subscription bound, passed by callers that know the
+   * id is served by the Codex subscription. It outranks provider discovery and
+   * enrichment so a subscription model never advertises a window Codex will not
+   * honor, and it never overrides a window the upload stated.
+   */
+  codexSubscription?: ModelMetadataHint | null;
   provider?: ModelMetadataHint | null;
   openRouter?: OpenRouterModelMetadata | null;
 }>;
@@ -127,12 +134,39 @@ export const codexSnapshotMetadataHint = (record: Record<string, unknown> | null
   };
 };
 
+/**
+ * The window a Codex subscription serves when the uploaded catalog does not state
+ * one. A subscription serves frontier models below their API-level maximum, and
+ * third-party catalogs publish that larger maximum, so falling through to
+ * enrichment would advertise a window the subscription cannot honor. Measured
+ * from the uploaded catalog on 2026-09-17: every Codex-served id reports
+ * `context_window` 272,000 with `max_context_window` 872,000.
+ *
+ * This is a conservative deployment bound, not per-model curation: an explicit
+ * window in the uploaded catalog still wins, and ids Codex does not serve are
+ * untouched.
+ */
+export const CODEX_SUBSCRIPTION_CONTEXT_WINDOW_TOKENS = 272_000;
+export const CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS = 872_000;
+
+/** The conservative Codex window as a hint, for Codex-served ids the upload leaves unstated. */
+export const codexSubscriptionMetadataHint = (): ModelMetadataHint => ({
+  context_window_tokens: CODEX_SUBSCRIPTION_CONTEXT_WINDOW_TOKENS,
+  max_context_window_tokens: CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS,
+});
+
 /** True when a source published either context window, in either spelling. */
 const statesContext = (hint: ModelMetadataHint | null): boolean =>
   hint !== null && (positiveTokenCount(hint.context_window_tokens) !== null || positiveTokenCount(hint.max_context_window_tokens) !== null);
 
-const contextSourceOf = (codex: ModelMetadataHint | null, provider: ModelMetadataHint | null, enrichment: ModelMetadataHint | null): ModelMetadataSource => {
+const contextSourceOf = (
+  codex: ModelMetadataHint | null,
+  subscription: ModelMetadataHint | null,
+  provider: ModelMetadataHint | null,
+  enrichment: ModelMetadataHint | null
+): ModelMetadataSource => {
   if (statesContext(codex)) return "codex_upload";
+  if (statesContext(subscription)) return "codex_subscription";
   if (statesContext(provider)) return "provider_discovery";
   if (statesContext(enrichment)) return "openrouter";
   return "unknown";
@@ -172,13 +206,18 @@ const reasoningFrom = (codex: ModelMetadataHint | null, provider: ModelMetadataH
 export const resolveModelMetadata = (modelId: string, sources: ModelMetadataSources = {}): ResolvedModelMetadata => {
   const openRouter = sources.openRouter === undefined ? openRouterMetadataFor(modelId) : sources.openRouter;
   const codex = sources.codex ?? null;
+  const subscription = sources.codexSubscription ?? null;
   const provider = sources.provider ?? null;
   const enrichment = openRouter ? openRouterHint(openRouter) : null;
 
-  const contextWindow = firstTokenCount(codex?.context_window_tokens, provider?.context_window_tokens, enrichment?.context_window_tokens);
-  const declaredMaxWindow = firstTokenCount(codex?.max_context_window_tokens, provider?.max_context_window_tokens, enrichment?.max_context_window_tokens);
-  const declaredAutoCompact = firstTokenCount(codex?.auto_compact_token_limit_tokens, provider?.auto_compact_token_limit_tokens);
-  const declaredPercent = codex?.effective_context_window_percent ?? provider?.effective_context_window_percent;
+  // A Codex-served id never advertises more than the subscription bound: the
+  // uploaded window wins when it exists, otherwise the bound replaces what
+  // enrichment would have claimed.
+  const windowHint = statesContext(codex) ? codex : subscription;
+  const contextWindow = firstTokenCount(windowHint?.context_window_tokens, provider?.context_window_tokens, enrichment?.context_window_tokens);
+  const declaredMaxWindow = firstTokenCount(windowHint?.max_context_window_tokens, provider?.max_context_window_tokens, enrichment?.max_context_window_tokens);
+  const declaredAutoCompact = firstTokenCount(windowHint?.auto_compact_token_limit_tokens, provider?.auto_compact_token_limit_tokens);
+  const declaredPercent = windowHint?.effective_context_window_percent ?? provider?.effective_context_window_percent;
   const reasoning = reasoningFrom(codex, provider, enrichment);
 
   return {
@@ -188,7 +227,7 @@ export const resolveModelMetadata = (modelId: string, sources: ModelMetadataSour
     effective_context_window_percent: positiveTokenCount(declaredPercent) ?? (contextWindow === null ? null : CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT),
     supported_reasoning_levels: reasoning.levels.length ? reasoning.levels : null,
     default_reasoning_effort: reasoning.defaultLevel,
-    context_source: contextSourceOf(codex, provider, enrichment),
+    context_source: contextSourceOf(codex, subscription, provider, enrichment),
     reasoning_source: reasoning.source,
   };
 };

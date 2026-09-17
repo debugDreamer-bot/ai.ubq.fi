@@ -1,67 +1,32 @@
 /// <reference lib="deno.ns" />
 
-import { getKv } from "./src/kv.ts";
 import { config } from "./src/config.ts";
+import { getKv } from "./src/kv.ts";
 import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseServeRuntimeOptions } from "./src/local_admin_auth.ts";
 import { ensureLocalDevelopmentApiKey } from "./src/local_development_key.ts";
-import { reconcileDuePaidFallbacksV3 } from "./src/paid_fallback_ledger.ts";
-import { prunePromptCacheAnalytics } from "./src/prompt_cache_analytics.ts";
-import { sampleProviderCapacityForCron } from "./src/provider_capacity.ts";
-import { fetchOpenRouterModels } from "./src/openrouter_models.ts";
 import { createServeHandler } from "./src/serve_handler.ts";
-const isProductionRuntime = (): boolean => Deno.env.get("DENO_TIMELINE") === "production";
 
-void Deno.cron("reconcile pending metered billing", "* * * * *", async () => {
-  if (!isProductionRuntime()) return;
-  try {
-    // KV is optional at process boot. Resolve it only when the scheduled
-    // reconciliation actually runs so a slow KV connection cannot prevent
-    // a new Deploy revision from reaching the serving state.
-    const kv = await getKv();
-    if (!kv) return;
-    await reconcileDuePaidFallbacksV3(Date.now(), kv);
-  } catch (error) {
-    console.error("[ai.ubq.fi] Scheduled paid fallback reconciliation failed:", error instanceof Error ? error.message : String(error));
-  }
-});
-
-void Deno.cron("sample Codex provider capacity", "*/15 * * * *", async () => {
-  if (!isProductionRuntime()) return;
-  try {
-    const kv = await getKv();
-    if (!kv) return;
-    await sampleProviderCapacityForCron({ kv });
-  } catch (error) {
-    console.error("[ai.ubq.fi] Provider capacity sampler failed:", error instanceof Error ? error.message : String(error));
-  }
-});
-
-void Deno.cron("refresh model metadata enrichment", "*/5 * * * *", async () => {
-  if (!isProductionRuntime()) return;
-  try {
-    // TTL-aware: a request that already refreshed the snapshot inside the window
-    // makes this cheap, so the catalog stays warm without polling harder than the
-    // cache needs. A failed refresh keeps the last good snapshot.
-    await fetchOpenRouterModels();
-  } catch (error) {
-    console.error("[ai.ubq.fi] Model metadata refresh failed:", error instanceof Error ? error.message : String(error));
-  }
-});
-
-void Deno.cron("prune prompt cache analytics", "7 * * * *", async () => {
-  if (!isProductionRuntime()) return;
-  try {
-    const kv = await getKv();
-    if (!kv) return;
-    const result = await prunePromptCacheAnalytics({ kv });
-    if (result.status === "unavailable") {
-      console.warn("[ai.ubq.fi] prompt_cache_analytics", JSON.stringify({ status: "prune_unavailable" }));
-    }
-  } catch {
-    console.warn("[ai.ubq.fi] prompt_cache_analytics", JSON.stringify({ status: "prune_failed" }));
-  }
-});
-
+/**
+ * No scheduled work runs in this process. Everything the deploy crons used to do
+ * now happens because an event happened, and the mapping is deliberate:
+ *
+ * - "reconcile pending metered billing" (every minute) -> a paid-fallback request
+ *   reaching a terminal state (`src/paid_fallback.ts`) or an operator reading the
+ *   paid-fallback ledger (`src/admin.ts`).
+ * - "sample Codex provider capacity" (every 15 minutes) -> a capacity observation
+ *   in `src/codex.ts` (quota exhaustion, upstream outage or unreachable host, a
+ *   verified banked reset, or a served request), or an operator asking for a live
+ *   view (`?refresh=live`). One probe per fifteen-minute history bucket,
+ *   lease-guarded.
+ * - "prune prompt cache analytics" (hourly) -> the first analytics write in a new
+ *   bucket (`src/prompt_cache_analytics.ts`).
+ *
+ * Consequences are intentional: with no traffic and no operator, nothing runs.
+ * Durable state (pending reconciliation markers, capacity buckets, retained
+ * analytics) waits for the next event instead of a timer, and `deno.json` no
+ * longer enables the `cron` unstable feature, so `Deno.cron` does not exist here.
+ * See `docs/event-driven-maintenance.md`.
+ */
 const serveHandler = createServeHandler();
 
 const runtimeOptions = parseServeRuntimeOptions(Deno.args, { isDeploy: config.isDeploy });

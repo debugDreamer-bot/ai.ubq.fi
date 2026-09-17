@@ -479,7 +479,10 @@ export const recordPromptCacheAnalytics = async (
   try {
     for (let attempt = 0; attempt <= PROMPT_CACHE_ANALYTICS_MAX_COHORTS_PER_BUCKET; attempt += 1) {
       const outcome = await admitCohort(admission);
-      if (outcome !== null) return outcome;
+      if (outcome !== null) {
+        pruneRetentionOnEvent(kv, bucketStartAtMs, nowMs);
+        return outcome;
+      }
     }
   } catch {
     return recordResult("unavailable", "kv_unavailable", bucketStartAtMs);
@@ -500,6 +503,20 @@ const storageBucketStart = (key: Deno.KvKey): number | null => {
 const legacyStorageBucketStart = (key: Deno.KvKey): number | null => {
   const bucketStartAtMs = key[LEGACY_PROMPT_CACHE_ANALYTICS_V1_KV_PREFIX.length];
   return safeCounter(bucketStartAtMs) ? bucketStartAtMs : null;
+};
+
+/**
+ * One prune per analytics bucket, driven by a write instead of the retired
+ * hourly cron. Retention still removes everything past its cutoff: the first
+ * write in a new bucket prunes, later writes in the same bucket are a no-op, so
+ * pruning costs one scan per bucket no matter how much traffic arrives.
+ */
+let lastPrunedBucketStartAtMs = 0;
+
+const pruneRetentionOnEvent = (kv: Deno.Kv, bucketStartAtMs: number, nowMs: number): void => {
+  if (bucketStartAtMs <= lastPrunedBucketStartAtMs) return;
+  lastPrunedBucketStartAtMs = bucketStartAtMs;
+  void prunePromptCacheAnalytics({ kv, now: () => nowMs }).catch(() => {});
 };
 
 /** Removes V2 and legacy V1 entries at the eight-day boundary without scanning fresh buckets. */

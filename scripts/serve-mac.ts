@@ -17,28 +17,6 @@ const kv = await Deno.openKv(new URL(".data/kv.sqlite3", root).pathname);
 const { initializeKv } = await import(new URL("src/kv.ts", release).href);
 initializeKv(kv);
 const { default: handler } = (await import(new URL("serve.ts", release).href)) as typeof import("../serve.ts");
-const { sampleProviderCapacityForCron } = await import(new URL("src/provider_capacity.ts", release).href);
-const sampleCapacity = async () => {
-  try {
-    await sampleProviderCapacityForCron({ kv });
-  } catch (error) {
-    console.error("[ai.ubq.fi] Mac provider capacity sampler failed:", error);
-  }
-};
-// The registration promise only surfaces registration errors; awaiting it would
-// delay startup and the job runs in the background for the process lifetime.
-void Deno.cron("sample Mac provider capacity", "*/15 * * * *", sampleCapacity);
-await sampleCapacity();
-const { fetchOpenRouterModels } = await import(new URL("src/openrouter_models.ts", release).href);
-const refreshModelMetadata = async () => {
-  try {
-    await fetchOpenRouterModels();
-  } catch (error) {
-    console.error("[ai.ubq.fi] Mac model metadata refresh failed:", error);
-  }
-};
-void Deno.cron("refresh Mac model metadata", "*/5 * * * *", refreshModelMetadata);
-await refreshModelMetadata();
 const { configureAdminAuthForListener, configureAdminAuthPeerForRequest } = await import(new URL("src/local_admin_auth.ts", release).href);
 // The Mac service is the loopback development server, so it provisions the
 // unlimited local development key that loopback inference authenticates as.

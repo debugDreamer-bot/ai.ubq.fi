@@ -1,4 +1,11 @@
 import assert from "node:assert/strict";
+
+// This suite asserts exact fetch and KV budgets, so the event-driven maintenance
+// hooks must not run in the background while it measures them.
+const { setProviderCapacitySampleTriggerForTest } = await import("../src/provider_capacity_events.ts");
+const { setPaidFallbackTerminalSweepForTest } = await import("../src/paid_fallback.ts");
+setProviderCapacitySampleTriggerForTest(() => {});
+setPaidFallbackTerminalSweepForTest(() => {});
 import type { CodexBankedResetConfig } from "../src/codex_banked_reset.ts";
 import type { CodexUsageResetProvider } from "../src/codex_banked_reset_provider.ts";
 import type { CodexAuthPoolState } from "../src/types.ts";

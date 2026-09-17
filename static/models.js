@@ -21,6 +21,7 @@ const providerNames = {
 // group, so a row can honestly read "Codex catalog + OpenRouter".
 const metadataSourceNames = {
   codex_upload: "Codex catalog",
+  codex_subscription: "Codex subscription",
   provider_discovery: "Provider discovery",
   openrouter: "OpenRouter",
 };

@@ -47,7 +47,7 @@ import { readBoundedResponseBody } from "./bounded_response_body.ts";
 import { BUFFERED_INFERENCE_DEADLINE_MS } from "./inference_deadline.ts";
 import { recordCodexProviderHealth } from "./provider_health.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, loadRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY } from "./runtime_config.ts";
-import { recordProviderCapacityDowntimeEvent, recordProviderCapacityResetEvent } from "./provider_capacity_events.ts";
+import { recordProviderCapacityDowntimeEvent, recordProviderCapacityResetEvent, triggerProviderCapacitySample } from "./provider_capacity_events.ts";
 import type { SentinelUpstreamRecorder } from "./sentinel_upstream_capture.ts";
 import { base64UrlDecode, decodeBase64ToString, getString, isRecord, sha256Hex } from "./utils.ts";
 import type { CodexAuthPoolState, CodexAuthState, ResponseInputItem } from "./types.ts";
@@ -1400,6 +1400,8 @@ const recordCodexResponseHealth = async (
   if (response.status === 401 || (response.status === 403 && auth !== undefined && accessTokenExpired(auth))) {
     await recordCodexProviderHealth(accountId, "auth_invalid", response.status, Date.now, providerRequestId);
   } else if (response.status === 429) {
+    // An exhausted account is the strongest capacity observation there is.
+    triggerProviderCapacitySample();
     await recordCodexProviderHealth(accountId, "quota_exhausted", response.status, Date.now, providerRequestId);
   } else if (response.status >= 500) {
     void recordProviderCapacityDowntimeEvent({
@@ -1407,8 +1409,13 @@ const recordCodexResponseHealth = async (
       status: response.status,
       observed_at_ms: Date.now(),
     });
+    // An upstream failure is a capacity observation: sample the bucket now.
+    triggerProviderCapacitySample();
     await recordCodexProviderHealth(accountId, "upstream_error", response.status, Date.now, providerRequestId);
   } else if (response.ok && successfulResponseEvent !== null) {
+    // A served request is a capacity observation too: it keeps the bucket's
+    // history current on a healthy gateway, still one probe per bucket.
+    triggerProviderCapacitySample();
     await recordCodexProviderHealth(accountId, successfulResponseEvent, response.status, Date.now, providerRequestId);
   } else if (!response.ok) {
     await recordCodexProviderHealth(accountId, "reachable", response.status, Date.now, providerRequestId);
@@ -1430,6 +1437,7 @@ const recordCodexThrownHealth = async (accountId: string, error: unknown): Promi
       status: error instanceof CodexError && error.status >= 500 && error.status <= 599 ? error.status : null,
       observed_at_ms: Date.now(),
     });
+    triggerProviderCapacitySample();
   }
 };
 
@@ -2575,6 +2583,8 @@ const fetchPreparedCodexResponses = async (
         },
         kv
       );
+      // A verified reset changes the capacity picture; refresh the sample.
+      triggerProviderCapacitySample();
     } catch {
       // Capacity telemetry is best effort and must never change inference.
     }
