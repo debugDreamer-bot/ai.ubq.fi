@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 
 import { CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT } from "../src/recent_model_context.ts";
+import {
+  CODEX_SUBSCRIPTION_CONTEXT_WINDOW_TOKENS,
+  CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS,
+  codexSubscriptionMetadataHint,
+} from "../src/model_metadata.ts";
 import { codexSnapshotMetadataHint, resolveModelMetadata } from "../src/model_metadata.ts";
 import type { OpenRouterModelMetadata } from "../src/openrouter_models.ts";
 
@@ -76,6 +81,40 @@ Deno.test("a declared auto-compact limit inside the resolved window is preserved
   });
   assert.equal(resolved.context_window_tokens, 272_000);
   assert.equal(resolved.auto_compact_token_limit_tokens, 200_000);
+});
+
+Deno.test("the Codex subscription bound outranks enrichment for a Codex-served id", () => {
+  // OpenRouter publishes the API-level maximum; a subscription serves less, so
+  // the conservative bound has to win when the upload states no window.
+  const resolved = resolveModelMetadata("gpt-5.6-sol", {
+    codex: { supported_reasoning_levels: ["low", "high"] },
+    codexSubscription: codexSubscriptionMetadataHint(),
+    openRouter: enrichment({ context_window_tokens: 1_050_000, max_context_window_tokens: 1_050_000 }),
+  });
+  assert.equal(resolved.context_window_tokens, CODEX_SUBSCRIPTION_CONTEXT_WINDOW_TOKENS);
+  assert.equal(resolved.max_context_window_tokens, CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS);
+  assert.equal(resolved.auto_compact_token_limit_tokens, 222_000);
+  assert.equal(resolved.context_source, "codex_subscription");
+  // Tiers still come from the upload, which is authoritative for them.
+  assert.equal(resolved.reasoning_source, "codex_upload");
+});
+
+Deno.test("an uploaded Codex window beats the subscription bound", () => {
+  const resolved = resolveModelMetadata("gpt-5.6-sol", {
+    codex: { context_window_tokens: 400_000, max_context_window_tokens: 400_000 },
+    codexSubscription: codexSubscriptionMetadataHint(),
+    openRouter: enrichment(),
+  });
+  assert.equal(resolved.context_window_tokens, 400_000);
+  assert.equal(resolved.context_source, "codex_upload");
+});
+
+Deno.test("ids Codex does not serve keep their provider or enrichment window", () => {
+  const resolved = resolveModelMetadata("glm-5.3", {
+    openRouter: enrichment({ id: "z-ai/glm-5.3", context_window_tokens: 1_310_720, max_context_window_tokens: 1_310_720 }),
+  });
+  assert.equal(resolved.context_window_tokens, 1_310_720);
+  assert.equal(resolved.context_source, "openrouter");
 });
 
 Deno.test("a mandatory-reasoning model does not gain a none tier it does not advertise", () => {

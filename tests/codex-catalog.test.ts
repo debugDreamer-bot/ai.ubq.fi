@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
 
+// This suite asserts exact fetch and KV budgets, so the event-driven maintenance
+// hooks must not run in the background while it measures them.
+const { setProviderCapacitySampleTriggerForTest } = await import("../src/provider_capacity_events.ts");
+const { setPaidFallbackTerminalSweepForTest } = await import("../src/paid_fallback.ts");
+setProviderCapacitySampleTriggerForTest(() => {});
+setPaidFallbackTerminalSweepForTest(() => {});
+
 // The DeepSeek official route appends its models to the served catalog whenever
 // DEEPSEEK_API_KEY is configured. These tests assert exact catalog shapes from
 // stored snapshots and discovery sources only, so the ambient credential is

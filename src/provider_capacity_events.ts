@@ -340,14 +340,24 @@ export const listProviderCapacityResetEvents = async (
  */
 let lastSampledBucketStartAtMs = 0;
 
-export const resetProviderCapacityEventTriggerForTest = (): void => {
-  lastSampledBucketStartAtMs = 0;
-};
-
-export const triggerProviderCapacitySample = (options: Readonly<{ now?: () => number }> = {}): void => {
+const defaultProviderCapacitySampleTrigger = (options: Readonly<{ now?: () => number }>): void => {
   const nowMs = (options.now ?? Date.now)();
   const bucketStartAtMs = Math.floor(nowMs / PROVIDER_CAPACITY_HISTORY_BUCKET_MS) * PROVIDER_CAPACITY_HISTORY_BUCKET_MS;
   if (bucketStartAtMs <= lastSampledBucketStartAtMs) return;
   lastSampledBucketStartAtMs = bucketStartAtMs;
   void import("./provider_capacity.ts").then((sampler) => sampler.sampleProviderCapacityOnEvent({ now: () => nowMs })).catch(() => {});
+};
+
+let providerCapacitySampleTrigger = defaultProviderCapacitySampleTrigger;
+
+/**
+ * Tests replace the trigger so a background probe cannot race their fetch and KV
+ * expectations; `null` restores the real one.
+ */
+export const setProviderCapacitySampleTriggerForTest = (trigger: ((options: Readonly<{ now?: () => number }>) => void) | null): void => {
+  providerCapacitySampleTrigger = trigger ?? defaultProviderCapacitySampleTrigger;
+};
+
+export const triggerProviderCapacitySample = (options: Readonly<{ now?: () => number }> = {}): void => {
+  providerCapacitySampleTrigger(options);
 };

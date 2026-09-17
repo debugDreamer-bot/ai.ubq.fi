@@ -1400,6 +1400,8 @@ const recordCodexResponseHealth = async (
   if (response.status === 401 || (response.status === 403 && auth !== undefined && accessTokenExpired(auth))) {
     await recordCodexProviderHealth(accountId, "auth_invalid", response.status, Date.now, providerRequestId);
   } else if (response.status === 429) {
+    // An exhausted account is the strongest capacity observation there is.
+    triggerProviderCapacitySample();
     await recordCodexProviderHealth(accountId, "quota_exhausted", response.status, Date.now, providerRequestId);
   } else if (response.status >= 500) {
     void recordProviderCapacityDowntimeEvent({
@@ -1411,6 +1413,9 @@ const recordCodexResponseHealth = async (
     triggerProviderCapacitySample();
     await recordCodexProviderHealth(accountId, "upstream_error", response.status, Date.now, providerRequestId);
   } else if (response.ok && successfulResponseEvent !== null) {
+    // A served request is a capacity observation too: it keeps the bucket's
+    // history current on a healthy gateway, still one probe per bucket.
+    triggerProviderCapacitySample();
     await recordCodexProviderHealth(accountId, successfulResponseEvent, response.status, Date.now, providerRequestId);
   } else if (!response.ok) {
     await recordCodexProviderHealth(accountId, "reachable", response.status, Date.now, providerRequestId);

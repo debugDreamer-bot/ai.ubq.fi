@@ -14,9 +14,10 @@ import { createServeHandler } from "./src/serve_handler.ts";
  *   reaching a terminal state (`src/paid_fallback.ts`) or an operator reading the
  *   paid-fallback ledger (`src/admin.ts`).
  * - "sample Codex provider capacity" (every 15 minutes) -> a capacity observation
- *   (rate-limit reset, upstream downtime) in `src/codex.ts`, or an operator
- *   opening the capacity view (`src/provider_capacity.ts`). One probe per
- *   fifteen-minute history bucket, lease-guarded.
+ *   in `src/codex.ts` (quota exhaustion, upstream outage or unreachable host, a
+ *   verified banked reset, or a served request), or an operator asking for a live
+ *   view (`?refresh=live`). One probe per fifteen-minute history bucket,
+ *   lease-guarded.
  * - "prune prompt cache analytics" (hourly) -> the first analytics write in a new
  *   bucket (`src/prompt_cache_analytics.ts`).
  *

@@ -79,6 +79,7 @@ import { getKv } from "./kv.ts";
 import { loadRuntimeConfig } from "./runtime_config.ts";
 import {
   codexSnapshotMetadataHint,
+  codexSubscriptionMetadataHint,
   resolveModelMetadata,
   type ModelMetadataHint,
   type ModelMetadataSource,
@@ -5928,7 +5929,7 @@ const normalizeModelCapabilitiesEntry = (value: unknown): Record<string, unknown
   const promptCache = normalizePromptCacheCapabilities(value.prompt_cache);
   // The uploaded catalog is authoritative whenever it publishes a value; the
   // dynamic sources only fill what it leaves unstated.
-  const resolved = resolveModelMetadata(id, { codex: codexSnapshotMetadataHint(value) });
+  const resolved = resolveModelMetadata(id, { codex: codexSnapshotMetadataHint(value), codexSubscription: codexSubscriptionMetadataHint() });
   return {
     id,
     object: "uos.model_capabilities",
@@ -7869,7 +7870,11 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
   // Enrichment is cache-only and never awaited, so a slow third party cannot
   // delay the catalog; the first load after a cold start simply shows less.
   warmOpenRouterModels();
-  const snapshot = await loadCodexModelsSnapshot();
+  // The compacted runtime copy keeps reasoning tiers and drops context windows,
+  // so reading it here let a third-party API-level window (1M) outrank the window
+  // Codex actually serves (272k for these ids). The full uploaded catalog is the
+  // Codex override; the runtime copy is only a fallback when it is unavailable.
+  const snapshot = (await loadFullCodexModelsSnapshot()) ?? (await loadCodexModelsSnapshot());
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
   const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels({ requireApiKey: false })]);
   const codexModels = normalized?.data ?? [];
@@ -7892,7 +7897,7 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
         supported_endpoints: ["/v1/responses", "/v1/chat/completions"],
       },
       model.created,
-      { codex: codexSnapshotMetadataHint(codexRecord) }
+      { codex: codexSnapshotMetadataHint(codexRecord), codexSubscription: codexSubscriptionMetadataHint() }
     );
   }
   for (const model of metered?.models ?? []) {

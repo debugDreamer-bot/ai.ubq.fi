@@ -12,7 +12,6 @@ import {
   type ProviderCapacityRateLimitResetEvent,
   providerCapacityRateLimitResetEventKey,
   type ProviderCapacityResetEvent,
-  triggerProviderCapacitySample,
 } from "./provider_capacity_events.ts";
 import { readPromptCacheAnalytics } from "./prompt_cache_analytics.ts";
 import { PROVIDER_CAPACITY_HISTORY_BUCKET_MS, PROVIDER_CAPACITY_SNAPSHOT_KEY } from "./provider_capacity_contract.ts";
@@ -1318,10 +1317,6 @@ export const handleProviderCapacity = async (
   options: ProviderCapacitySnapshotOptions = {}
 ): Promise<Response> => {
   const promptCache = readPromptCacheAnalytics({ kv: options.kv, now: options.now });
-  // Opening the capacity view is an event: sample the current bucket in the
-  // background so the persisted view this dashboard reads keeps up without a
-  // scheduled sampler.
-  triggerProviderCapacitySample(options);
   try {
     const live = new URL(request.url).searchParams.get("refresh") === "live";
     const view = live ? await refreshProviderCapacity(options) : await getPersistedProviderCapacityView(options);

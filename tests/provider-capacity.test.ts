@@ -1252,7 +1252,7 @@ const withCountingCapacityEnvironment = async (run: () => Promise<void>): Promis
   }
 };
 
-Deno.test("cron sampler persists capacity without building the discarded admin projection", async () => {
+Deno.test("event sampler persists capacity without building the discarded admin projection", async () => {
   await withCountingCapacityEnvironment(async () => {
     const samplerKv = new CountingKv();
     seedCountingCapacityKv(samplerKv);
@@ -1263,7 +1263,7 @@ Deno.test("cron sampler persists capacity without building the discarded admin p
       kv: samplerKv as unknown as Deno.Kv,
       fetcher: createFetcher(samplerCalls),
       now: () => nowMs,
-      createLeaseOwner: () => "cron-sampler",
+      createLeaseOwner: () => "event-sampler",
     });
     finishSamplerBudget();
 
@@ -1273,11 +1273,11 @@ Deno.test("cron sampler persists capacity without building the discarded admin p
     assert.equal(
       samplerKv.commands.filter((command) => command.scenario === "background:capacity_sampler" && command.command === "list").length,
       0,
-      "the cron sampler must not enumerate history or reset-event projection prefixes"
+      "the event sampler must not enumerate history or reset-event projection prefixes"
     );
     // The quota refresh inside a sample also appends at most one hourly
     // balance-history read plus one upsert, hence the 22-command ceiling.
-    assert.ok(samplerBudget.commands <= 22, `cron sampler budget unexpectedly grew to ${samplerBudget.commands} KV commands`);
+    assert.ok(samplerBudget.commands <= 22, `event sampler budget unexpectedly grew to ${samplerBudget.commands} KV commands`);
     assert.notEqual((await samplerKv.get(PROVIDER_CAPACITY_SNAPSHOT_KEY)).value, null);
     assert.notEqual((await samplerKv.get(providerCapacityHistoryKey(nowMs))).value, null);
     assert.notEqual((await samplerKv.get(CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY)).value, null);
@@ -1312,11 +1312,11 @@ Deno.test("cron sampler persists capacity without building the discarded admin p
       liveRefreshKv.commands.filter((command) => command.scenario === "background:capacity_view" && command.command === "list").length >= 8,
       "the full admin view should retain its history and reset-event projections"
     );
-    assert.ok(liveRefreshBudget.commands - samplerBudget.commands >= 10, "the cron-only path must retain the measured projection reduction");
+    assert.ok(liveRefreshBudget.commands - samplerBudget.commands >= 10, "the sampler-only path must retain the measured projection reduction");
   });
 });
 
-Deno.test("cron sampler preserves a same-bucket reset transition", async () => {
+Deno.test("event sampler preserves a same-bucket reset transition", async () => {
   await withCountingCapacityEnvironment(async () => {
     const countingKv = new CountingKv();
     seedCountingCapacityKv(countingKv);
@@ -1353,7 +1353,7 @@ Deno.test("cron sampler preserves a same-bucket reset transition", async () => {
   });
 });
 
-Deno.test("concurrent cron samplers keep one provider probe under the durable lease", async () => {
+Deno.test("concurrent event samplers keep one provider probe under the durable lease", async () => {
   await withCountingCapacityEnvironment(async () => {
     const countingKv = new CountingKv();
     seedCountingCapacityKv(countingKv);
@@ -1370,18 +1370,18 @@ Deno.test("concurrent cron samplers keep one provider probe under the durable le
       kv: countingKv as unknown as Deno.Kv,
       fetcher,
       now: () => nowMs,
-      createLeaseOwner: () => "first-cron",
+      createLeaseOwner: () => "first-event",
     });
     const waitDeadline = Date.now() + 2_000;
     while (calls.length < 3) {
-      assert.ok(Date.now() < waitDeadline, "first cron sampler did not issue all provider calls");
+      assert.ok(Date.now() < waitDeadline, "first event sampler did not issue all provider calls");
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     const second = sampleProviderCapacityOnEvent({
       kv: countingKv as unknown as Deno.Kv,
       fetcher,
       now: () => nowMs,
-      createLeaseOwner: () => "second-cron",
+      createLeaseOwner: () => "second-event",
     });
     releaseFetch();
     await Promise.all([first, second]);

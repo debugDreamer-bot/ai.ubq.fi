@@ -513,10 +513,6 @@ const legacyStorageBucketStart = (key: Deno.KvKey): number | null => {
  */
 let lastPrunedBucketStartAtMs = 0;
 
-export const resetPromptCacheAnalyticsPruneTriggerForTest = (): void => {
-  lastPrunedBucketStartAtMs = 0;
-};
-
 const pruneRetentionOnEvent = (kv: Deno.Kv, bucketStartAtMs: number, nowMs: number): void => {
   if (bucketStartAtMs <= lastPrunedBucketStartAtMs) return;
   lastPrunedBucketStartAtMs = bucketStartAtMs;
