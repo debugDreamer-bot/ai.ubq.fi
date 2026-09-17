@@ -8012,8 +8012,14 @@ const loadDefaults = async (options = {}) => {
 // The public Models page renders providers, reasoning tiers, and context sizes
 // for each catalog entry; this panel reuses that presentation with a checkbox
 // per model so an operator can switch visibility on and off.
-const MODEL_PROVIDER_LABELS = { codex: "Codex", openlux: "Metered 2", surplus: "Metered 1" };
-const MODEL_PROVIDER_IDS = ["codex", "openlux", "surplus"];
+const MODEL_PROVIDER_LABELS = {
+  codex: "Codex",
+  openlux: "Metered 2",
+  surplus: "Metered 1",
+  deepseek: "DeepSeek",
+  cerebras: "Cerebras",
+};
+const MODEL_PROVIDER_IDS = ["codex", "openlux", "surplus", "deepseek", "cerebras"];
 const MODEL_REASONING_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const MODEL_TOKEN_FORMAT = new Intl.NumberFormat("en-US");
 const MODEL_DATE_FORMAT = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "2-digit" });
@@ -8216,7 +8222,13 @@ const invalidateAdminModels = (message) => {
 
 const modelsCatalogWarning = () => {
   const unavailable = MODEL_PROVIDER_IDS
-    .filter((id) => modelsCatalogSources?.[id]?.status && modelsCatalogSources[id].status !== "available")
+    .filter((id) => {
+      const source = modelsCatalogSources?.[id];
+      if (!source?.status || source.status === "available") return false;
+      // A credential-gated provider that the gateway has no key for is absent
+      // on purpose; only a configured source that failed to read is a warning.
+      return source.configured !== false;
+    })
     .map((id) => MODEL_PROVIDER_LABELS[id]);
   if (!unavailable.length) return "";
   return `${
@@ -8279,6 +8291,9 @@ const updateModelsStatus = () => {
     button.disabled = id !== "all" && count === 0;
     const countElement = button.querySelector("[data-model-filter-count]");
     if (countElement) countElement.textContent = formatNumber(count);
+    button.title = modelsCatalogSources?.[id]?.configured === false
+      ? `${MODEL_PROVIDER_LABELS[id]} is not configured`
+      : "";
   }
 
   modelsCheckAllBtn.disabled = saving || visibleCount === 0 || visibleChecked === visibleCount;

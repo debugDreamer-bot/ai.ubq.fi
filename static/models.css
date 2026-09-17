@@ -36,7 +36,7 @@ body[data-page="models"] [data-model-count] {
 
 body[data-page="models"] [data-source-summary] {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
   margin-top: 28px;
 }
@@ -80,6 +80,14 @@ body[data-page="models"] [data-source-summary] article:nth-child(2) {
 
 body[data-page="models"] [data-source-summary] article:nth-child(3) {
   --i: 2;
+}
+
+body[data-page="models"] [data-source-summary] article:nth-child(4) {
+  --i: 3;
+}
+
+body[data-page="models"] [data-source-summary] article:nth-child(5) {
+  --i: 4;
 }
 
 body[data-page="models"] [data-model-list] {
