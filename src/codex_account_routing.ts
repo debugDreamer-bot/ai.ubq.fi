@@ -1,6 +1,7 @@
 import { getKv } from "./kv.ts";
 import { readBoundedResponseBody } from "./bounded_response_body.ts";
 import { PROVIDER_CAPACITY_SNAPSHOT_KEY } from "./provider_capacity_contract.ts";
+import { codexAccountEligibility, codexSubscriptionHash, loadProviderSelectionCached } from "./provider_selection.ts";
 import { getString, isRecord, sha256Hex } from "./utils.ts";
 import type { CodexAuthPoolState, CodexAuthState } from "./types.ts";
 
@@ -2996,6 +2997,29 @@ type CodexSerialAdmissionRows = Readonly<{
 }>;
 
 /**
+ * The configured subscriptions the operator has left eligible for routing.
+ * Durable slots keep tracking every configured account — the routing state is
+ * passed the full pool — so re-enabling a subscription resumes its recorded
+ * quota history instead of rebuilding it. Only the accounts an admission may
+ * select are narrowed here.
+ *
+ * Narrowing the pool is itself the operator's decision, so a reduced cohort is
+ * the cohort: "every account is exhausted" and the banked-reset cohort both
+ * describe the subscriptions that are still switched on.
+ */
+const selectedCodexSubscriptionPool = async (pool: CodexAuthPoolState): Promise<CodexAuthPoolState> => {
+  const eligibility = codexAccountEligibility(await loadProviderSelectionCached());
+  if (eligibility.kind === "all") return pool;
+  if (eligibility.kind === "none") return pool.accounts.length ? { ...pool, accounts: [] } : pool;
+  const enabled = new Set<string>(eligibility.hashes);
+  const accounts: CodexAuthState[] = [];
+  for (const account of pool.accounts) {
+    if (enabled.has(await codexSubscriptionHash(account.account_id))) accounts.push(account);
+  }
+  return accounts.length === pool.accounts.length ? pool : { ...pool, accounts };
+};
+
+/**
  * Parse one strong-read snapshot. Any malformed or unavailable durable row
  * fails the admission before any decision or write.
  */
@@ -3013,10 +3037,13 @@ const prepareCodexSerialAdmissionRows = async (
   if (rows.routingEntry.value !== null && durableRouting === null) return null;
   const normalized = await normalizeRoutingState(durableRouting, durablePool, now, true);
   const observations = parseStoredCapacityObservationStore(rows.capacityEntry.value);
-  const evaluations = await evaluateSerialRoutingAccounts(normalized, durablePool, model, observations, now);
+  // The admission pool and the decision pool must be the same pool, or a
+  // switched-off subscription could still be elected as the active account.
+  const routingPool = await selectedCodexSubscriptionPool(durablePool);
+  const evaluations = await evaluateSerialRoutingAccounts(normalized, routingPool, model, observations, now);
   return {
     active,
-    durablePool,
+    durablePool: routingPool,
     durableRouting,
     normalized,
     poolVersionstamp,
