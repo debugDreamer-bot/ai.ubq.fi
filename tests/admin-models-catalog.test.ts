@@ -382,6 +382,7 @@ Deno.test("the Providers tab renders a provider picker next to the Analytics tab
   assert.match(adminScript, /analytics: viewAnalytics/);
 
   for (const id of [
+    "providers-selection-drop-missing",
     "providers-selection-search",
     "providers-selection-sort",
     "providers-selection-only-active",
@@ -417,6 +418,23 @@ Deno.test("the Providers tab renders a provider picker next to the Analytics tab
   assert.match(adminScript, /providersEmptyWarning/);
   // The waterfall order is fixed, so the picker must never claim to reorder it.
   assert.match(adminHtml, /The waterfall order itself never changes/);
+});
+
+Deno.test("each Codex subscription is selectable under the Codex provider", () => {
+  assert.match(adminHtml, /Each configured Codex subscription is selectable on its own/);
+  assert.match(adminScript, /list\.dataset\.providerSubscriptions = ""/);
+  assert.match(adminScript, /dataset\.providerSubscriptionToggle = subscription\.id/);
+  assert.match(adminScript, /dataset\.providerSubscriptionMeta/);
+
+  // The umbrella and the individual subscription ids must never coexist, or the
+  // saved selection would be ambiguous about whether it means one account or all.
+  assert.match(adminScript, /const setSubscriptionChecked = \(subscriptionId, checked\) => \{/);
+  assert.match(adminScript, /providerSelection\.delete\("codex"\)/);
+  assert.match(adminScript, /providerSelection\.add\("codex"\)/);
+  assert.match(adminScript, /checkbox\.indeterminate = partial/);
+  assert.match(adminScript, /providersMissingSelectionIds/);
+  assert.match(adminScript, /fetch\(apiUrl\("\/admin\/providers\/selection"\), \{/);
+  assert.match(adminScript, /subscriptions\.every\(\(subscription\) => providerSelection\.has\(subscription\.id\)\)/);
 });
 
 Deno.test("admin metadata refresh forces every upstream and reports what is cached", async () => {

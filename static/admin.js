@@ -238,6 +238,7 @@ const providersOnlyActiveInput = mustGet("providers-selection-only-active");
 const providersCheckAllBtn = mustGet("providers-selection-check-all");
 const providersUncheckAllBtn = mustGet("providers-selection-uncheck-all");
 const providersInvertBtn = mustGet("providers-selection-invert");
+const providersDropMissingBtn = mustGet("providers-selection-drop-missing");
 const providersDiscardBtn = mustGet("providers-selection-discard");
 const providersReloadBtn = mustGet("providers-selection-reload");
 const providersSummary = mustGet("providers-selection-summary");
@@ -8701,6 +8702,41 @@ const providerRosterEntry = (id) => providerRoster.find((entry) => entry.id === 
 /** The loaded roster, so a retired provider never reaches the API again. */
 const providersRosterIds = () => (providerRoster.length ? providerRoster.map((entry) => entry.id) : PROVIDER_ALL_IDS);
 
+/** One configured Codex subscription, as the API reports it. */
+const providersSubscriptionsFor = (entry) =>
+  Array.isArray(entry?.subscriptions)
+    ? entry.subscriptions.filter((subscription) => typeof subscription?.id === "string" && subscription.id)
+    : [];
+
+const providerSubscriptions = () => providersSubscriptionsFor(providerRosterEntry("codex"));
+
+/**
+ * The Codex tier has two selection shapes: the `codex` umbrella means every
+ * configured subscription, and individual subscription ids mean exactly those.
+ * The staged set never holds both, so the panel (and the saved list) is always
+ * unambiguous.
+ */
+const providerSubscriptionSelected = (subscriptionId) =>
+  providerSelection.has("codex") || providerSelection.has(subscriptionId);
+
+/** A tier is active when its own id is checked, or when any of its subscriptions is. */
+const isProviderChecked = (providerId) =>
+  providerId === "codex"
+    ? providerSelection.has("codex") || providerCodexSelection().selected > 0
+    : providerSelection.has(providerId);
+
+const providerCodexSelection = () => {
+  const subscriptions = providerSubscriptions();
+  const selected = subscriptions.filter((subscription) => providerSubscriptionSelected(subscription.id)).length;
+  return { subscriptions, selected, total: subscriptions.length, all: providerSelection.has("codex") };
+};
+
+/** Staged ids that the loaded roster no longer describes: retired providers, gone subscriptions. */
+const providersMissingSelectionIds = () => {
+  const known = new Set([...providersRosterIds(), ...providerSubscriptions().map((subscription) => subscription.id)]);
+  return [...providerSelection].filter((id) => !known.has(id)).sort();
+};
+
 /**
  * An empty saved selection is the documented "no filter" state, so the console
  * shows every provider as active and never offers to save that empty state
@@ -8717,11 +8753,20 @@ const providersHasUnsavedChanges = () =>
 
 const providersSelectionIsEmpty = () => providerSelection.size === 0;
 
-/** Selected ids in roster order, or an empty list when every active provider is checked. */
+/**
+ * Selected ids in roster order, then the narrowed subscriptions, or an empty
+ * list when every active provider is checked (which is the no-filter state).
+ */
 const providersSelectedIds = () => {
   const rosterIds = providersRosterIds();
-  if (providersSelectionIsEmpty() || providerSelection.size >= rosterIds.length) return [];
-  return rosterIds.filter((id) => providerSelection.has(id));
+  if (providersSelectionIsEmpty() || rosterIds.every((id) => providerSelection.has(id))) return [];
+  const selected = rosterIds.filter((id) => providerSelection.has(id));
+  for (const subscription of providerSubscriptions()) {
+    if (providerSubscriptionSelected(subscription.id) && !providerSelection.has("codex")) {
+      selected.push(subscription.id);
+    }
+  }
+  return selected;
 };
 
 const providersTierCounts = () => {
@@ -8736,7 +8781,10 @@ const providersEntryMatchesQuery = (entry, query) => {
     entry.label.toLowerCase().includes(query) ||
     (PROVIDER_TIER_LABELS[entry.tier] ?? entry.tier).toLowerCase().includes(query) ||
     String(entry.model_count ?? 0).includes(query) ||
-    entry.detail.toLowerCase().includes(query);
+    entry.detail.toLowerCase().includes(query) ||
+    providersSubscriptionsFor(entry).some((subscription) =>
+      String(subscription.label ?? "").toLowerCase().includes(query)
+    );
 };
 
 const providersFilterIsActive = () =>
@@ -8748,7 +8796,9 @@ const providersVisibleEntries = () => {
   const onlyActive = providersOnlyActiveInput.checked;
   const visible = providerRoster.filter((entry) => {
     if (providerTierFilter !== "all" && entry.tier !== providerTierFilter) return false;
-    if (onlyActive && !providerSelection.has(entry.id)) return false;
+    if (
+      onlyActive && !providerSelection.has(entry.id) && !(entry.id === "codex" && providerCodexSelection().selected > 0)
+    ) return false;
     return providersEntryMatchesQuery(entry, query);
   });
   if (providersSortSelect.value === "models") {
@@ -8776,15 +8826,20 @@ const providerHealthFor = (id) => {
 
 const buildProviderOption = (entry) => {
   const id = entry.id;
+  const codex = id === "codex" ? providerCodexSelection() : null;
+  const checked = codex ? codex.all : providerSelection.has(id);
+  const partial = codex !== null && !codex.all && codex.selected > 0;
   const option = document.createElement("label");
   option.dataset.providerOption = "";
   option.dataset.providerId = id;
-  option.dataset.checked = providerSelection.has(id) ? "true" : "false";
+  option.dataset.checked = checked ? "true" : "false";
+  option.dataset.providerPartial = partial ? "true" : "false";
 
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   checkbox.dataset.providerToggle = id;
-  checkbox.checked = providerSelection.has(id);
+  checkbox.checked = checked;
+  checkbox.indeterminate = partial;
 
   const body = document.createElement("span");
   body.dataset.providerBody = "";
@@ -8816,7 +8871,13 @@ const buildProviderOption = (entry) => {
 
   const facts = [`${formatNumber(Number(entry.model_count ?? 0))} catalog models`, entry.endpoints];
   if (entry.status && entry.status !== "available") facts.push("Catalog unavailable");
-  if (health?.accountCount) facts.push(`${formatNumber(health.accountCount)} accounts`);
+  if (codex?.total) {
+    facts.push(
+      codex.all
+        ? `${formatNumber(codex.total)} subscriptions`
+        : `${formatNumber(codex.selected)} of ${formatNumber(codex.total)} subscriptions`,
+    );
+  } else if (health?.accountCount) facts.push(`${formatNumber(health.accountCount)} accounts`);
   const meta = document.createElement("span");
   meta.dataset.providerMeta = "";
   meta.textContent = facts.join(" · ");
@@ -8824,6 +8885,57 @@ const buildProviderOption = (entry) => {
 
   option.append(checkbox, body);
   return option;
+};
+
+/**
+ * The subscription rows under the Codex provider. Checking one narrows the tier
+ * to that account; the parent row keeps the tier itself switched on.
+ */
+const buildProviderSubscriptions = (entry) => {
+  const list = document.createElement("div");
+  list.dataset.providerSubscriptions = "";
+  list.setAttribute("role", "group");
+  list.setAttribute("aria-label", `${entry.label} subscriptions`);
+  for (const subscription of providersSubscriptionsFor(entry)) {
+    const selected = providerSubscriptionSelected(subscription.id);
+    const row = document.createElement("label");
+    row.dataset.providerSubscription = "";
+    row.dataset.subscriptionId = subscription.id;
+    row.dataset.checked = selected ? "true" : "false";
+    if (providerSelection.has("codex")) row.dataset.inherited = "true";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.providerSubscriptionToggle = subscription.id;
+    checkbox.checked = selected;
+
+    const body = document.createElement("span");
+    body.dataset.providerSubscriptionBody = "";
+    const name = document.createElement("span");
+    name.dataset.providerSubscriptionName = "";
+    name.textContent = subscription.label ?? subscription.id;
+    const meta = document.createElement("span");
+    meta.dataset.providerSubscriptionMeta = "";
+    const health = latestProviderHealth?.codex?.accounts?.find?.((account) => account?.slot === subscription.slot) ??
+      null;
+    const facts = [`slot ${formatNumber(Number(subscription.slot ?? 0))}`];
+    if (health?.access_token_expired === true) facts.push("token expired");
+    else if (health?.refresh_recommended === true) facts.push("refresh due");
+    meta.textContent = facts.join(" · ");
+    body.append(name, meta);
+    row.append(checkbox, body);
+    list.append(row);
+  }
+  return list;
+};
+
+const buildProviderEntry = (entry) => {
+  const container = document.createElement("div");
+  container.dataset.providerEntry = "";
+  container.dataset.providerId = entry.id;
+  container.append(buildProviderOption(entry));
+  if (providersSubscriptionsFor(entry).length) container.append(buildProviderSubscriptions(entry));
+  return container;
 };
 
 const renderProvidersMessage = (message) => {
@@ -8856,7 +8968,25 @@ const providersEmptyWarning = () =>
 const providersRoutingWarnings = () => {
   const warnings = [];
   if (providersSelectionIsEmpty()) return warnings;
-  if (!providerSelection.has("codex")) {
+  const missing = providersMissingSelectionIds();
+  if (missing.length) {
+    warnings.push(
+      `${formatNumber(missing.length)} saved ${
+        missing.length === 1 ? "subscription is" : "subscriptions are"
+      } no longer configured, so ${
+        missing.length === 1 ? "it" : "they"
+      } cannot serve; remove the missing entries to keep the selection honest.`,
+    );
+  }
+  const codex = providerCodexSelection();
+  if (!providerSelection.has("codex") && codex.total && codex.selected > 0) {
+    warnings.push(
+      `Codex is limited to ${formatNumber(codex.selected)} of ${
+        formatNumber(codex.total)
+      } subscriptions; the other accounts stay unused.`,
+    );
+  }
+  if (!isProviderChecked("codex")) {
     warnings.push("Codex is off, so requests start at the paid tiers and the subscription capacity stays unused.");
   }
   if (!providerSelection.has("surplus") && !providerSelection.has("openlux")) {
@@ -8868,7 +8998,7 @@ const providersRoutingWarnings = () => {
 const providersHealthWarning = () => {
   const missing = PROVIDER_ALL_IDS.filter((id) => {
     const health = providerHealthFor(id);
-    return providerSelection.has(id) && health?.configured === false;
+    return isProviderChecked(id) && health?.configured === false;
   });
   if (!missing.length) return "";
   const labels = missing.map((id) => providerRosterEntry(id)?.label ?? id);
@@ -8886,11 +9016,17 @@ const updateProvidersStatus = () => {
   const visibleChecked = [...providersVisibleIds].filter((id) => providerSelection.has(id)).length;
   const unsaved = providersHasUnsavedChanges();
   const saving = providerSelectionSaving;
+  const missingSelectionIds = providersMissingSelectionIds();
   const filterActive = providersSelectedIds().length > 0;
 
-  const activeLabels = providersRosterIds().filter((id) => providerSelection.has(id)).map((id) =>
-    providerRosterEntry(id)?.label ?? id
-  );
+  const codex = providerCodexSelection();
+  // A narrowed Codex tier is active, so it belongs in the active list with the
+  // subscription count that is doing the work.
+  const activeLabels = providersRosterIds().filter((id) => isProviderChecked(id)).map((id) => {
+    const label = providerRosterEntry(id)?.label ?? id;
+    if (id !== "codex" || !codex.total || codex.all) return label;
+    return `${label} (${formatNumber(codex.selected)} of ${formatNumber(codex.total)} subscriptions)`;
+  });
   if (!providerSelectionLoadedAt && total === 0) {
     providersSummary.textContent = "Waiting for the provider roster.";
   } else if (selected === 0) {
@@ -8901,7 +9037,7 @@ const updateProvidersStatus = () => {
     } providers checked: no filter is saved, so every provider is active.`;
   } else {
     providersSummary.textContent =
-      `${formatNumber(selected)} of ${formatNumber(total)} providers active: ${activeLabels.join(", ")}.` +
+      `${formatNumber(activeLabels.length)} of ${formatNumber(total)} providers active: ${activeLabels.join(", ")}.` +
       (visibleCount < total ? ` Showing ${formatNumber(visibleCount)}.` : "");
   }
 
@@ -8913,7 +9049,8 @@ const updateProvidersStatus = () => {
   else if (providerSelectionSaveError) setProvidersSelectionBadge("bad", providerSelectionSaveError);
   else if (unsaved) setProvidersSelectionBadge("warning", "Unsaved changes");
   else if (providerSelectionLoadedAt) {
-    setProvidersSelectionBadge("ok", filterActive ? `${formatNumber(selected)} active` : "No filter");
+    const activeTiers = providersRosterIds().filter((id) => isProviderChecked(id)).length;
+    setProvidersSelectionBadge("ok", filterActive ? `${formatNumber(activeTiers)} active` : "No filter");
   } else setProvidersSelectionBadge("unknown", "Not loaded");
 
   const counts = providersTierCounts();
@@ -8936,6 +9073,11 @@ const updateProvidersStatus = () => {
   providersUncheckAllBtn.textContent = scoped
     ? `Uncheck ${formatNumber(visibleCount)} shown`
     : `Uncheck all ${formatNumber(visibleCount)}`;
+  providersDropMissingBtn.disabled = saving || missingSelectionIds.length === 0;
+  providersDropMissingBtn.textContent = missingSelectionIds.length
+    ? `Remove ${formatNumber(missingSelectionIds.length)} missing`
+    : "Remove missing";
+  providersDropMissingBtn.hidden = providerRoster.length === 0;
   providersDiscardBtn.disabled = saving || !unsaved;
   // Saving nothing is not a state the API can store: an empty list clears the
   // filter, so the button stays disabled until at least one provider is checked.
@@ -8954,7 +9096,7 @@ const renderProvidersPicker = () => {
         : "No provider matches the current filters.",
     );
   } else {
-    providersList.replaceChildren(...visible.map(buildProviderOption));
+    providersList.replaceChildren(...visible.map(buildProviderEntry));
   }
   updateProvidersStatus();
 };
@@ -8966,12 +9108,30 @@ const applyProvidersSelection = (mutate) => {
     renderProvidersPicker();
     return;
   }
-  for (const option of providersList.querySelectorAll("[data-provider-option]")) {
-    const id = option.dataset.providerId;
-    const checked = typeof id === "string" && providerSelection.has(id);
-    const checkbox = option.querySelector("input[type=checkbox]");
-    if (checkbox) checkbox.checked = checked;
-    option.dataset.checked = checked ? "true" : "false";
+  for (const entry of providersList.querySelectorAll("[data-provider-entry]")) {
+    const id = entry.dataset.providerId;
+    const codex = id === "codex" ? providerCodexSelection() : null;
+    const checked = codex ? codex.all : typeof id === "string" && providerSelection.has(id);
+    const partial = codex !== null && !codex.all && codex.selected > 0;
+    const option = entry.querySelector("[data-provider-option]");
+    const checkbox = option?.querySelector("input[type=checkbox]");
+    if (checkbox) {
+      checkbox.checked = checked;
+      checkbox.indeterminate = partial;
+    }
+    if (option) {
+      option.dataset.checked = checked ? "true" : "false";
+      option.dataset.providerPartial = partial ? "true" : "false";
+    }
+    for (const row of entry.querySelectorAll("[data-provider-subscription]")) {
+      const subscriptionId = row.dataset.subscriptionId;
+      const selected = typeof subscriptionId === "string" && providerSubscriptionSelected(subscriptionId);
+      const rowCheckbox = row.querySelector("input[type=checkbox]");
+      if (rowCheckbox) rowCheckbox.checked = selected;
+      row.dataset.checked = selected ? "true" : "false";
+      if (providerSelection.has("codex")) row.dataset.inherited = "true";
+      else delete row.dataset.inherited;
+    }
   }
   updateProvidersStatus();
 };
@@ -9113,39 +9273,83 @@ providersOnlyActiveInput.addEventListener("change", () => {
   renderProvidersPicker();
 });
 
+/** The `codex` umbrella and the individual subscription ids never coexist. */
+const setProviderChecked = (providerId, checked) => {
+  if (providerId !== "codex") {
+    if (checked) providerSelection.add(providerId);
+    else providerSelection.delete(providerId);
+    return;
+  }
+  for (const subscription of providerSubscriptions()) providerSelection.delete(subscription.id);
+  if (checked) providerSelection.add("codex");
+  else providerSelection.delete("codex");
+};
+
+/** Narrowing to one subscription expands the umbrella, then drops that account. */
+const setSubscriptionChecked = (subscriptionId, checked) => {
+  const subscriptions = providerSubscriptions();
+  const all = providerSelection.has("codex");
+  if (!checked) {
+    if (all) {
+      providerSelection.delete("codex");
+      for (const subscription of subscriptions) {
+        if (subscription.id !== subscriptionId) providerSelection.add(subscription.id);
+      }
+      return;
+    }
+    providerSelection.delete(subscriptionId);
+    return;
+  }
+  if (all) return;
+  providerSelection.add(subscriptionId);
+  if (subscriptions.every((subscription) => providerSelection.has(subscription.id))) {
+    for (const subscription of subscriptions) providerSelection.delete(subscription.id);
+    providerSelection.add("codex");
+  }
+};
+
 providersList.addEventListener("change", (event) => {
   const checkbox = event.target;
   if (!(checkbox instanceof HTMLInputElement) || checkbox.type !== "checkbox") return;
+  const subscriptionId = checkbox.dataset.providerSubscriptionToggle;
   const id = checkbox.dataset.providerToggle;
-  if (!id) return;
+  if (!subscriptionId && !id) return;
   providerSelectionSaveError = "";
-  if (checkbox.checked) providerSelection.add(id);
-  else providerSelection.delete(id);
-  const option = checkbox.closest("[data-provider-option]");
-  if (option) option.dataset.checked = checkbox.checked ? "true" : "false";
-  if (providersOnlyActiveInput.checked) renderProvidersPicker();
-  else updateProvidersStatus();
+  if (subscriptionId) setSubscriptionChecked(subscriptionId, checkbox.checked);
+  else setProviderChecked(id, checkbox.checked);
+  if (providersOnlyActiveInput.checked || subscriptionId) renderProvidersPicker();
+  else {
+    applyProvidersSelection(() => {});
+  }
 });
 
 providersCheckAllBtn.addEventListener("click", () => {
   applyProvidersSelection((visible) => {
-    for (const entry of visible) providerSelection.add(entry.id);
+    for (const entry of visible) setProviderChecked(entry.id, true);
   });
 });
 
 providersUncheckAllBtn.addEventListener("click", () => {
   applyProvidersSelection((visible) => {
-    for (const entry of visible) providerSelection.delete(entry.id);
+    for (const entry of visible) setProviderChecked(entry.id, false);
   });
 });
 
 providersInvertBtn.addEventListener("click", () => {
   applyProvidersSelection((visible) => {
-    for (const entry of visible) {
-      if (providerSelection.has(entry.id)) providerSelection.delete(entry.id);
-      else providerSelection.add(entry.id);
-    }
+    for (const entry of visible) setProviderChecked(entry.id, !isProviderChecked(entry.id));
   });
+});
+
+providersDropMissingBtn.addEventListener("click", () => {
+  const missing = providersMissingSelectionIds();
+  if (!missing.length) return;
+  for (const id of missing) providerSelection.delete(id);
+  providerSelectionSaveError = "";
+  renderProvidersPicker();
+  toast.success(
+    `Removed ${formatNumber(missing.length)} missing ${missing.length === 1 ? "subscription" : "subscriptions"}`,
+  );
 });
 
 providersDiscardBtn.addEventListener("click", discardProviderChanges);

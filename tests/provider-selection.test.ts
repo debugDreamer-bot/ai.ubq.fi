@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 
 import { handleAdminProviderSelectionGet, handleAdminProviderSelectionSet } from "../src/admin.ts";
-import { CODEX_MODELS_KV_KEY, type CodexModelsSnapshot } from "../src/codex.ts";
+import { CODEX_AUTH_POOL_KV_KEY, CODEX_MODELS_KV_KEY, type CodexModelsSnapshot, resetCodexAuthCacheForTest } from "../src/codex.ts";
 import { DEEPSEEK_OFFICIAL_MODEL_IDS } from "../src/deepseek.ts";
 import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/codex_models_whitelist.ts";
 import handler from "../src/handler.ts";
 import { setKvForTest } from "../src/kv.ts";
 import { handleModels } from "../src/openai.ts";
 import {
+  codexAccountEligibility,
+  codexSubscriptionHash,
+  codexSubscriptionSelectionId,
   filterCatalogEntriesByProviderSelection,
+  isCodexSubscriptionEnabled,
   isProviderEnabled,
+  isProviderSelectionId,
   loadProviderSelection,
   loadProviderSelectionCached,
   normalizeProviderSelection,
@@ -133,6 +138,42 @@ Deno.test("an empty or absent selection keeps every provider eligible", () => {
   assert.equal(providerSelectionIsActive({ provider_ids: [], updated_at_ms: 1 }), false);
 });
 
+Deno.test("a subscription selection narrows the Codex tier instead of switching it off", async () => {
+  const first = codexSubscriptionSelectionId(await codexSubscriptionHash("account-one"));
+  const second = codexSubscriptionSelectionId(await codexSubscriptionHash("account-two"));
+  assert.notEqual(first, second);
+  assert.equal(first, `codex:${await codexSubscriptionHash("account-one")}`, "the hash memoizes to one stable id");
+  assert.equal(isProviderSelectionId(first), true);
+  assert.equal(isProviderSelectionId("codex:not-a-hash"), false);
+  assert.equal(isProviderSelectionId("codex:"), false);
+
+  const onlySecond = { provider_ids: [second], updated_at_ms: 1 } as const;
+  assert.equal(isProviderEnabled("codex", onlySecond), true, "one selected subscription is an enabled Codex tier");
+  assert.equal(isProviderEnabled("surplus", onlySecond), false);
+  assert.deepEqual(codexAccountEligibility(onlySecond), { kind: "only", hashes: [await codexSubscriptionHash("account-two")] });
+  assert.equal(isCodexSubscriptionEnabled(await codexSubscriptionHash("account-two"), onlySecond), true);
+  assert.equal(isCodexSubscriptionEnabled(await codexSubscriptionHash("account-one"), onlySecond), false);
+
+  assert.deepEqual(codexAccountEligibility(null), { kind: "all" }, "no selection restricts nothing");
+  assert.deepEqual(codexAccountEligibility({ provider_ids: [], updated_at_ms: 1 }), { kind: "all" });
+  assert.deepEqual(codexAccountEligibility({ provider_ids: ["codex"], updated_at_ms: 1 }), { kind: "all" }, "the umbrella means every subscription");
+  assert.deepEqual(codexAccountEligibility({ provider_ids: ["surplus"], updated_at_ms: 1 }), { kind: "none" }, "no Codex id at all switches the tier off");
+  assert.equal(isProviderEnabled("codex", { provider_ids: ["surplus"], updated_at_ms: 1 }), false);
+});
+
+Deno.test("the codex umbrella absorbs subscription ids so storage stays unambiguous", () => {
+  const subscription = codexSubscriptionSelectionId("a".repeat(64));
+  const other = codexSubscriptionSelectionId("b".repeat(64));
+  assert.deepEqual(normalizeSelectedProviderIds([other, "codex", subscription]), ["codex"]);
+  assert.deepEqual(normalizeSelectedProviderIds([other, "surplus", subscription]), ["surplus", subscription, other]);
+  assert.deepEqual(normalizeSelectedProviderIds(["codex:not-a-hash", "codex"]), ["codex"]);
+  assert.deepEqual(normalizeSelectedProviderIds(["codex:not-a-hash"]), []);
+  assert.deepEqual(normalizeProviderSelection({ provider_ids: [subscription, "codex"], updated_at_ms: 5 }), {
+    provider_ids: ["codex"],
+    updated_at_ms: 5,
+  });
+});
+
 Deno.test("a catalog row keeps only the providers that are still active", () => {
   const entries = [
     { id: "codex-only", providers: [{ id: "codex" }] },
@@ -144,6 +185,15 @@ Deno.test("a catalog row keeps only the providers that are still active", () => 
     filterCatalogEntriesByProviderSelection(entries, { provider_ids: ["surplus"], updated_at_ms: 1 }),
     [{ id: "shared", providers: [{ id: "surplus" }] }],
     "a switched-off provider is dropped from every row, and a row with no enabled provider disappears"
+  );
+  const subscriptionOnly = { provider_ids: [codexSubscriptionSelectionId("c".repeat(64))], updated_at_ms: 1 } as const;
+  assert.deepEqual(
+    filterCatalogEntriesByProviderSelection(entries, subscriptionOnly),
+    [
+      { id: "codex-only", providers: [{ id: "codex" }] },
+      { id: "shared", providers: [{ id: "codex" }] },
+    ],
+    "a narrowed Codex tier still advertises every model Codex serves"
   );
 });
 
@@ -204,7 +254,7 @@ Deno.test("admin provider picker reports the roster, catalog counts, and the sav
     assert.deepEqual(
       body.data.providers,
       [
-        { id: "codex", model_count: 1, status: "available", configured: true },
+        { id: "codex", model_count: 1, status: "available", configured: true, subscriptions: [] },
         { id: "surplus", model_count: 2, status: "available", configured: true },
         { id: "openlux", model_count: 0, status: "unavailable", configured: false },
         { id: "deepseek", model_count: 1, status: "available", configured: true },
@@ -215,6 +265,75 @@ Deno.test("admin provider picker reports the roster, catalog counts, and the sav
     assert.deepEqual(body.data.selection.provider_ids, ["surplus"]);
     assert.equal(body.data.filter_active, true);
   });
+});
+
+const stripBase64Padding = (base64: string): string => {
+  let end = base64.length;
+  while (end > 0 && base64[end - 1] === "=") end -= 1;
+  return base64.slice(0, end);
+};
+
+const tokenWithPayload = (payload: unknown): string =>
+  `${stripBase64Padding(btoa(JSON.stringify({ alg: "none" })))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")}.${stripBase64Padding(btoa(JSON.stringify(payload)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")}.signature`;
+
+/** Two configured subscriptions: one with a profile email, one without. */
+const seedCodexAuthPool = (kv: SelectionKv): void => {
+  kv.values.set(keyOf([...CODEX_AUTH_POOL_KV_KEY]), {
+    accounts: [
+      {
+        access_token: tokenWithPayload({ "https://api.openai.com/profile": { email: "first@example.com" } }),
+        refresh_token: "refresh-one",
+        account_id: "account-one",
+        updated_at_ms: 1,
+      },
+      { access_token: "not-a-jwt", refresh_token: "refresh-two", account_id: "account-two", updated_at_ms: 1 },
+    ],
+    updated_at_ms: 1,
+  });
+  resetCodexAuthCacheForTest();
+};
+
+Deno.test("admin provider picker lists each configured Codex subscription under its opaque id", async () => {
+  const kv = new SelectionKv();
+  seedCodexAuthPool(kv);
+  try {
+    await withKv(kv, async () => {
+      const response = await handleAdminProviderSelectionGet({ buildCatalog: () => Promise.resolve(catalogFixture()) });
+      const body = await response.json();
+      const codex = body.data.providers.find((provider: { id: string }) => provider.id === "codex");
+      assert.deepEqual(codex.subscriptions, [
+        { id: codexSubscriptionSelectionId(await codexSubscriptionHash("account-one")), label: "first@example.com", slot: 1 },
+        { id: codexSubscriptionSelectionId(await codexSubscriptionHash("account-two")), label: "Codex account 2", slot: 2 },
+      ]);
+      assert.equal(
+        body.data.providers.some((provider: { id: string; subscriptions?: unknown }) => provider.subscriptions !== undefined && provider.id !== "codex"),
+        false,
+        "only the Codex tier carries subscriptions"
+      );
+      for (const provider of body.data.providers) {
+        assert.equal(JSON.stringify(provider).includes("account-one"), false, "a raw account id never crosses the response boundary");
+      }
+
+      // One subscription round-trips through the write path as an active Codex tier.
+      const saved = await handleAdminProviderSelectionSet(
+        new Request("https://ai.ubq.fi/admin/providers/selection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider_ids: [codex.subscriptions[1].id, "surplus"] }),
+        })
+      );
+      assert.equal(saved.status, 200);
+      assert.deepEqual((await saved.json()).provider_ids, ["surplus", codex.subscriptions[1].id]);
+      const reloaded = await handleAdminProviderSelectionGet({ buildCatalog: () => Promise.resolve(catalogFixture()) });
+      assert.equal((await reloaded.json()).data.filter_active, true);
+    });
+  } finally {
+    resetCodexAuthCacheForTest();
+  }
 });
 
 Deno.test("an empty saved provider selection is reported as no filter", async () => {

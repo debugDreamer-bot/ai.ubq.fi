@@ -36,7 +36,8 @@ const ADDITIONAL_WINDOW_UNANCHORED_TOLERANCE_MS = 60_000;
 const CODEX_SPARK_LIMIT_NAME = "GPT-5.3-Codex-Spark";
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 
-const codexAccountLabel = (slot: number, email: string | null = null): string => {
+/** The one label rule for a configured subscription, shared by every admin surface. */
+export const codexAccountLabel = (slot: number, email: string | null = null): string => {
   const trimmedEmail = email?.trim() ?? "";
   // A blank label would hide the account, so an empty or whitespace-only email
   // still falls back to the slot label.

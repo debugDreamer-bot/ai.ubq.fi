@@ -30,6 +30,12 @@ import {
   selectCodexRoutingAccountsStrong,
 } from "../src/codex_account_routing.ts";
 import { PROVIDER_CAPACITY_SNAPSHOT_KEY } from "../src/provider_capacity_contract.ts";
+import {
+  codexSubscriptionHash,
+  codexSubscriptionSelectionId,
+  PROVIDER_SELECTION_KV_KEY,
+  resetProviderSelectionCacheForTest,
+} from "../src/provider_selection.ts";
 import type { CodexAuthPoolState } from "../src/types.ts";
 
 const key = (value: Deno.KvKey): string => JSON.stringify(value);
@@ -3666,5 +3672,77 @@ Deno.test("malformed durable active state fails retryably and preserves the reco
   } finally {
     setKvForTest(null);
     resetCodexAccountRoutingForTest();
+  }
+});
+
+// ── Operator subscription selection ──────────────────────────────────────────
+
+/** Seed the operator selection and drop the routing selection cache. */
+const seedSubscriptionSelection = async (kv: RoutingKv, accountIds: readonly string[]): Promise<void> => {
+  await kv.set(PROVIDER_SELECTION_KV_KEY, {
+    provider_ids: await Promise.all(accountIds.map(async (id) => codexSubscriptionSelectionId(await codexSubscriptionHash(id)))),
+    updated_at_ms: Date.now(),
+  });
+  resetProviderSelectionCacheForTest();
+};
+
+Deno.test("a selected Codex subscription restricts which account may serve inference", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+
+    await seedSubscriptionSelection(kv, ["two"]);
+    const restricted = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(restricted.kind, "eligible");
+    assert.deepEqual(
+      restricted.accounts.map((account) => account.auth.account_id),
+      ["two"],
+      "only the selected subscription is eligible"
+    );
+
+    // The active subscription follows the operator: excluding the account that
+    // currently serves is an authoritative pool change, not a transient signal.
+    await seedSubscriptionSelection(kv, ["one"]);
+    const moved = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.equal(moved.kind, "eligible");
+    assert.deepEqual(
+      moved.accounts.map((account) => account.auth.account_id),
+      ["one"]
+    );
+
+    // The umbrella and an absent selection both restore the whole cohort.
+    for (const providerIds of [["codex"], []]) {
+      await kv.set(PROVIDER_SELECTION_KV_KEY, { provider_ids: providerIds, updated_at_ms: Date.now() });
+      resetProviderSelectionCacheForTest();
+      const unrestricted = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+      assert.equal(unrestricted.kind, "eligible");
+      assert.equal(unrestricted.accounts[0].auth.account_id, "one", `${providerIds.length ? "the umbrella" : "no selection"} keeps every subscription`);
+    }
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+    resetProviderSelectionCacheForTest();
+  }
+});
+
+Deno.test("a selection that names no configured subscription leaves no eligible Codex account", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  try {
+    const now = Date.now();
+    const authPool: CodexAuthPoolState = { accounts: pool.accounts.map((account) => ({ ...account, updated_at_ms: now })), updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, authPool);
+    await seedSubscriptionSelection(kv, ["retired-account"]);
+    const selected = await selectCodexRoutingAccountsStrong(authPool, authPool.accounts, now);
+    assert.notEqual(selected.kind, "eligible", "an unknown subscription hash never falls back to an unselected account");
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+    resetProviderSelectionCacheForTest();
   }
 });

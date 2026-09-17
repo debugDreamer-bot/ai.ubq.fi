@@ -11,7 +11,7 @@
     <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="icon" href="/favicon.png" type="image/png" sizes="256x256" />
     <link rel="stylesheet" href="/style.css?v=app-minimal-20260917" />
-    <link rel="stylesheet" href="/admin.css?v=20260917-provider-picker-v1" />
+    <link rel="stylesheet" href="/admin.css?v=20260917-subscription-picker-v1" />
   </head>
   <body data-page="admin" data-role="admin" data-auth-widget="collapsed" data-auth-scope="none">
     <div data-shell>
@@ -662,8 +662,9 @@
               <p>
                 Check every provider the gateway may dispatch to. Unchecked providers leave inference routing,
                 and the models only they serve disappear from <code>/v1/models</code>, the public catalog, and
-                the Codex catalog. The waterfall order itself never changes. Saving an empty selection removes
-                the filter, so every provider is active again.
+                the Codex catalog. Each configured Codex subscription is selectable on its own, so the
+                subscription tier can be narrowed to one account. The waterfall order itself never changes.
+                Saving an empty selection removes the filter, so every provider is active again.
               </p>
             </header>
             <div data-card-body>
@@ -718,6 +719,7 @@
                 <button id="providers-selection-check-all" type="button">Check all shown</button>
                 <button id="providers-selection-uncheck-all" type="button">Uncheck all shown</button>
                 <button id="providers-selection-invert" type="button">Invert shown</button>
+                <button id="providers-selection-drop-missing" type="button" hidden>Remove missing</button>
                 <button id="providers-selection-discard" type="button" disabled>Discard changes</button>
                 <button
                   id="providers-selection-reload"
@@ -981,6 +983,6 @@
         </button>
       </section>
     </div>
-    <script type="module" src="/admin.js?v=20260917-provider-picker-v1"></script>
+    <script type="module" src="/admin.js?v=20260917-subscription-picker-v1"></script>
   </body>
 </html>
