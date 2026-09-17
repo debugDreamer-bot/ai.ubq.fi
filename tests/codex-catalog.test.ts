@@ -149,7 +149,16 @@ const seedBaseState = (snapshotVersion = "0.200.0"): void => {
     source: "chatgpt_codex",
     client_version: snapshotVersion,
     updated_at_ms: Date.now(),
-    models: [{ slug: `snapshot-${snapshotVersion}` }],
+    models: [
+      { slug: `snapshot-${snapshotVersion}` },
+      // The Codex endpoint's own window for an id the paid routes also serve.
+      {
+        slug: "gpt-6-astra",
+        context_window: 272_000,
+        max_context_window: 872_000,
+        supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      },
+    ],
   };
   kvStore.set(keyToString(SNAPSHOT_KEY), {
     value: snapshot,
@@ -1397,6 +1406,66 @@ Deno.test("codex catalog: third-party enrichment fills rows no first-party sourc
     assert.equal(deepseek.auto_compact_token_limit, 891_289, "the limit is derived from the resolved window");
     assert.equal(deepseek.effective_context_window_percent, 95);
     assert.equal(deepseek.model_class, undefined, "the curated model class is gone with the curated table");
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetSurplusModelsCacheForTest();
+    resetOpenRouterModelsCacheForTest();
+    if (originalSurplusKey === undefined) Deno.env.delete("SURPLUS_API_KEY");
+    else Deno.env.set("SURPLUS_API_KEY", originalSurplusKey);
+  }
+});
+
+Deno.test("codex catalog: a Codex-served id keeps the Codex endpoint window, not enrichment", async () => {
+  seedBaseState("0.200.0");
+  resetSurplusModelsCacheForTest();
+  resetOpenRouterModelsCacheForTest();
+  const originalFetch = globalThis.fetch;
+  const originalSurplusKey = Deno.env.get("SURPLUS_API_KEY");
+  Deno.env.set("SURPLUS_API_KEY", "surplus-catalog-test-key");
+  // The paid route serves this id too, and OpenRouter advertises the API-level
+  // maximum for it. The Codex endpoint serves less, and that has to win.
+  await fetchSurplusModels({
+    apiKey: "surplus-catalog-test-key",
+    force: true,
+    fetcher: () => Promise.resolve(Response.json({ data: [{ id: "gpt-6-astra", provider: "surplus" }] })),
+  });
+  await fetchOpenRouterModels({
+    force: true,
+    fetcher: () =>
+      Promise.resolve(
+        Response.json({
+          data: [
+            {
+              id: "openai/gpt-6-astra",
+              context_length: 1_050_000,
+              top_provider: { context_length: 1_050_000 },
+              reasoning: { supported_efforts: ["max", "high", "low"], default_effort: "high", mandatory: false },
+            },
+          ],
+        })
+      ),
+  });
+  globalThis.fetch = (input) => {
+    const version = new URL(fetchUrl(input)).searchParams.get("client_version") ?? "missing";
+    return Promise.resolve(new Response(catalogBody(version), { headers: { "Content-Type": "application/json" } }));
+  };
+
+  try {
+    // A version with no stored catalog takes the paid-only path, which is where
+    // the enrichment leak reached Codex clients.
+    const response = await handleCodexCatalogModels(request("0.155.0"), "0.155.0");
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { models: Record<string, unknown>[] };
+    const astra = payload.models.find((model) => model.slug === "gpt-6-astra");
+    assert.ok(astra, "the paid route still advertises the Codex-served id");
+    assert.equal(astra.context_window, 272_000, "the Codex endpoint window wins over the API-level maximum");
+    assert.equal(astra.max_context_window, 872_000);
+    assert.equal(astra.auto_compact_token_limit, 222_000);
+    assert.deepEqual(
+      (astra.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
+      ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+      "the uploaded Codex tiers still win"
+    );
   } finally {
     globalThis.fetch = originalFetch;
     resetSurplusModelsCacheForTest();

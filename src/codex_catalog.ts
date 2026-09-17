@@ -1,4 +1,11 @@
-import { CODEX_AUTH_POOL_KV_KEY, CODEX_MODELS_KV_KEY, type CodexModelsSnapshot, fetchCodexModels, preserveCodexDefaultModel } from "./codex.ts";
+import {
+  CODEX_AUTH_POOL_KV_KEY,
+  CODEX_MODELS_KV_KEY,
+  type CodexModelsSnapshot,
+  fetchCodexModels,
+  loadFullCodexModelsSnapshot,
+  preserveCodexDefaultModel,
+} from "./codex.ts";
 import { loadCodexModelsWhitelist, filterWhitelistedCatalogModels } from "./codex_models_whitelist.ts";
 import {
   CODEX_CHATGPT_PROMPT_CACHE_PROVIDER,
@@ -20,7 +27,7 @@ import { DEEPSEEK_CONTEXT_WINDOW_TOKENS, DEEPSEEK_DISPLAY_NAMES, DEEPSEEK_OFFICI
 import { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS } from "./metered.ts";
 import type { recordSentinelProviderDegradationFromEnvironment } from "./sentinel_incident_outbox.ts";
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "./surplus.ts";
-import { resolveModelMetadata } from "./model_metadata.ts";
+import { codexSnapshotMetadataHint, codexSubscriptionMetadataHint, resolveModelMetadata } from "./model_metadata.ts";
 import { warmOpenRouterModels } from "./openrouter_models.ts";
 import { isProviderEnabled, loadProviderSelectionCached, type ProviderSelection } from "./provider_selection.ts";
 
@@ -628,18 +635,37 @@ const etagMatches = (requestValue: string | null, etag: string | null): boolean 
  */
 const codexReasoningEffortDescription = (effort: string): string => (effort === "none" ? "No reasoning" : `Reasoning effort: ${effort}`);
 
+/**
+ * Raw uploaded records by id. A Codex-served id must keep the Codex endpoint's
+ * own window: discovery and enrichment describe how the gateway can serve the id,
+ * not how much context the subscription honors.
+ */
+const codexSnapshotRecords = (snapshot: CodexModelsSnapshot | null): Map<string, Record<string, unknown>> => {
+  const records = new Map<string, Record<string, unknown>>();
+  for (const entry of snapshot?.models ?? []) {
+    if (!isRecord(entry)) continue;
+    const id = (getString(entry.slug) ?? getString(entry.id) ?? getString(entry.model) ?? getString(entry.name))?.trim();
+    if (id) records.set(id, entry);
+  }
+  return records;
+};
+
 const meteredCodexModelRecord = (
   model: Readonly<{
     id: string;
     description?: string;
     owned_by: string;
     supported_endpoint_types: readonly string[];
-  }>
+  }>,
+  codexRecord: Record<string, unknown> | null = null
 ) => {
-  // Discovery states an id, not its capabilities: every value here comes from
-  // the dynamic resolver, and an id no source describes keeps the no-reasoning
-  // default rather than inheriting a curated guess.
-  const resolved = resolveModelMetadata(model.id);
+  // A Codex-served id keeps the Codex endpoint's window and tiers, capped by the
+  // subscription bound; a paid-only id falls back to discovery plus enrichment.
+  // Without this, OpenRouter's API-level maximum (1,050,000 for gpt-6-astra)
+  // reached Codex clients as if the subscription served it.
+  const resolved = codexRecord
+    ? resolveModelMetadata(model.id, { codex: codexSnapshotMetadataHint(codexRecord), codexSubscription: codexSubscriptionMetadataHint() })
+    : resolveModelMetadata(model.id);
   const levels = resolved.supported_reasoning_levels;
   return {
     slug: model.id,
@@ -836,9 +862,10 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
     models: codexEnabled && Array.isArray(catalog.parsed.models) ? [...catalog.parsed.models] : [],
   };
   const seen = catalogModelIds(parsed.models);
+  const codexRecords = codexSnapshotRecords(await loadFullCodexModelsSnapshot());
   for (const model of paidModels) {
     if (seen.has(model.id)) continue;
-    parsed.models.push(meteredCodexModelRecord(model));
+    parsed.models.push(meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null));
     seen.add(model.id);
   }
   // The official ids are appended first so an operator whitelist still has the
@@ -861,9 +888,12 @@ const meteredCatalogResponse = async (selection: ProviderSelection | null): Prom
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
   const configured = isProviderEnabled("deepseek", selection) ? deepSeekOfficialCodexModels() : [];
   if (!paidModels.length && !configured.length) return null;
+  // This path answers without a stored catalog, so the Codex snapshot is the only
+  // place a Codex-served id's real window can come from.
+  const codexRecords = codexSnapshotRecords(await loadFullCodexModelsSnapshot());
   return new Response(
     JSON.stringify({
-      models: withDeepSeekOfficialModels(paidModels.map(meteredCodexModelRecord)),
+      models: withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null))),
     }),
     {
       status: 200,
