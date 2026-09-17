@@ -1,5 +1,5 @@
 import { getKv } from "./kv.ts";
-import { getString, isRecord } from "./utils.ts";
+import { getString, isRecord, sha256Hex } from "./utils.ts";
 
 // ── KV key ───────────────────────────────────────────────────────────────────
 
@@ -20,12 +20,56 @@ export const SELECTABLE_PROVIDER_IDS = ["codex", "surplus", "openlux", "deepseek
 
 export type SelectableProviderId = (typeof SELECTABLE_PROVIDER_IDS)[number];
 
+/**
+ * One configured Codex subscription, addressed by the opaque hash of its
+ * account id. A selection may therefore narrow the Codex tier to a subset of
+ * the configured accounts the same way it narrows the whole waterfall:
+ * `codex` alone means every configured subscription, `codex:<hash>` entries
+ * mean exactly those, and neither means the Codex tier is switched off.
+ */
+export type CodexSubscriptionId = `codex:${string}`;
+
+export type ProviderSelectionId = SelectableProviderId | CodexSubscriptionId;
+
 export type ProviderSelection = Readonly<{
-  provider_ids: readonly SelectableProviderId[];
+  provider_ids: readonly ProviderSelectionId[];
   updated_at_ms: number;
 }>;
 
 const selectableProviderIdSet = new Set<string>(SELECTABLE_PROVIDER_IDS);
+const CODEX_SUBSCRIPTION_ID_PREFIX = "codex:";
+const CODEX_SUBSCRIPTION_HASH_PATTERN = /^[a-f0-9]{64}$/;
+const subscriptionHashCache = new Map<string, string>();
+
+/**
+ * Stable opaque id for one configured subscription, for the operator picker.
+ * The selection never stores a raw account id: this is deliberately the same
+ * unsalted account hash the admin console already uses to name one subscription
+ * in the banked-reset settings, so both admin surfaces identify the same
+ * account with the same opaque id.
+ */
+export const codexSubscriptionHash = async (accountId: string): Promise<string> => {
+  const cached = subscriptionHashCache.get(accountId);
+  if (cached !== undefined) return cached;
+  const hash = await sha256Hex(accountId);
+  subscriptionHashCache.set(accountId, hash);
+  return hash;
+};
+
+export const codexSubscriptionSelectionId = (accountIdHash: string): CodexSubscriptionId =>
+  `${CODEX_SUBSCRIPTION_ID_PREFIX}${accountIdHash}` as CodexSubscriptionId;
+
+export const isCodexSubscriptionSelectionId = (value: unknown): value is CodexSubscriptionId =>
+  typeof value === "string" &&
+  value.startsWith(CODEX_SUBSCRIPTION_ID_PREFIX) &&
+  CODEX_SUBSCRIPTION_HASH_PATTERN.test(value.slice(CODEX_SUBSCRIPTION_ID_PREFIX.length));
+
+/** The account hash inside a subscription id, or `null` for any other id. */
+export const codexSubscriptionHashFromSelectionId = (value: unknown): string | null =>
+  isCodexSubscriptionSelectionId(value) ? value.slice(CODEX_SUBSCRIPTION_ID_PREFIX.length) : null;
+
+/** Every id the operator API may store: a roster provider or one subscription. */
+export const isProviderSelectionId = (value: unknown): value is ProviderSelectionId => isSelectableProviderId(value) || isCodexSubscriptionSelectionId(value);
 
 /** Last selection served to the routing path, with the write path priming it. */
 let cachedSelection: Readonly<{ value: ProviderSelection | null; expires_at_ms: number }> | null = null;
@@ -36,17 +80,26 @@ export const isSelectableProviderId = (value: unknown): value is SelectableProvi
 // ── Normalize / validate ─────────────────────────────────────────────────────
 
 /**
- * Canonical form of a submitted provider list: known ids only, de-duplicated,
- * always in roster order. Storage and the wire response both use this form, so
- * re-saving an already-normalized selection is a no-op.
+ * Canonical form of a submitted selection: known provider ids in roster order,
+ * then subscription ids in hash order, de-duplicated. The `codex` umbrella
+ * means every configured subscription, so it absorbs any subscription id
+ * submitted alongside it and storage can never hold an ambiguous pair.
  */
-export const normalizeSelectedProviderIds = (rawIds: readonly unknown[]): SelectableProviderId[] => {
-  const submitted = new Set<string>();
+export const normalizeSelectedProviderIds = (rawIds: readonly unknown[]): ProviderSelectionId[] => {
+  const submittedProviders = new Set<string>();
+  const submittedSubscriptions = new Set<CodexSubscriptionId>();
   for (const raw of rawIds) {
     const id = getString(raw)?.trim();
-    if (id && selectableProviderIdSet.has(id)) submitted.add(id);
+    if (!id) continue;
+    if (selectableProviderIdSet.has(id)) {
+      submittedProviders.add(id);
+      continue;
+    }
+    if (isCodexSubscriptionSelectionId(id)) submittedSubscriptions.add(id);
   }
-  return SELECTABLE_PROVIDER_IDS.filter((id) => submitted.has(id));
+  const providers = SELECTABLE_PROVIDER_IDS.filter((id) => submittedProviders.has(id));
+  if (submittedProviders.has("codex")) return [...providers];
+  return [...providers, ...[...submittedSubscriptions].sort((left, right) => left.localeCompare(right))];
 };
 
 /**
@@ -77,7 +130,7 @@ export const loadProviderSelection = async (kv: Deno.Kv | null): Promise<Provide
  * written, so an operator sees the effect of a save on the next request
  * instead of waiting out the cache TTL. Returns `null` when KV rejected it.
  */
-export const storeProviderSelection = async (kv: Deno.Kv, providerIds: readonly SelectableProviderId[]): Promise<ProviderSelection | null> => {
+export const storeProviderSelection = async (kv: Deno.Kv, providerIds: readonly ProviderSelectionId[]): Promise<ProviderSelection | null> => {
   const selection: ProviderSelection = { provider_ids: normalizeSelectedProviderIds(providerIds), updated_at_ms: Date.now() };
   try {
     await kv.set(PROVIDER_SELECTION_KV_KEY, selection);
@@ -90,30 +143,61 @@ export const storeProviderSelection = async (kv: Deno.Kv, providerIds: readonly 
 
 // ── Enforcement ──────────────────────────────────────────────────────────────
 
+const selectionIds = (selection: ProviderSelection | null): readonly string[] => selection?.provider_ids ?? [];
+
 /**
  * An empty or absent selection is no filter at all: every provider stays
  * eligible. That matches the model whitelist contract and keeps an accidental
  * (or stale) empty selection from disabling inference.
+ *
+ * `codex` is enabled by its own id or by any single selected subscription, so
+ * narrowing the tier to one account never reads as switching the tier off.
  */
-export const isProviderEnabled = (provider: SelectableProviderId, selection: ProviderSelection | null): boolean =>
-  selection === null || selection.provider_ids.length === 0 || selection.provider_ids.includes(provider);
+export const isProviderEnabled = (provider: SelectableProviderId, selection: ProviderSelection | null): boolean => {
+  if (selection === null || selection.provider_ids.length === 0) return true;
+  if (selection.provider_ids.includes(provider)) return true;
+  if (provider !== "codex") return false;
+  return selection.provider_ids.some((id) => isCodexSubscriptionSelectionId(id));
+};
 
 export const providerSelectionIsActive = (selection: ProviderSelection | null): boolean => selection !== null && selection.provider_ids.length > 0;
+
+/**
+ * Which configured Codex subscriptions may serve inference: every account (no
+ * restriction), none of them (the tier is switched off), or exactly the hashes
+ * the operator selected.
+ */
+export type CodexAccountEligibility = Readonly<{ kind: "all" }> | Readonly<{ kind: "none" }> | Readonly<{ kind: "only"; hashes: readonly string[] }>;
+
+export const codexAccountEligibility = (selection: ProviderSelection | null): CodexAccountEligibility => {
+  const ids = selectionIds(selection);
+  if (!ids.length || ids.includes("codex")) return { kind: "all" };
+  const hashes = ids.map((id) => codexSubscriptionHashFromSelectionId(id)).filter((hash): hash is string => hash !== null);
+  return hashes.length ? { kind: "only", hashes } : { kind: "none" };
+};
+
+export const isCodexSubscriptionEnabled = (accountIdHash: string, selection: ProviderSelection | null): boolean => {
+  const eligibility = codexAccountEligibility(selection);
+  if (eligibility.kind === "all") return true;
+  if (eligibility.kind === "none") return false;
+  return eligibility.hashes.includes(accountIdHash);
+};
 
 /**
  * Keep only the entries an enabled provider serves, narrowing each row to the
  * providers that are still active. An entry no enabled provider serves is
  * dropped, so a disabled provider can never be advertised or dispatched to.
+ * Catalog vocabulary the picker does not control stays listed untouched.
  */
 export const filterCatalogEntriesByProviderSelection = <T extends Readonly<{ providers: readonly Readonly<{ id: string }>[] }>>(
   entries: readonly T[],
   selection: ProviderSelection | null
 ): T[] => {
-  if (!selection || selection.provider_ids.length === 0) return [...entries];
-  const enabled = new Set<string>(selection.provider_ids);
+  if (!providerSelectionIsActive(selection)) return [...entries];
+  const enabled = (id: string): boolean => (selectableProviderIdSet.has(id) ? isProviderEnabled(id as SelectableProviderId, selection) : true);
   const filtered: T[] = [];
   for (const entry of entries) {
-    const providers = entry.providers.filter((provider) => enabled.has(provider.id));
+    const providers = entry.providers.filter((provider) => enabled(provider.id));
     if (!providers.length) continue;
     filtered.push(providers.length === entry.providers.length ? entry : { ...entry, providers });
   }

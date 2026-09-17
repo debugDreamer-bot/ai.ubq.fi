@@ -19,6 +19,7 @@ import {
   validateCodexAuthJson,
 } from "./codex.ts";
 import { recheckCodexRoutingSlot } from "./codex_account_routing.ts";
+import { codexAccountLabel } from "./provider_capacity.ts";
 import { mergeCodexModelPromptCacheCapabilities, normalizeCodexModelsPayload } from "./codex_models.ts";
 import { CODEX_CATALOG_AUTH_GENERATION_KEY, storeCodexCatalog } from "./codex_catalog.ts";
 import {
@@ -95,7 +96,9 @@ import { defaultIncludeLegacyForProfile, importKvMigrationLines, type KvMigratio
 import { getKv } from "./kv.ts";
 import { loadCodexModelsWhitelist, normalizeWhitelistModelIds, storeCodexModelsWhitelist } from "./codex_models_whitelist.ts";
 import {
-  isSelectableProviderId,
+  codexSubscriptionHash,
+  codexSubscriptionSelectionId,
+  isProviderSelectionId,
   loadProviderSelection,
   providerSelectionIsActive,
   SELECTABLE_PROVIDER_IDS,
@@ -731,9 +734,31 @@ export const handleAdminCodexModelsWhitelistSet = async (req: Request): Promise<
 };
 
 /**
+ * The configured Codex subscriptions, each under the opaque account hash the
+ * picker stores. A missing or unreadable auth pool is not an error here: the
+ * provider roster still reports the Codex tier, just without selectable
+ * subscriptions.
+ */
+const codexSubscriptionRoster = async (): Promise<readonly { id: string; label: string; slot: number }[]> => {
+  try {
+    const accounts = await getCodexCapacityAccounts();
+    return await Promise.all(
+      accounts.map(async (account) => ({
+        id: codexSubscriptionSelectionId(await codexSubscriptionHash(account.account_id)),
+        label: codexAccountLabel(account.slot, account.email),
+        slot: account.slot,
+      }))
+    );
+  } catch {
+    return [];
+  }
+};
+
+/**
  * Provider picker data: the fixed provider roster with the catalog entry count
- * each provider currently contributes, plus the stored selection, so the admin
- * console can render one consistent checkbox list from a single read.
+ * each provider currently contributes, the selectable Codex subscriptions, and
+ * the stored selection, so the admin console can render one consistent
+ * checkbox list from a single read.
  *
  * `buildCatalog` is injectable for tests, matching the other admin handlers.
  */
@@ -743,7 +768,7 @@ export const handleAdminProviderSelectionGet = async (dependencies: Readonly<{ b
     return openaiError(500, "Deno KV is not available; cannot read the provider selection", "server_error", { type: "server_error" });
   }
   const buildCatalog = dependencies.buildCatalog ?? buildModelCatalogSnapshot;
-  const [catalog, selection] = await Promise.all([buildCatalog(), loadProviderSelection(kv)]);
+  const [catalog, selection, subscriptions] = await Promise.all([buildCatalog(), loadProviderSelection(kv), codexSubscriptionRoster()]);
   const counts = new Map<string, number>(SELECTABLE_PROVIDER_IDS.map((id) => [id, 0]));
   for (const entry of catalog.models) {
     for (const provider of entry.providers) {
@@ -765,6 +790,8 @@ export const handleAdminProviderSelectionGet = async (dependencies: Readonly<{ b
             // Only credential-gated providers report this; for the discovered
             // sources the status already says whether they answered.
             configured: source.configured ?? source.status === "available",
+            // Only the Codex tier can be narrowed to individual subscriptions.
+            ...(id === "codex" ? { subscriptions } : {}),
           };
         }),
         selection: { provider_ids: selection ? [...selection.provider_ids] : [], updated_at_ms: selection?.updated_at_ms ?? 0 },
@@ -788,18 +815,18 @@ export const handleAdminProviderSelectionSet = async (req: Request): Promise<Res
   if (!Array.isArray(rawIds)) {
     return openaiError(400, "provider_ids must be an array", "invalid_request_error");
   }
-  // Every entry has to be a string naming a provider on the roster: silently
-  // dropping an unknown id would store a selection the operator never made, and
-  // the console would show it as saved.
+  // Every entry has to be a string naming a provider on the roster or one
+  // configured subscription: silently dropping an unknown id would store a
+  // selection the operator never made, and the console would show it as saved.
   if (rawIds.some((id: unknown) => typeof id !== "string")) {
     return openaiError(400, "provider_ids must contain only strings", "invalid_request_error");
   }
   const submittedIds = (rawIds as string[]).map((id) => id.trim());
-  const unknownIds = submittedIds.filter((id) => !isSelectableProviderId(id));
+  const unknownIds = submittedIds.filter((id) => !isProviderSelectionId(id));
   if (unknownIds.length) {
     return openaiError(400, `unknown provider ids: ${unknownIds.join(", ")}`, "invalid_request_error", { param: "provider_ids" });
   }
-  const stored = await storeProviderSelection(kv, submittedIds.filter(isSelectableProviderId));
+  const stored = await storeProviderSelection(kv, submittedIds.filter(isProviderSelectionId));
   if (!stored) {
     return openaiError(500, "Deno KV is not available; cannot persist the provider selection", "server_error", { type: "server_error" });
   }
