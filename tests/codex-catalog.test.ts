@@ -99,6 +99,7 @@ const { handleModels } = await import("../src/openai.ts");
 const { config } = await import("../src/config.ts");
 const { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS, resetMeteredModelsCacheForTest, setMeteredModelsFetchForTest } = await import("../src/metered.ts");
 const { fetchSurplusModels, resetSurplusModelsCacheForTest, SURPLUS_MODELS_CACHE_TTL_MS } = await import("../src/surplus.ts");
+const { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest } = await import("../src/openrouter_models.ts");
 const { loadRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } = await import("../src/runtime_config.ts");
 
 const AUTH_GENERATION = "auth-generation-test";
@@ -1040,23 +1041,20 @@ Deno.test("codex catalog: model picker receives the complete unique union of pai
     assert.deepEqual(payload.models.find((model) => model.slug === "surplus-only-model")?.supported_reasoning_levels, [
       { effort: "none", description: "No reasoning" },
     ]);
+    // Discovery states an id, not its capabilities, and nothing enriches these
+    // ids in this test: the records keep the no-reasoning default and publish no
+    // context rather than inheriting a curated guess.
     for (const slug of ["deepseek-v4-flash", "deepseek-v4-flash-0731", "deepseek-v4-flash:web"]) {
       const model = payload.models.find((candidate) => candidate.slug === slug);
-      assert.deepEqual(model?.supported_reasoning_levels, [
-        { effort: "none", description: "Disable optional reasoning" },
-        { effort: "low", description: "Reasoning effort: low" },
-        { effort: "high", description: "Reasoning effort: high" },
-        { effort: "max", description: "Maximum reasoning depth" },
-      ]);
-      assert.equal(model.default_reasoning_level, "high");
-      assert.equal(model.context_window, 1_000_000);
-      assert.equal(model.max_context_window, 1_000_000);
-      assert.equal(model.auto_compact_token_limit, 850_000);
-      assert.equal(model.effective_context_window_percent, 95);
+      assert.deepEqual(model?.supported_reasoning_levels, [{ effort: "none", description: "No reasoning" }]);
+      assert.equal(model.default_reasoning_level, "none");
+      assert.equal(model.context_window, undefined);
+      assert.equal(model.max_context_window, undefined);
+      assert.equal(model.auto_compact_token_limit, undefined);
     }
     const minimax = payload.models.find((model) => model.slug === "minimax-m2.7");
-    assert.equal(minimax?.context_window, 204_800);
-    assert.equal(minimax.auto_compact_token_limit, 154_800);
+    assert.equal(minimax?.context_window, undefined);
+    assert.equal(minimax?.auto_compact_token_limit, undefined);
     assert.equal(slugs.includes("chat-only-model"), false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1101,9 +1099,10 @@ Deno.test("codex catalog: cold provider caches cannot publish the incomplete Cod
     const slugs = payload.models.map((model) => model.slug);
     assert.equal(slugs.includes("cold-openlux-model"), true);
     const deepseek = payload.models.find((model) => model.slug === "deepseek-v4-flash");
+    // No source describes this id here, so the row advertises no reasoning only.
     assert.deepEqual(
       (deepseek?.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
-      ["none", "low", "high", "max"]
+      ["none"]
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -1336,6 +1335,65 @@ Deno.test("codex catalog: expired paid-provider caches schedule background refre
     resetSurplusModelsCacheForTest();
     if (originalMeteredKey === undefined) Deno.env.delete("METERED_API_KEY");
     else Deno.env.set("METERED_API_KEY", originalMeteredKey);
+    if (originalSurplusKey === undefined) Deno.env.delete("SURPLUS_API_KEY");
+    else Deno.env.set("SURPLUS_API_KEY", originalSurplusKey);
+  }
+});
+
+Deno.test("codex catalog: third-party enrichment fills rows no first-party source describes", async () => {
+  seedBaseState("0.200.0");
+  resetSurplusModelsCacheForTest();
+  resetOpenRouterModelsCacheForTest();
+  const originalFetch = globalThis.fetch;
+  const originalSurplusKey = Deno.env.get("SURPLUS_API_KEY");
+  Deno.env.set("SURPLUS_API_KEY", "surplus-catalog-test-key");
+  await fetchSurplusModels({
+    apiKey: "surplus-catalog-test-key",
+    force: true,
+    fetcher: () => Promise.resolve(Response.json({ data: [{ id: "deepseek-v4-flash", provider: "surplus" }] })),
+  });
+  await fetchOpenRouterModels({
+    force: true,
+    fetcher: () =>
+      Promise.resolve(
+        Response.json({
+          data: [
+            {
+              id: "deepseek/deepseek-v4-flash",
+              context_length: 1_048_576,
+              top_provider: { context_length: 1_048_576, max_completion_tokens: 384_000 },
+              reasoning: { supported_efforts: ["max", "high", "low"], default_effort: "high", mandatory: false },
+            },
+          ],
+        })
+      ),
+  });
+  globalThis.fetch = (input) => {
+    const version = new URL(fetchUrl(input)).searchParams.get("client_version") ?? "missing";
+    return Promise.resolve(new Response(catalogBody(version), { headers: { "Content-Type": "application/json" } }));
+  };
+
+  try {
+    const response = await handleCodexCatalogModels(request("0.148.0"), "0.148.0");
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { models: Record<string, unknown>[] };
+    const deepseek = payload.models.find((model) => model.slug === "deepseek-v4-flash");
+    assert.ok(deepseek, "the discovery-only id is still advertised");
+    assert.deepEqual(
+      (deepseek.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
+      ["none", "max", "high", "low"],
+      "an optional-reasoning model gains the gateway's none tier alongside the advertised ones"
+    );
+    assert.equal(deepseek.default_reasoning_level, "high");
+    assert.equal(deepseek.context_window, 1_048_576);
+    assert.equal(deepseek.max_context_window, 1_048_576);
+    assert.equal(deepseek.auto_compact_token_limit, 891_289, "the limit is derived from the resolved window");
+    assert.equal(deepseek.effective_context_window_percent, 95);
+    assert.equal(deepseek.model_class, undefined, "the curated model class is gone with the curated table");
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetSurplusModelsCacheForTest();
+    resetOpenRouterModelsCacheForTest();
     if (originalSurplusKey === undefined) Deno.env.delete("SURPLUS_API_KEY");
     else Deno.env.set("SURPLUS_API_KEY", originalSurplusKey);
   }

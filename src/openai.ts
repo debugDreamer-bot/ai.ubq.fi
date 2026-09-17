@@ -70,7 +70,14 @@ import {
 } from "./inference_deadline.ts";
 import { getKv } from "./kv.ts";
 import { loadRuntimeConfig } from "./runtime_config.ts";
-import { recentModelContextFor } from "./recent_model_context.ts";
+import {
+  codexSnapshotMetadataHint,
+  resolveModelMetadata,
+  type ModelMetadataHint,
+  type ModelMetadataSource,
+  type ModelMetadataSources,
+} from "./model_metadata.ts";
+import { warmOpenRouterModels, openRouterModelsSnapshot } from "./openrouter_models.ts";
 import { CHAT_COMPLETIONS_REQUEST_KEYS, RESPONSES_REQUEST_KEYS } from "./openai_schema.ts";
 import { captureRawBodyOnce, discardRawBodyObserverOnce, readJsonBody } from "./request.ts";
 import {
@@ -5749,23 +5756,28 @@ const configuredCerebrasModel = (): Record<string, unknown> | null =>
       }
     : null;
 
-const configuredCerebrasModelCapabilities = (): Record<string, unknown> | null =>
-  readCerebrasApiKey()
-    ? {
-        id: CEREBRAS_GPT_OSS_120B_MODEL,
-        object: "uos.model_capabilities",
-        owned_by: "cerebras",
-        display_name: "GPT-OSS 120B",
-        upstream_provider: "cerebras",
-        supported_endpoints: ["/v1/chat/completions"],
-        supported_reasoning_levels: ["low", "medium", "high"],
-        default_reasoning_effort: "medium",
-        reasoning_effort_wire_map: {},
-        context_window_tokens: null,
-        max_context_window_tokens: null,
-        auto_compact_token_limit_tokens: null,
-      }
-    : null;
+const configuredCerebrasModelCapabilities = (): Record<string, unknown> | null => {
+  if (!readCerebrasApiKey()) return null;
+  // Cerebras publishes no context window of its own, so the window on this row
+  // comes from enrichment or stays null; the tiers are the route's declaration.
+  const resolved = resolveModelMetadata(CEREBRAS_GPT_OSS_120B_MODEL, { provider: CEREBRAS_PROVIDER_HINT });
+  return {
+    id: CEREBRAS_GPT_OSS_120B_MODEL,
+    object: "uos.model_capabilities",
+    owned_by: "cerebras",
+    display_name: "GPT-OSS 120B",
+    upstream_provider: "cerebras",
+    supported_endpoints: ["/v1/chat/completions"],
+    supported_reasoning_levels: [...(CEREBRAS_PROVIDER_HINT.supported_reasoning_levels ?? [])],
+    default_reasoning_effort: CEREBRAS_PROVIDER_HINT.default_reasoning_effort ?? "medium",
+    reasoning_effort_wire_map: {},
+    context_window_tokens: resolved.context_window_tokens,
+    max_context_window_tokens: resolved.max_context_window_tokens,
+    auto_compact_token_limit_tokens: resolved.auto_compact_token_limit_tokens,
+    ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+    context_source: resolved.context_source,
+  };
+};
 
 const withConfiguredCerebrasModel = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
   const cerebras = configuredCerebrasModel();
@@ -5795,7 +5807,11 @@ const configuredDeepSeekModels = (): Record<string, unknown>[] =>
 const configuredDeepSeekModelCapabilities = (): Record<string, unknown>[] => {
   if (!readDeepSeekApiKey()) return [];
   return DEEPSEEK_OFFICIAL_MODEL_IDS.map((id) => {
-    const context = recentModelContextFor(id);
+    // The official DeepSeek route declares one window for both interchangeable
+    // ids; anything more specific comes from the dynamic sources.
+    const resolved = resolveModelMetadata(id, {
+      provider: { context_window_tokens: DEEPSEEK_CONTEXT_WINDOW_TOKENS, max_context_window_tokens: DEEPSEEK_CONTEXT_WINDOW_TOKENS },
+    });
     return {
       id,
       object: "uos.model_capabilities",
@@ -5808,15 +5824,11 @@ const configuredDeepSeekModelCapabilities = (): Record<string, unknown>[] => {
       // `ultra` is the Codex CLI preset for maximum effort; DeepSeek documents
       // `max` as its wire tier for exactly that request.
       reasoning_effort_wire_map: { ultra: "max" },
-      context_window_tokens: context?.context_window_tokens ?? DEEPSEEK_CONTEXT_WINDOW_TOKENS,
-      max_context_window_tokens: context?.max_context_window_tokens ?? DEEPSEEK_CONTEXT_WINDOW_TOKENS,
-      auto_compact_token_limit_tokens: context?.auto_compact_token_limit_tokens ?? null,
-      ...(context
-        ? {
-            model_class: context.model_class,
-            effective_context_window_percent: context.effective_context_window_percent,
-          }
-        : {}),
+      context_window_tokens: resolved.context_window_tokens,
+      max_context_window_tokens: resolved.max_context_window_tokens,
+      auto_compact_token_limit_tokens: resolved.auto_compact_token_limit_tokens,
+      ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+      context_source: resolved.context_source,
     };
   });
 };
@@ -5841,20 +5853,9 @@ const normalizeModelCapabilitiesEntry = (value: unknown): Record<string, unknown
   if (!id) return null;
   const reasoning = getCodexModelReasoning(value);
   const promptCache = normalizePromptCacheCapabilities(value.prompt_cache);
-  const nativeContextWindow = normalizeTokenCount(value.context_window);
-  const nativeMaxContextWindow = normalizeTokenCount(value.max_context_window);
-  const nativeAutoCompactTokenLimit = normalizeTokenCount(value.auto_compact_token_limit);
-  const resolvedContext = recentModelContextFor(id, {
-    context_window_tokens: nativeContextWindow,
-    max_context_window_tokens: nativeMaxContextWindow,
-    auto_compact_token_limit_tokens: nativeAutoCompactTokenLimit,
-    effective_context_window_percent: normalizeTokenCount(value.effective_context_window_percent),
-  });
-  const contextWindow = resolvedContext?.context_window_tokens ?? nativeContextWindow;
-  const maxContextWindow = resolvedContext?.max_context_window_tokens ?? nativeMaxContextWindow ?? contextWindow;
-  const autoCompactTokenLimit =
-    resolvedContext?.auto_compact_token_limit_tokens ??
-    (nativeAutoCompactTokenLimit !== null && (contextWindow === null || nativeAutoCompactTokenLimit <= contextWindow) ? nativeAutoCompactTokenLimit : null);
+  // The uploaded catalog is authoritative whenever it publishes a value; the
+  // dynamic sources only fill what it leaves unstated.
+  const resolved = resolveModelMetadata(id, { codex: codexSnapshotMetadataHint(value) });
   return {
     id,
     object: "uos.model_capabilities",
@@ -5865,15 +5866,12 @@ const normalizeModelCapabilitiesEntry = (value: unknown): Record<string, unknown
     supported_reasoning_levels: reasoning.levels,
     default_reasoning_effort: reasoning.defaultLevel,
     reasoning_effort_wire_map: Object.fromEntries(reasoning.wireEfforts),
-    context_window_tokens: contextWindow,
-    max_context_window_tokens: maxContextWindow,
-    auto_compact_token_limit_tokens: autoCompactTokenLimit,
-    ...(resolvedContext
-      ? {
-          model_class: resolvedContext.model_class,
-          effective_context_window_percent: resolvedContext.effective_context_window_percent,
-        }
-      : {}),
+    context_window_tokens: resolved.context_window_tokens,
+    max_context_window_tokens: resolved.max_context_window_tokens,
+    auto_compact_token_limit_tokens: resolved.auto_compact_token_limit_tokens,
+    ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+    context_source: resolved.context_source,
+    reasoning_source: resolved.reasoning_source,
     ...(promptCache !== null ? { prompt_cache: promptCache } : {}),
   };
 };
@@ -7619,11 +7617,37 @@ export type PublicModelCatalogEntry = {
   id: string;
   providers: PublicModelProvider[];
   created?: number;
-  model_class?: string;
   context_window_tokens?: number;
   max_context_window_tokens?: number;
   auto_compact_token_limit_tokens?: number;
   effective_context_window_percent?: number;
+  /**
+   * The reasoning tiers this model accepts, from the same resolver the
+   * capabilities endpoint uses. Absent means no source advertises any tier.
+   */
+  supported_reasoning_levels?: readonly string[];
+  default_reasoning_effort?: string;
+  /** Where the context numbers came from: `codex_upload`, `provider_discovery`, `openrouter`, or `unknown`. */
+  context_source?: ModelMetadataSource;
+  /** Where the reasoning tiers came from, in the same vocabulary. */
+  reasoning_source?: ModelMetadataSource;
+};
+
+/**
+ * What each credential-gated route declares about its own model. These are the
+ * route's statements, not curated per-model knowledge, so both the catalog and
+ * the capabilities endpoint read them from here.
+ */
+const DEEPSEEK_PROVIDER_HINT: ModelMetadataHint = {
+  context_window_tokens: DEEPSEEK_CONTEXT_WINDOW_TOKENS,
+  max_context_window_tokens: DEEPSEEK_CONTEXT_WINDOW_TOKENS,
+  supported_reasoning_levels: [...DEEPSEEK_REASONING_LEVELS],
+  default_reasoning_effort: DEEPSEEK_DEFAULT_REASONING_EFFORT,
+};
+
+const CEREBRAS_PROVIDER_HINT: ModelMetadataHint = {
+  supported_reasoning_levels: ["low", "medium", "high"],
+  default_reasoning_effort: "medium",
 };
 
 const providerSupportedEndpointPaths = (supportedEndpointTypes: readonly string[]): string[] => [
@@ -7633,26 +7657,37 @@ const providerSupportedEndpointPaths = (supportedEndpointTypes: readonly string[
 
 const catalogAvailabilityStatus = (available: unknown): "available" | "unavailable" => (available ? "available" : "unavailable");
 
-const publicModelCatalogEntry = (id: string, provider: PublicModelProvider, created: unknown): PublicModelCatalogEntry => {
-  const context = recentModelContextFor(id);
+/**
+ * One catalog row for one model id. Metadata comes from `resolveModelMetadata`,
+ * so a row carries a value only when a source actually published one, and it
+ * names that source. Ids no source describes stay bare instead of inheriting a
+ * curated guess.
+ */
+const publicModelCatalogEntry = (id: string, provider: PublicModelProvider, created: unknown, sources: ModelMetadataSources = {}): PublicModelCatalogEntry => {
+  const resolved = resolveModelMetadata(id, sources);
   const createdSeconds = typeof created === "number" && Number.isSafeInteger(created) && created > 0 ? created : null;
   return {
     id,
     providers: [provider],
     ...(createdSeconds === null ? {} : { created: createdSeconds }),
-    ...(context
-      ? {
-          model_class: context.model_class,
-          context_window_tokens: context.context_window_tokens,
-          max_context_window_tokens: context.max_context_window_tokens,
-          auto_compact_token_limit_tokens: context.auto_compact_token_limit_tokens,
-          effective_context_window_percent: context.effective_context_window_percent,
-        }
-      : {}),
+    ...(resolved.context_window_tokens === null ? {} : { context_window_tokens: resolved.context_window_tokens }),
+    ...(resolved.max_context_window_tokens === null ? {} : { max_context_window_tokens: resolved.max_context_window_tokens }),
+    ...(resolved.auto_compact_token_limit_tokens === null ? {} : { auto_compact_token_limit_tokens: resolved.auto_compact_token_limit_tokens }),
+    ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+    ...(resolved.supported_reasoning_levels === null ? {} : { supported_reasoning_levels: resolved.supported_reasoning_levels }),
+    ...(resolved.default_reasoning_effort === null ? {} : { default_reasoning_effort: resolved.default_reasoning_effort }),
+    context_source: resolved.context_source,
+    reasoning_source: resolved.reasoning_source,
   };
 };
 
-const addPublicModelCatalogEntry = (models: Map<string, PublicModelCatalogEntry>, id: string, provider: PublicModelProvider, created: unknown = null): void => {
+const addPublicModelCatalogEntry = (
+  models: Map<string, PublicModelCatalogEntry>,
+  id: string,
+  provider: PublicModelProvider,
+  created: unknown = null,
+  sources: ModelMetadataSources = {}
+): void => {
   const existing = models.get(id);
   if (existing) {
     existing.providers.push(provider);
@@ -7661,10 +7696,22 @@ const addPublicModelCatalogEntry = (models: Map<string, PublicModelCatalogEntry>
     }
     return;
   }
-  models.set(id, publicModelCatalogEntry(id, provider, created));
+  models.set(id, publicModelCatalogEntry(id, provider, created, sources));
 };
 
-export type ModelCatalogSourceId = "codex" | "openlux" | "surplus" | "deepseek" | "cerebras";
+/** Raw uploaded records by id, so the catalog can read metadata `normalizeModelList` drops. */
+const collectCodexSnapshotRecords = (snapshot: CodexModelsSnapshot | null): Map<string, Record<string, unknown>> => {
+  const records = new Map<string, Record<string, unknown>>();
+  if (!snapshot || !Array.isArray(snapshot.models)) return records;
+  for (const entry of snapshot.models) {
+    if (!isRecord(entry)) continue;
+    const id = modelIdFromSnapshotRecord(entry);
+    if (id) records.set(id, entry);
+  }
+  return records;
+};
+
+export type ModelCatalogSourceId = "codex" | "openlux" | "surplus" | "deepseek" | "cerebras" | "openrouter";
 
 export type ModelCatalogSource = Readonly<{
   status: "available" | "unavailable";
@@ -7706,7 +7753,10 @@ const addCredentialGatedCatalogProviders = (models: Map<string, PublicModelCatal
       supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
     };
     for (const id of DEEPSEEK_OFFICIAL_MODEL_IDS) {
-      addPublicModelCatalogEntry(models, id, provider, null);
+      // Both official ids are one served model behind two aliases, and the route
+      // declares its window and tiers so the row matches what the capabilities
+      // endpoint reports for the same id.
+      addPublicModelCatalogEntry(models, id, provider, null, { provider: DEEPSEEK_PROVIDER_HINT });
       deepseek += 1;
     }
   }
@@ -7716,7 +7766,8 @@ const addCredentialGatedCatalogProviders = (models: Map<string, PublicModelCatal
       models,
       CEREBRAS_GPT_OSS_120B_MODEL,
       { id: "cerebras", owned_by: "cerebras", supported_endpoints: ["/v1/chat/completions"] },
-      null
+      null,
+      { provider: CEREBRAS_PROVIDER_HINT }
     );
     cerebras = 1;
   }
@@ -7730,16 +7781,23 @@ const addCredentialGatedCatalogProviders = (models: Map<string, PublicModelCatal
  * be switched back on) in the operator's picker.
  */
 export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot> => {
+  // Enrichment is cache-only and never awaited, so a slow third party cannot
+  // delay the catalog; the first load after a cold start simply shows less.
+  warmOpenRouterModels();
   const snapshot = await loadCodexModelsSnapshot();
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
   const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels({ requireApiKey: false })]);
   const codexModels = normalized?.data ?? [];
   const surplusModels = surplus?.models ?? [];
   const models = new Map<string, PublicModelCatalogEntry>();
+  // The uploaded records carry the context and reasoning metadata that
+  // `normalizeModelList` strips down to id/object/created/owned_by.
+  const codexRecords = collectCodexSnapshotRecords(snapshot);
 
   for (const model of codexModels) {
     const id = getString(model.id);
     if (!id) continue;
+    const codexRecord = codexRecords.get(id) ?? null;
     addPublicModelCatalogEntry(
       models,
       id,
@@ -7748,7 +7806,8 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
         owned_by: getString(model.owned_by) ?? "openai",
         supported_endpoints: ["/v1/responses", "/v1/chat/completions"],
       },
-      model.created
+      model.created,
+      { codex: codexSnapshotMetadataHint(codexRecord) }
     );
   }
   for (const model of metered?.models ?? []) {
@@ -7798,6 +7857,14 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
       },
       deepseek: credentialGatedCatalogSource(readDeepSeekApiKey() !== null, credentialGated.deepseek),
       cerebras: credentialGatedCatalogSource(readCerebrasApiKey() !== null, credentialGated.cerebras),
+      // Enrichment is listed as a source so the page can show how much of THIS
+      // catalog it fills, counted the same way as every other source: rows it
+      // supplied, not the size of the upstream catalog.
+      openrouter: {
+        status: catalogAvailabilityStatus(openRouterModelsSnapshot()),
+        count: [...models.values()].filter((model) => model.context_source === "openrouter" || model.reasoning_source === "openrouter").length,
+        updated_at_ms: openRouterModelsSnapshot()?.updated_at_ms ?? null,
+      },
     },
   };
 };
@@ -7818,7 +7885,11 @@ const discoveredModelCapabilitiesEntry = (
   provider: "metered" | "surplus"
 ): Record<string, unknown> => {
   const supportedEndpoints = providerSupportedEndpointPaths(model.supported_endpoint_types);
-  const context = recentModelContextFor(model.id);
+  // A discovery row states which endpoints exist, not what the model can do, so
+  // enrichment is the only source left for these ids. When even that is silent
+  // the model advertises `none` alone: that is the gateway's no-reasoning
+  // default, not a claim about the model's tiers.
+  const resolved = resolveModelMetadata(model.id);
   return {
     id: model.id,
     object: "uos.model_capabilities",
@@ -7826,22 +7897,20 @@ const discoveredModelCapabilitiesEntry = (
     display_name: model.id,
     upstream_provider: provider,
     supported_endpoints: supportedEndpoints,
-    supported_reasoning_levels: ["none"],
-    default_reasoning_effort: "none",
+    supported_reasoning_levels: resolved.supported_reasoning_levels ?? ["none"],
+    default_reasoning_effort: resolved.default_reasoning_effort ?? "none",
     reasoning_effort_wire_map: {},
-    context_window_tokens: context?.context_window_tokens ?? null,
-    max_context_window_tokens: context?.max_context_window_tokens ?? null,
-    auto_compact_token_limit_tokens: context?.auto_compact_token_limit_tokens ?? null,
-    ...(context
-      ? {
-          model_class: context.model_class,
-          effective_context_window_percent: context.effective_context_window_percent,
-        }
-      : {}),
+    context_window_tokens: resolved.context_window_tokens,
+    max_context_window_tokens: resolved.max_context_window_tokens,
+    auto_compact_token_limit_tokens: resolved.auto_compact_token_limit_tokens,
+    ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+    context_source: resolved.context_source,
+    reasoning_source: resolved.reasoning_source,
   };
 };
 
 export const handleModelCapabilities = async (): Promise<Response> => {
+  warmOpenRouterModels();
   const snapshot = await loadFullCodexModelsSnapshot();
   let data =
     snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0
