@@ -7615,7 +7615,7 @@ export const handleModels = async (req?: Request): Promise<Response> => {
 };
 
 type PublicModelProvider = Readonly<{
-  id: "codex" | "openlux" | "surplus";
+  id: "codex" | "openlux" | "surplus" | "deepseek" | "cerebras";
   owned_by: string;
   supported_endpoints: readonly string[];
 }>;
@@ -7678,12 +7678,18 @@ const collectCodexCatalogModelIds = (codexModels: readonly Record<string, unknow
   return ids;
 };
 
-export type ModelCatalogSourceId = "codex" | "openlux" | "surplus";
+export type ModelCatalogSourceId = "codex" | "openlux" | "surplus" | "deepseek" | "cerebras";
 
 export type ModelCatalogSource = Readonly<{
   status: "available" | "unavailable";
   count: number;
   updated_at_ms: number | null;
+  /**
+   * Present only for credential-gated providers, which are served from a
+   * configured API key instead of discovery. `false` means the gateway does not
+   * serve that provider at all, which is not the same as a failed discovery.
+   */
+  configured?: boolean;
 }>;
 
 export type ModelCatalogSnapshot = Readonly<{
@@ -7691,11 +7697,55 @@ export type ModelCatalogSnapshot = Readonly<{
   sources: Readonly<Record<ModelCatalogSourceId, ModelCatalogSource>>;
 }>;
 
+/** A credential-gated provider is configured or it is absent; it has no upstream timestamp. */
+const credentialGatedCatalogSource = (configured: boolean, count: number): ModelCatalogSource => ({
+  status: configured ? "available" : "unavailable",
+  count: configured ? count : 0,
+  updated_at_ms: null,
+  configured,
+});
+
 /**
- * Build the complete provider-discovered catalog without applying the operator
- * whitelist. `/uos/models/catalog` filters this snapshot for the public page,
- * while the admin console reads it unfiltered so a disabled model stays visible
- * (and can be switched back on) in the operator's picker.
+ * The official DeepSeek ids are served from the configured DeepSeek key, and
+ * `/v1/models` REPLACES any discovered row for them. Replace the catalog
+ * attribution the same way, so a row never names a provider that does not serve
+ * it and the operator can select these ids at all.
+ */
+const applyDeepSeekCatalogProvider = (models: Map<string, PublicModelCatalogEntry>): { configured: boolean; count: number } => {
+  if (!readDeepSeekApiKey()) return { configured: false, count: 0 };
+  const provider: PublicModelProvider = {
+    id: "deepseek",
+    owned_by: "deepseek",
+    supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
+  };
+  for (const id of DEEPSEEK_OFFICIAL_MODEL_IDS) models.set(id, publicModelCatalogEntry(id, provider, null));
+  return { configured: true, count: DEEPSEEK_OFFICIAL_MODEL_IDS.length };
+};
+
+/**
+ * Cerebras advertises one id, and `/v1/models` only adds it when the Codex
+ * snapshot does not already own that id. Mirror that precedence here: the id
+ * stays attributed to Codex when Codex serves it, and otherwise it is
+ * attributed to Cerebras instead of the discovered provider it displaces.
+ */
+const applyCerebrasCatalogProvider = (
+  models: Map<string, PublicModelCatalogEntry>,
+  codexModelIds: ReadonlySet<string>
+): { configured: boolean; count: number } => {
+  if (!readCerebrasApiKey()) return { configured: false, count: 0 };
+  if (codexModelIds.has(CEREBRAS_GPT_OSS_120B_MODEL)) return { configured: true, count: 0 };
+  models.set(
+    CEREBRAS_GPT_OSS_120B_MODEL,
+    publicModelCatalogEntry(CEREBRAS_GPT_OSS_120B_MODEL, { id: "cerebras", owned_by: "cerebras", supported_endpoints: ["/v1/chat/completions"] }, null)
+  );
+  return { configured: true, count: 1 };
+};
+
+/**
+ * Build the complete catalog without applying the operator whitelist.
+ * `/uos/models/catalog` filters this snapshot for the public page, while the
+ * admin console reads it unfiltered so a disabled model stays visible (and can
+ * be switched back on) in the operator's picker.
  */
 export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot> => {
   const snapshot = await loadCodexModelsSnapshot();
@@ -7703,7 +7753,8 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
   const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels({ requireApiKey: false })]);
   const codexModels = normalized?.data ?? [];
   const surplusModels = surplus?.models ?? [];
-  const otherProviderModelIds = collectCodexCatalogModelIds(codexModels);
+  const codexModelIds = collectCodexCatalogModelIds(codexModels);
+  const otherProviderModelIds = new Set(codexModelIds);
   for (const model of surplusModels) otherProviderModelIds.add(model.id);
   const models = new Map<string, PublicModelCatalogEntry>();
   const includedOpenLuxModelIds = new Set<string>();
@@ -7751,6 +7802,9 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
     );
   }
 
+  const deepseek = applyDeepSeekCatalogProvider(models);
+  const cerebras = applyCerebrasCatalogProvider(models, codexModelIds);
+
   return {
     models: [...models.values()].sort((left, right) => left.id.localeCompare(right.id)),
     sources: {
@@ -7769,6 +7823,8 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
         count: surplus?.models.length ?? 0,
         updated_at_ms: surplus?.updated_at_ms ?? null,
       },
+      deepseek: credentialGatedCatalogSource(deepseek.configured, deepseek.count),
+      cerebras: credentialGatedCatalogSource(cerebras.configured, cerebras.count),
     },
   };
 };

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import adminHtml from "../static/admin.html" with { type: "text" };
 import adminScript from "../static/admin.js" with { type: "text" };
+import modelsScript from "../static/models.js" with { type: "text" };
 import adminSource from "../src/admin.ts" with { type: "text" };
 import { handleAdminCodexModelsWhitelistGet, handleAdminCodexModelsWhitelistSet, handleAdminModelsCatalogGet } from "../src/admin.ts";
 import {
@@ -14,7 +15,14 @@ import {
 } from "../src/codex_models_whitelist.ts";
 import handler from "../src/handler.ts";
 import { setKvForTest } from "../src/kv.ts";
+import { buildModelCatalogSnapshot } from "../src/openai.ts";
 import openaiSource from "../src/openai.ts" with { type: "text" };
+
+// The catalog builder reads discovery credentials from the environment. Clearing
+// them keeps these tests on the credential-gated providers they own, and keeps
+// the discovery fetches from reaching a network the test task does not allow.
+Deno.env.delete("METERED_API_KEY");
+Deno.env.delete("SURPLUS_API_KEY");
 
 const WHITELIST_URL = "https://ai.ubq.fi/admin/models/whitelist";
 
@@ -51,11 +59,17 @@ const catalogFixture = () => ({
       id: "kimi-k2",
       providers: [{ id: "surplus" as const, owned_by: "moonshot", supported_endpoints: ["/v1/chat/completions"] }],
     },
+    {
+      id: "deepseek-v4-flash",
+      providers: [{ id: "deepseek" as const, owned_by: "deepseek", supported_endpoints: ["/v1/chat/completions", "/v1/responses"] }],
+    },
   ],
   sources: {
     codex: { status: "available" as const, count: 2, updated_at_ms: 1 },
     openlux: { status: "unavailable" as const, count: 0, updated_at_ms: null },
     surplus: { status: "available" as const, count: 1, updated_at_ms: 2 },
+    deepseek: { status: "available" as const, count: 1, updated_at_ms: null, configured: true },
+    cerebras: { status: "unavailable" as const, count: 0, updated_at_ms: null, configured: false },
   },
 });
 
@@ -85,7 +99,7 @@ Deno.test("admin model picker lists every discovered model alongside the saved s
     const body = await response.json();
     assert.deepEqual(
       body.data.models.map((model: { id: string }) => model.id),
-      ["gpt-5.6-sol", "gpt-5.6-terra", "kimi-k2"],
+      ["gpt-5.6-sol", "gpt-5.6-terra", "kimi-k2", "deepseek-v4-flash"],
       "an unfiltered catalog keeps the hidden models selectable"
     );
     assert.deepEqual(body.data.whitelist.model_ids, ["gpt-5.6-sol"]);
@@ -108,6 +122,74 @@ Deno.test("an empty stored whitelist is reported as no filter, not as nothing se
     const storedBody = await stored.json();
     assert.equal(storedBody.data.filter_active, false, "an empty saved list lists every model");
   });
+});
+
+Deno.test("the official DeepSeek ids are cataloged as their own provider category", async () => {
+  Deno.env.delete("CEREBRAS_API_KEY");
+  Deno.env.set("DEEPSEEK_API_KEY", "fixture-deepseek-key");
+  try {
+    const catalog = await buildModelCatalogSnapshot();
+    const rows = catalog.models.filter((model) => model.providers.some((provider) => provider.id === "deepseek"));
+    assert.deepEqual(
+      rows.map((model) => model.id),
+      ["deepseek-flash", "deepseek-v4-flash"],
+      "both official ids are selectable in the picker"
+    );
+    for (const row of rows) {
+      assert.deepEqual(
+        row.providers.map((provider) => provider.id),
+        ["deepseek"],
+        "the official route replaces a discovered attribution"
+      );
+      assert.deepEqual(row.providers[0].supported_endpoints, ["/v1/chat/completions", "/v1/responses"]);
+      assert.equal(row.model_class, "deepseek-v4");
+      assert.equal(row.context_window_tokens, 1_000_000);
+    }
+    assert.deepEqual(catalog.sources.deepseek, { status: "available", count: 2, updated_at_ms: null, configured: true });
+    assert.deepEqual(catalog.sources.cerebras, { status: "unavailable", count: 0, updated_at_ms: null, configured: false });
+  } finally {
+    Deno.env.delete("DEEPSEEK_API_KEY");
+  }
+});
+
+Deno.test("a credential-gated provider with no key is absent instead of unavailable", async () => {
+  Deno.env.delete("DEEPSEEK_API_KEY");
+  Deno.env.delete("CEREBRAS_API_KEY");
+  try {
+    const catalog = await buildModelCatalogSnapshot();
+    assert.equal(
+      catalog.models.some((model) => model.providers.some((provider) => provider.id === "deepseek")),
+      false
+    );
+    assert.equal(
+      catalog.models.some((model) => model.providers.some((provider) => provider.id === "cerebras")),
+      false
+    );
+    assert.equal(catalog.sources.deepseek.configured, false);
+    assert.equal(catalog.sources.deepseek.status, "unavailable");
+    assert.equal(catalog.sources.cerebras.configured, false);
+  } finally {
+    Deno.env.delete("DEEPSEEK_API_KEY");
+    Deno.env.delete("CEREBRAS_API_KEY");
+  }
+});
+
+Deno.test("Cerebras claims its id unless the Codex snapshot already owns it", async () => {
+  Deno.env.delete("DEEPSEEK_API_KEY");
+  Deno.env.set("CEREBRAS_API_KEY", "fixture-cerebras-key");
+  try {
+    const catalog = await buildModelCatalogSnapshot();
+    const row = catalog.models.find((model) => model.id === "gpt-oss-120b");
+    assert.ok(row, "the configured Cerebras model is cataloged");
+    assert.deepEqual(
+      row.providers.map((provider) => provider.id),
+      ["cerebras"]
+    );
+    assert.deepEqual(row.providers[0].supported_endpoints, ["/v1/chat/completions"]);
+    assert.deepEqual(catalog.sources.cerebras, { status: "available", count: 1, updated_at_ms: null, configured: true });
+  } finally {
+    Deno.env.delete("CEREBRAS_API_KEY");
+  }
 });
 
 Deno.test("the model picker refuses to render without KV", async () => {
@@ -249,8 +331,11 @@ Deno.test("the Models tab renders checkbox tools instead of a free-text whitelis
     assert.match(adminHtml, new RegExp(`id="${id}"`), `${id} must be rendered`);
     assert.match(adminScript, new RegExp(`mustGet\\("${id}"\\)`), `${id} must be wired`);
   }
-  for (const provider of ["all", "codex", "openlux", "surplus"]) {
-    assert.match(adminHtml, new RegExp(`data-model-provider="${provider}"`));
+  for (const provider of ["all", "codex", "openlux", "surplus", "deepseek", "cerebras"]) {
+    assert.match(adminHtml, new RegExp(`data-model-provider="${provider}"`), `${provider} needs a filter chip`);
+  }
+  for (const provider of ["codex", "openlux", "surplus", "deepseek", "cerebras"]) {
+    assert.match(adminScript, new RegExp(`\\b${provider}: "`), `${provider} needs a display label`);
   }
 
   assert.match(adminScript, /checkbox\.type = "checkbox"/);
@@ -275,4 +360,10 @@ Deno.test("the Models tab renders checkbox tools instead of a free-text whitelis
   // The legacy rule has to stay visible: an empty selection is a cleared filter.
   assert.match(adminHtml, /Saving an empty selection removes the filter/);
   assert.match(adminScript, /No models checked: the filter is off/);
+
+  // A credential-gated provider with no key is absent on purpose, not broken.
+  assert.match(adminScript, /source\.configured !== false/);
+  assert.match(modelsScript, /source\?\.configured !== false/);
+  assert.match(modelsScript, /deepseek: "DeepSeek"/);
+  assert.match(modelsScript, /cerebras: "Cerebras"/);
 });

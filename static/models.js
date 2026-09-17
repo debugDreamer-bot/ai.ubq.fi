@@ -10,7 +10,13 @@ if (!summary || !list || !count || !(search instanceof HTMLInputElement)) {
   throw new Error("Models page markup is incomplete");
 }
 
-const providerNames = { codex: "Codex", openlux: "Metered 2", surplus: "Metered 1" };
+const providerNames = {
+  codex: "Codex",
+  openlux: "Metered 2",
+  surplus: "Metered 1",
+  deepseek: "DeepSeek",
+  cerebras: "Cerebras",
+};
 const reasoningOrder = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const tokenNumber = new Intl.NumberFormat("en-US");
 
@@ -130,18 +136,22 @@ try {
   const payload = await response.json();
   assignCatalog(Array.isArray(payload.data) ? payload.data : []);
   summary.replaceChildren(
-    ...Object.entries(payload.sources ?? {}).map(([id, source]) => {
-      const article = document.createElement("article");
-      const name = document.createElement("h2");
-      const total = document.createElement("strong");
-      const state = document.createElement("span");
-      name.textContent = providerNames[id] ?? id;
-      total.textContent = String(source.count ?? 0);
-      state.textContent = source.status === "available" ? "cataloged models" : "catalog unavailable";
-      article.dataset.state = source.status ?? "unavailable";
-      article.append(name, total, state);
-      return article;
-    }),
+    ...Object.entries(payload.sources ?? {})
+      // Credential-gated providers that the gateway has no key for are absent
+      // on purpose, so they are not reported as unavailable sources.
+      .filter(([, source]) => source?.configured !== false)
+      .map(([id, source]) => {
+        const article = document.createElement("article");
+        const name = document.createElement("h2");
+        const total = document.createElement("strong");
+        const state = document.createElement("span");
+        name.textContent = providerNames[id] ?? id;
+        total.textContent = String(source.count ?? 0);
+        state.textContent = source.status === "available" ? "cataloged models" : "catalog unavailable";
+        article.dataset.state = source.status ?? "unavailable";
+        article.append(name, total, state);
+        return article;
+      }),
   );
   render();
 } catch (error) {
