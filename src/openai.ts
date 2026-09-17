@@ -56,6 +56,13 @@ import {
 import { getCatalogClientVersion, handleCodexCatalogModels } from "./codex_catalog.ts";
 import { CODEX_CHATGPT_PROMPT_CACHE_PROVIDER, normalizePromptCacheCapabilities, type PromptCacheControls } from "./codex_models.ts";
 import { loadCodexModelsWhitelist, filterWhitelistedModelList, filterWhitelistedModelMap } from "./codex_models_whitelist.ts";
+import {
+  filterCatalogEntriesByProviderSelection,
+  isProviderEnabled,
+  loadProviderSelectionCached,
+  type ProviderSelection,
+  SELECTABLE_PROVIDER_IDS,
+} from "./provider_selection.ts";
 import { type ApiKeyProviderDispatch, ApiKeyQuotaDispatchError, type ApiKeyUsageReservation } from "./api_key_policy.ts";
 import { DEFAULT_REASONING_EFFORT, normalizeReasoningEffort, type ReasoningEffort } from "./defaults.ts";
 import { BOUNDED_RESPONSE_BODY_MAX_BYTES, BOUNDED_RESPONSE_BODY_TIMEOUT_MS, readBoundedResponseBody } from "./bounded_response_body.ts";
@@ -2454,10 +2461,10 @@ const paidProviderAdmissionError = (reason: string): Response => {
   }
 };
 
-const canAttemptPaidFallback = (context: UsageContext | undefined): boolean =>
+const canAttemptPaidFallback = (context: UsageContext | undefined, selection: ProviderSelection | null): boolean =>
   context?.paidFallbackEnabled === true &&
   Boolean(context.keyId && context.requestId && context.startedAtMs !== undefined) &&
-  (Boolean(readSurplusApiKey()) || Boolean(readMeteredApiKey()));
+  ((isProviderEnabled("surplus", selection) && Boolean(readSurplusApiKey())) || (isProviderEnabled("openlux", selection) && Boolean(readMeteredApiKey())));
 
 const bestEffortPaidFallbackBookkeeping = async (operation: string, run: () => Promise<unknown>): Promise<void> => {
   try {
@@ -2645,12 +2652,14 @@ const resolvePaidRoutingState = (
     endpointType: string;
     requestUsesTools: boolean;
     model: string;
+    selection: ProviderSelection | null;
   }>
 ): Readonly<{
   surplusBilling: SurplusBillingPricing | null;
   paidProviders: readonly ("metered" | "surplus")[];
   paidModelKnown: boolean;
   meteredOnly: boolean;
+  codexEnabled: boolean;
 }> => {
   const meteredModelSupportsRoute =
     input.meteredCatalog?.models.some((entry) => entry.id === input.model && entry.supported_endpoint_types.includes(input.endpointType)) === true;
@@ -2673,14 +2682,25 @@ const resolvePaidRoutingState = (
           ...(surplusModel?.cache_write_price_per_token === undefined ? {} : { cache_write_price_per_token: surplusModel.cache_write_price_per_token }),
         }
       : null;
+  // The operator can switch a provider off. An empty or absent selection is no
+  // filter at all, so `isProviderEnabled` keeps every provider eligible by
+  // default and only a saved selection narrows the waterfall.
+  const codexEnabled = isProviderEnabled("codex", input.selection);
   // A known Codex model retains the historical OpenLux roster path even when
   // its discovery request is temporarily unavailable. Surplus is selected
   // only when its own catalog proves that the exact model is routable.
-  const meteredCanServe = Boolean(readMeteredApiKey()) && (input.meteredCatalog === null ? input.codexModelKnown : meteredModelSupportsRoute);
+  const meteredCanServe =
+    isProviderEnabled("openlux", input.selection) &&
+    Boolean(readMeteredApiKey()) &&
+    (input.meteredCatalog === null ? input.codexModelKnown : meteredModelSupportsRoute);
   // Tool-bearing work needs explicit capability evidence from the exact
   // Surplus model record. Missing or partial metadata remains fail-closed.
   const surplusCanServe =
-    (!input.requestUsesTools || surplusModel?.supports_tools === true) && Boolean(readSurplusApiKey()) && surplusModelSupportsRoute && surplusBilling !== null;
+    isProviderEnabled("surplus", input.selection) &&
+    (!input.requestUsesTools || surplusModel?.supports_tools === true) &&
+    Boolean(readSurplusApiKey()) &&
+    surplusModelSupportsRoute &&
+    surplusBilling !== null;
   // The paid tiers have a fixed cost order for every model. Provider
   // availability may remove a tier, but it must never reverse the order.
   const preferredPaidProviders: readonly ("metered" | "surplus")[] = ["surplus", "metered"];
@@ -2690,6 +2710,7 @@ const resolvePaidRoutingState = (
     paidProviders,
     paidModelKnown: meteredModelSupportsRoute || surplusModelSupportsRoute,
     meteredOnly: paidProviders.length > 0 && !input.codexModelKnown,
+    codexEnabled,
   };
 };
 
@@ -2776,7 +2797,8 @@ const fetchTemporaryFreeSurplusRoutedResponses = async (
 
 const loadPaidResponsesCatalogs = async (
   body: Record<string, unknown>,
-  options: Readonly<{ model: string; route: "chat.completions" | "responses"; signal?: AbortSignal }>
+  options: Readonly<{ model: string; route: "chat.completions" | "responses"; signal?: AbortSignal }>,
+  selection: ProviderSelection | null
 ): Promise<
   Readonly<{
     codexModelKnown: boolean;
@@ -2784,11 +2806,13 @@ const loadPaidResponsesCatalogs = async (
     requestUsesTools: boolean;
     meteredCatalog: Awaited<ReturnType<typeof fetchMeteredModels>>;
     surplusCatalog: Awaited<ReturnType<typeof fetchSurplusModels>>;
+    selection: ProviderSelection | null;
     routing: Readonly<{
       surplusBilling: SurplusBillingPricing | null;
       paidProviders: readonly ("metered" | "surplus")[];
       paidModelKnown: boolean;
       meteredOnly: boolean;
+      codexEnabled: boolean;
     }>;
   }>
 > => {
@@ -2811,9 +2835,9 @@ const loadPaidResponsesCatalogs = async (
   ) {
     [meteredCatalog, surplusCatalog] = await refreshPaidCatalogs(meteredCatalog, surplusCatalog, options.signal);
   }
-  const routing = resolvePaidRoutingState({ meteredCatalog, surplusCatalog, codexModelKnown, endpointType, requestUsesTools, model: options.model });
+  const routing = resolvePaidRoutingState({ meteredCatalog, surplusCatalog, codexModelKnown, endpointType, requestUsesTools, model: options.model, selection });
   if (routing.paidProviders.length) refreshStalePaidCatalogsInBackground(meteredCatalog, surplusCatalog);
-  return { codexModelKnown, endpointType, requestUsesTools, meteredCatalog, surplusCatalog, routing };
+  return { codexModelKnown, endpointType, requestUsesTools, meteredCatalog, surplusCatalog, selection, routing };
 };
 
 const rejectPaidAdmission = (
@@ -2835,6 +2859,33 @@ const rejectPaidAdmission = (
     paidFallback: null,
     gatewayResponse: true,
     fallbackReason: "dynamic_paid_model",
+    allowRemovedProviderRecovery: false,
+  };
+};
+
+/**
+ * The operator switched the Codex subscription provider off and no enabled paid
+ * provider can serve this request. Fail closed with an explicit gateway error
+ * instead of quietly dispatching to the provider that was switched off.
+ */
+const rejectDisabledCodexProvider = (
+  model: string,
+  telemetry: ResponseTelemetryState | undefined,
+  usageContext: UsageContext | undefined
+): RoutedResponsesUpstream => {
+  if (telemetry) {
+    telemetry.provider = "gateway";
+    telemetry.fallbackReason = null;
+  }
+  logPaidProviderAdmissionRejected(usageContext?.requestId ?? "unknown", model, "codex_provider_disabled");
+  return {
+    response: openaiError(503, "The Codex provider is switched off and no enabled paid provider serves this model.", "provider_disabled", {
+      type: "server_error",
+    }),
+    provider: "chatgpt_codex",
+    paidFallback: null,
+    gatewayResponse: true,
+    fallbackReason: null,
     allowRemovedProviderRecovery: false,
   };
 };
@@ -2971,12 +3022,21 @@ const recordCodexPrimaryTelemetry = async (primary: Response, telemetry: Respons
   telemetry.providerRequestId = providerRequestIdFromResponse(primary);
 };
 
+/**
+ * The paid provider a request dispatches to as its primary. A model outside the
+ * Codex roster has always taken that path; a disabled Codex provider takes it
+ * because there is no subscription attempt left to make first.
+ */
+const directPaidProviderFor = (
+  routing: Readonly<{ meteredOnly: boolean; codexEnabled: boolean; paidProviders: readonly ("metered" | "surplus")[] }>
+): "metered" | "surplus" | null => (routing.meteredOnly || !routing.codexEnabled ? (routing.paidProviders[0] ?? null) : null);
+
 const resolveDirectPaidPrimary = (
-  routing: Readonly<{ meteredOnly: boolean; paidProviders: readonly ("metered" | "surplus")[] }>,
+  routing: Readonly<{ meteredOnly: boolean; codexEnabled: boolean; paidProviders: readonly ("metered" | "surplus")[] }>,
   telemetry: ResponseTelemetryState | undefined,
   usageContext: UsageContext | undefined
 ) => {
-  const directPaidProvider = routing.meteredOnly ? routing.paidProviders[0] : null;
+  const directPaidProvider = directPaidProviderFor(routing);
   const directPaidPrimary = directPaidProvider
     ? openaiError(503, "Paid-provider routing did not reach the selected upstream.", "paid_provider_not_dispatched", { type: "server_error" })
     : null;
@@ -2996,7 +3056,7 @@ const paidFallbackReasonFor = (
 };
 
 const resolvePaidFallbackAdmission = (
-  routing: Readonly<{ meteredOnly: boolean; paidProviders: readonly ("metered" | "surplus")[] }>,
+  routing: Readonly<{ meteredOnly: boolean; codexEnabled: boolean; paidProviders: readonly ("metered" | "surplus")[] }>,
   primary: Response,
   primaryStatus: number,
   routingError: string | null,
@@ -3014,7 +3074,7 @@ const resolvePaidFallbackAdmission = (
       createdAtMs: number;
       rejectAdmission: (errorReason: string, logReason?: string) => RoutedResponsesUpstream;
     }> => {
-  const directPaidProvider = routing.meteredOnly ? routing.paidProviders[0] : null;
+  const directPaidProvider = directPaidProviderFor(routing);
   const keyId = usageContext?.keyId;
   const requestId = usageContext?.requestId;
   const createdAtMs = usageContext?.startedAtMs;
@@ -3049,8 +3109,9 @@ const replenishPaidFallbackCatalogs = async (
     paidProviders: readonly ("metered" | "surplus")[];
     paidModelKnown: boolean;
     meteredOnly: boolean;
+    codexEnabled: boolean;
   }>,
-  routingInput: Readonly<{ codexModelKnown: boolean; endpointType: string; requestUsesTools: boolean; model: string }>,
+  routingInput: Readonly<{ codexModelKnown: boolean; endpointType: string; requestUsesTools: boolean; model: string; selection: ProviderSelection | null }>,
   fallbackSignal: AbortSignal | undefined
 ): Promise<
   Readonly<{
@@ -3061,6 +3122,7 @@ const replenishPaidFallbackCatalogs = async (
       paidProviders: readonly ("metered" | "surplus")[];
       paidModelKnown: boolean;
       meteredOnly: boolean;
+      codexEnabled: boolean;
     }>;
   }>
 > => {
@@ -3086,6 +3148,7 @@ const replenishPaidFallbackCatalogs = async (
     endpointType: routingInput.endpointType,
     requestUsesTools: routingInput.requestUsesTools,
     model: routingInput.model,
+    selection: routingInput.selection,
   });
   if (nextRouting.paidProviders.length) refreshStalePaidCatalogsInBackground(nextMeteredCatalog, nextSurplusCatalog);
   return { meteredCatalog: nextMeteredCatalog, surplusCatalog: nextSurplusCatalog, routing: nextRouting };
@@ -3411,8 +3474,15 @@ const fetchResponsesWithPaidFallback = async (
 ): Promise<RoutedResponsesUpstream> => {
   const fallbackSignal = options.fallbackSignal ?? options.signal;
   const telemetry = options.usageContext?.responseTelemetry;
-  if (isTemporaryFreeSurplusModel(options.model)) return fetchTemporaryFreeSurplusRoutedResponses(body, options);
-  const catalogs = await loadPaidResponsesCatalogs(body, options);
+  // The operator's provider selection is read once per request and reused by
+  // every routing decision below, including the paid catalog resolution.
+  const selection = await loadProviderSelectionCached();
+  // The temporary free model is a Surplus route, so switching Surplus off takes
+  // it out of that route and leaves the ordinary waterfall to decide.
+  if (isTemporaryFreeSurplusModel(options.model) && isProviderEnabled("surplus", selection)) {
+    return fetchTemporaryFreeSurplusRoutedResponses(body, options);
+  }
+  const catalogs = await loadPaidResponsesCatalogs(body, options, selection);
   const { codexModelKnown, endpointType, requestUsesTools } = catalogs;
   const meteredCatalog = catalogs.meteredCatalog;
   let surplusCatalog = catalogs.surplusCatalog;
@@ -3429,6 +3499,9 @@ const fetchResponsesWithPaidFallback = async (
   );
   if (unroutableModel) return unroutableModel;
   const { directPaidProvider, directPaidPrimary } = resolveDirectPaidPrimary(routing, telemetry, options.usageContext);
+  // A disabled Codex provider with no enabled paid provider must never fall back
+  // to Codex itself, so this is a terminal gateway error rather than a dispatch.
+  if (!routing.codexEnabled && !directPaidProvider) return rejectDisabledCodexProvider(options.model, telemetry, options.usageContext);
   let primary = await dispatchCodexPrimaryResponse(body, options, directPaidPrimary);
   const primaryStatus = primary.status;
   const authReauthenticationPrimary = primaryStatus === 401 && responseWarnings(primary).includes(CODEX_AUTH_REAUTH_WARNING);
@@ -3462,7 +3535,7 @@ const fetchResponsesWithPaidFallback = async (
     meteredCatalog,
     surplusCatalog,
     routing,
-    { codexModelKnown, endpointType, requestUsesTools, model: options.model },
+    { codexModelKnown, endpointType, requestUsesTools, model: options.model, selection: catalogs.selection },
     fallbackSignal
   );
   surplusCatalog = replenished.surplusCatalog;
@@ -5779,8 +5852,8 @@ const configuredCerebrasModelCapabilities = (): Record<string, unknown> | null =
   };
 };
 
-const withConfiguredCerebrasModel = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
-  const cerebras = configuredCerebrasModel();
+const withConfiguredCerebrasModel = (models: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
+  const cerebras = enabled ? configuredCerebrasModel() : null;
   if (!cerebras || models.some((model) => model.id === CEREBRAS_GPT_OSS_120B_MODEL)) {
     return [...models];
   }
@@ -5833,15 +5906,15 @@ const configuredDeepSeekModelCapabilities = (): Record<string, unknown>[] => {
   });
 };
 
-const withConfiguredDeepSeekModels = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
-  const configured = configuredDeepSeekModels();
+const withConfiguredDeepSeekModels = (models: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
+  const configured = enabled ? configuredDeepSeekModels() : [];
   if (!configured.length) return [...models];
   const ids = new Set(configured.map((model) => model.id));
   return [...models.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
 };
 
-const withConfiguredDeepSeekCapabilities = (data: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
-  const configured = configuredDeepSeekModelCapabilities();
+const withConfiguredDeepSeekCapabilities = (data: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
+  const configured = enabled ? configuredDeepSeekModelCapabilities() : [];
   if (!configured.length) return [...data];
   const ids = new Set(configured.map((model) => model.id));
   return [...data.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
@@ -7584,10 +7657,20 @@ export const handleModels = async (req?: Request): Promise<Response> => {
     const clientVersion = getCatalogClientVersion(req);
     if (clientVersion !== null) return await handleCodexCatalogModels(req, clientVersion);
   }
+  // A switched-off provider is not advertised, so its rows leave this list even
+  // while the discovery snapshots still hold them.
+  const selection = await loadProviderSelectionCached();
   const snapshot = await loadCodexModelsSnapshot();
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
-  const data = withConfiguredDeepSeekModels(withConfiguredCerebrasModel(normalized?.data ?? []));
-  const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels()]);
+  const codexModels = isProviderEnabled("codex", selection) ? (normalized?.data ?? []) : [];
+  const data = withConfiguredDeepSeekModels(
+    withConfiguredCerebrasModel(codexModels, isProviderEnabled("cerebras", selection)),
+    isProviderEnabled("deepseek", selection)
+  );
+  const [metered, surplus] = await Promise.all([
+    isProviderEnabled("openlux", selection) ? fetchMeteredModels() : Promise.resolve(null),
+    isProviderEnabled("surplus", selection) ? fetchSurplusModels() : Promise.resolve(null),
+  ]);
   const merged = [...data];
   for (const model of [...(metered?.models ?? []), ...(surplus?.models ?? [])]) {
     if (!model.supported_endpoint_types.some((type) => type === "openai" || type === "openai-response")) continue;
@@ -7723,6 +7806,8 @@ export type ModelCatalogSource = Readonly<{
    * serve that provider at all, which is not the same as a failed discovery.
    */
   configured?: boolean;
+  /** Set when the operator switched this provider off in the admin console. */
+  disabled?: boolean;
 }>;
 
 export type ModelCatalogSnapshot = Readonly<{
@@ -7869,14 +7954,30 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
   };
 };
 
+/**
+ * Public catalog sources for one provider selection. A switched-off provider
+ * contributes nothing and is marked `disabled`, which the models page reads as
+ * "not served at all" rather than as a failed discovery. The admin picker keeps
+ * using the unfiltered snapshot so every provider stays visible and switchable.
+ */
+const selectedCatalogSources = (sources: ModelCatalogSnapshot["sources"], selection: ProviderSelection | null): ModelCatalogSnapshot["sources"] => {
+  if (!selection || selection.provider_ids.length === 0) return sources;
+  const adjusted = { ...sources };
+  for (const id of SELECTABLE_PROVIDER_IDS) {
+    if (isProviderEnabled(id, selection)) continue;
+    adjusted[id] = { status: "unavailable", count: 0, updated_at_ms: null, configured: false, disabled: true };
+  }
+  return adjusted;
+};
+
 export const handlePublicModelCatalog = async (): Promise<Response> => {
-  const catalog = await buildModelCatalogSnapshot();
+  const [catalog, selection] = await Promise.all([buildModelCatalogSnapshot(), loadProviderSelectionCached()]);
   const catalogKv = await getKv();
   const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
   return json(200, {
     object: "uos.model_catalog",
-    data: filterWhitelistedModelMap(catalog.models, catalogWhitelist),
-    sources: catalog.sources,
+    data: filterWhitelistedModelMap(filterCatalogEntriesByProviderSelection(catalog.models, selection), catalogWhitelist),
+    sources: selectedCatalogSources(catalog.sources, selection),
   });
 };
 
@@ -7911,16 +8012,22 @@ const discoveredModelCapabilitiesEntry = (
 
 export const handleModelCapabilities = async (): Promise<Response> => {
   warmOpenRouterModels();
+  // Capabilities describe the routes the gateway can still dispatch to, so a
+  // switched-off provider contributes no entries here either.
+  const selection = await loadProviderSelectionCached();
   const snapshot = await loadFullCodexModelsSnapshot();
   let data =
-    snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0
+    snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 && isProviderEnabled("codex", selection)
       ? (snapshot.models.map(normalizeModelCapabilitiesEntry).filter(Boolean) as Record<string, unknown>[])
       : [];
-  const cerebras = configuredCerebrasModelCapabilities();
+  const cerebras = isProviderEnabled("cerebras", selection) ? configuredCerebrasModelCapabilities() : null;
   if (cerebras && !data.some((model) => model.id === CEREBRAS_GPT_OSS_120B_MODEL)) {
     data.push(cerebras);
   }
-  const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels()]);
+  const [metered, surplus] = await Promise.all([
+    isProviderEnabled("openlux", selection) ? fetchMeteredModels() : Promise.resolve(null),
+    isProviderEnabled("surplus", selection) ? fetchSurplusModels() : Promise.resolve(null),
+  ]);
   for (const [provider, models] of [
     ["metered", metered?.models ?? []],
     ["surplus", surplus?.models ?? []],
@@ -7932,7 +8039,7 @@ export const handleModelCapabilities = async (): Promise<Response> => {
   }
   // Applied last so a DeepSeek-official id discovered above from the paid
   // fallback is replaced by the capabilities of the route it actually uses.
-  data = withConfiguredDeepSeekCapabilities(data);
+  data = withConfiguredDeepSeekCapabilities(data, isProviderEnabled("deepseek", selection));
 
   const capabilitiesKv = await getKv();
   const capabilitiesWhitelist = capabilitiesKv ? await loadCodexModelsWhitelist(capabilitiesKv) : null;
@@ -10371,10 +10478,13 @@ const handleChatCompletionsInternal = async (req: Request, usageContext?: UsageC
   if (!modelChoice.ok) return modelChoice.response;
   const { modelRaw, model, maxCompletionTokens } = modelChoice.value;
 
-  if (model.toLowerCase() === CEREBRAS_GPT_OSS_120B_MODEL) {
+  // A switched-off direct provider is not dispatched to; those ids then follow
+  // the ordinary Codex/paid waterfall like any other catalog model.
+  const selection = await loadProviderSelectionCached();
+  if (isProviderEnabled("cerebras", selection) && model.toLowerCase() === CEREBRAS_GPT_OSS_120B_MODEL) {
     return await handleCerebrasChatCompletions(req, rawRecord, modelRaw, usageContext);
   }
-  if (deepSeekUpstreamModelFor(model)) {
+  if (isProviderEnabled("deepseek", selection) && deepSeekUpstreamModelFor(model)) {
     return await handleDeepSeekChatCompletions(req, rawRecord, modelRaw, usageContext);
   }
 
@@ -10607,7 +10717,9 @@ const resolveResponsesModel = async (
   }
   const model = normalizeModelForCodex(modelRaw);
   if (usageContext?.responseTelemetry) usageContext.responseTelemetry.model = modelRaw;
-  if (model.toLowerCase() === CEREBRAS_GPT_OSS_120B_MODEL) {
+  // A switched-off Cerebras provider no longer owns this id, so the ordinary
+  // availability check below decides whether anything else can serve it.
+  if (model.toLowerCase() === CEREBRAS_GPT_OSS_120B_MODEL && isProviderEnabled("cerebras", await loadProviderSelectionCached())) {
     return {
       ok: false,
       response: openaiError(400, "gpt-oss-120b is available only on /v1/chat/completions.", "unsupported_model", { param: "model" }),
@@ -10822,7 +10934,7 @@ const prepareResponsesRouting = async (req: Request, state: ResponsesRequestStat
   const requestInferenceSignal = state.clientWantsStream ? downstreamSignal : inferenceSignal(req, state.usageContext);
   const preHeaderDeadline = createStreamFirstEventDeadline(requestInferenceSignal);
   const apiKey = isTemporaryFreeSurplusModel(model) ? null : readRemovedProviderApiKey();
-  const paidFallbackAvailable = canAttemptPaidFallback(state.usageContext);
+  const paidFallbackAvailable = canAttemptPaidFallback(state.usageContext, await loadProviderSelectionCached());
   const debugRoutingScenario = (await loadDebugRoutingConfig()).scenario;
   const circuit = apiKey ? await selectRemovedProviderCircuitRoute() : null;
   if (circuit) {

@@ -11,7 +11,7 @@
     <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="icon" href="/favicon.png" type="image/png" sizes="256x256" />
     <link rel="stylesheet" href="/style.css?v=app-minimal-20260917" />
-    <link rel="stylesheet" href="/admin.css?v=20260917-model-picker-v1" />
+    <link rel="stylesheet" href="/admin.css?v=20260917-provider-picker-v1" />
   </head>
   <body data-page="admin" data-role="admin" data-auth-widget="collapsed" data-auth-scope="none">
     <div data-shell>
@@ -46,11 +46,20 @@
           </div>
           <div data-tabs role="tablist" aria-label="Admin sections">
             <button
+              id="view-tab-analytics"
+              type="button"
+              role="tab"
+              aria-controls="view-analytics"
+              aria-selected="true"
+            >
+              Analytics
+            </button>
+            <button
               id="view-tab-providers"
               type="button"
               role="tab"
               aria-controls="view-providers"
-              aria-selected="true"
+              aria-selected="false"
             >
               Providers
             </button>
@@ -136,7 +145,7 @@
                   <span id="loading-upstream-status" data-badge data-state="unknown">Waiting</span>
                 </div>
                 <div data-loading-item>
-                  <span data-auth-label>Providers</span>
+                  <span data-auth-label>Provider health</span>
                   <span id="loading-providers-status" data-badge data-state="unknown">Waiting</span>
                 </div>
               </div>
@@ -599,16 +608,16 @@
         </section>
 
         <section
-          id="view-providers"
-          data-view="providers"
+          id="view-analytics"
+          data-view="analytics"
           data-layout="grid"
           role="tabpanel"
-          aria-labelledby="view-tab-providers"
+          aria-labelledby="view-tab-analytics"
           hidden
         >
           <article data-card aria-labelledby="card-provider-capacity">
             <header>
-              <h2 id="card-provider-capacity">Providers</h2>
+              <h2 id="card-provider-capacity">Provider analytics</h2>
             </header>
             <div data-card-body>
               <div data-provider-heading>
@@ -637,6 +646,98 @@
               <p id="quota-runway-note" data-muted></p>
             </div>
           </details>
+        </section>
+
+        <section
+          id="view-providers"
+          data-view="providers"
+          data-layout="grid"
+          role="tabpanel"
+          aria-labelledby="view-tab-providers"
+          hidden
+        >
+          <article data-card aria-labelledby="card-providers">
+            <header>
+              <h2 id="card-providers">Active providers</h2>
+              <p>
+                Check every provider the gateway may dispatch to. Unchecked providers leave inference routing,
+                and the models only they serve disappear from <code>/v1/models</code>, the public catalog, and
+                the Codex catalog. The waterfall order itself never changes. Saving an empty selection removes
+                the filter, so every provider is active again.
+              </p>
+            </header>
+            <div data-card-body>
+              <div data-provider-controls>
+                <label data-field>
+                  <span data-label>Search providers</span>
+                  <input
+                    id="providers-selection-search"
+                    type="search"
+                    placeholder="Search by provider, tier, or model count"
+                    autocomplete="off"
+                  />
+                </label>
+                <label data-field>
+                  <span data-label>Sort</span>
+                  <select id="providers-selection-sort">
+                    <option value="roster">Waterfall order</option>
+                    <option value="models">Most models</option>
+                    <option value="id">Provider A–Z</option>
+                  </select>
+                </label>
+                <div data-provider-filters role="group" aria-label="Filter by tier">
+                  <button id="providers-selection-tier-all" type="button" data-provider-tier="all" aria-pressed="true">
+                    All <span data-provider-filter-count>0</span>
+                  </button>
+                  <button id="providers-selection-tier-subscription" type="button" data-provider-tier="subscription"
+                    aria-pressed="false">
+                    Subscription <span data-provider-filter-count>0</span>
+                  </button>
+                  <button id="providers-selection-tier-paid" type="button" data-provider-tier="paid"
+                    aria-pressed="false">
+                    Paid fallback <span data-provider-filter-count>0</span>
+                  </button>
+                  <button id="providers-selection-tier-direct" type="button" data-provider-tier="direct"
+                    aria-pressed="false">
+                    Direct <span data-provider-filter-count>0</span>
+                  </button>
+                </div>
+                <label data-check="only-active">
+                  <input id="providers-selection-only-active" type="checkbox" />
+                  <span>Only active</span>
+                </label>
+              </div>
+              <div data-provider-status>
+                <span id="providers-selection-badge" data-badge data-state="unknown">Not loaded</span>
+                <p id="providers-selection-summary" data-provider-summary aria-live="polite">
+                  Waiting for the provider roster.
+                </p>
+              </div>
+              <p id="providers-selection-warning" data-help data-tone="warning" hidden></p>
+              <div data-layout="row" data-provider-actions>
+                <button id="providers-selection-check-all" type="button">Check all shown</button>
+                <button id="providers-selection-uncheck-all" type="button">Uncheck all shown</button>
+                <button id="providers-selection-invert" type="button">Invert shown</button>
+                <button id="providers-selection-discard" type="button" disabled>Discard changes</button>
+                <button
+                  id="providers-selection-reload"
+                  type="button"
+                  data-icon-button
+                  data-tooltip="Reload the provider roster and the saved selection"
+                  aria-label="Reload the provider roster and the saved selection"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v6h-6" />
+                  </svg>
+                </button>
+                <button id="providers-selection-save" type="button" data-variant="primary" disabled>Save</button>
+              </div>
+              <div id="providers-selection-list" data-provider-picker role="group" aria-label="Gateway providers"></div>
+              <p data-field-help>
+                To test one provider in isolation: uncheck every provider, check only the one under test, then save.
+              </p>
+            </div>
+          </article>
         </section>
 
         <section
@@ -869,6 +970,6 @@
         </button>
       </section>
     </div>
-    <script type="module" src="/admin.js?v=20260917-model-picker-v1"></script>
+    <script type="module" src="/admin.js?v=20260917-provider-picker-v1"></script>
   </body>
 </html>

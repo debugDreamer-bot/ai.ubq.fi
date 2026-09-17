@@ -22,6 +22,7 @@ import type { recordSentinelProviderDegradationFromEnvironment } from "./sentine
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "./surplus.ts";
 import { resolveModelMetadata } from "./model_metadata.ts";
 import { warmOpenRouterModels } from "./openrouter_models.ts";
+import { isProviderEnabled, loadProviderSelectionCached, type ProviderSelection } from "./provider_selection.ts";
 
 export const CODEX_CATALOG_FRESH_MS = 5 * 60_000;
 export const CODEX_CATALOG_RETENTION_MS = 24 * 60 * 60_000;
@@ -788,6 +789,26 @@ const refreshExpiredModelList = (nowMs: number, updatedAtMs: number, ttlMs: numb
   if (nowMs - updatedAtMs >= ttlMs) void refresh().catch(() => {});
 };
 
+/** The catalogs of the providers the operator still has switched on. */
+const enabledPaidCatalogSources = async (selection: ProviderSelection | null, options: Readonly<{ force?: boolean }> = {}) => {
+  const openluxEnabled = isProviderEnabled("openlux", selection);
+  const surplusEnabled = isProviderEnabled("surplus", selection);
+  if (options.force === true) {
+    return await Promise.all([
+      openluxEnabled ? fetchMeteredModels({ force: true }) : Promise.resolve(null),
+      surplusEnabled ? fetchSurplusModels({ force: true }) : Promise.resolve(null),
+    ]);
+  }
+  const [cachedMetered, cachedSurplus] = await Promise.all([
+    openluxEnabled ? fetchMeteredModels({ cachedOnly: true }) : Promise.resolve(null),
+    surplusEnabled ? fetchSurplusModels({ cachedOnly: true }) : Promise.resolve(null),
+  ]);
+  return await Promise.all([
+    openluxEnabled ? (cachedMetered ?? fetchMeteredModels()) : Promise.resolve(null),
+    surplusEnabled ? (cachedSurplus ?? fetchSurplusModels()) : Promise.resolve(null),
+  ]);
+};
+
 const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheState: string): Promise<Response> => {
   // Rows this response appends are resolved dynamically, so start an enrichment
   // refresh without waiting for it; the stored catalog already carries Codex's
@@ -799,16 +820,20 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
     "x-uos-upstream": "chatgpt_codex",
     "x-uos-cache": cacheState,
   });
-  const [cachedMetered, cachedSurplus] = await Promise.all([fetchMeteredModels({ cachedOnly: true }), fetchSurplusModels({ cachedOnly: true })]);
-  const [metered, surplus] = await Promise.all([cachedMetered ?? fetchMeteredModels(), cachedSurplus ?? fetchSurplusModels()]);
+  const selection = await loadProviderSelectionCached();
+  const codexEnabled = isProviderEnabled("codex", selection);
+  const deepSeekEnabled = isProviderEnabled("deepseek", selection);
+  const [metered, surplus] = await enabledPaidCatalogSources(selection);
   const nowMs = Date.now();
   if (metered) refreshExpiredModelList(nowMs, metered.updated_at_ms, METERED_MODELS_CACHE_TTL_MS, fetchMeteredModels);
   if (surplus) refreshExpiredModelList(nowMs, surplus.updated_at_ms, SURPLUS_MODELS_CACHE_TTL_MS, fetchSurplusModels);
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
-  if (!paidModels.length && !readDeepSeekApiKey()) return catalogOnlyResponse(catalog, req, headers);
+  // The stored catalog body is Codex's own, so it can only answer for a Codex
+  // provider that is still switched on.
+  if (!paidModels.length && !deepSeekEnabled && codexEnabled) return catalogOnlyResponse(catalog, req, headers);
   const parsed = {
     ...catalog.parsed,
-    models: [...(Array.isArray(catalog.parsed.models) ? catalog.parsed.models : [])],
+    models: codexEnabled && Array.isArray(catalog.parsed.models) ? [...catalog.parsed.models] : [],
   };
   const seen = catalogModelIds(parsed.models);
   for (const model of paidModels) {
@@ -818,7 +843,7 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   }
   // The official ids are appended first so an operator whitelist still has the
   // final say over every advertised model, this route included.
-  parsed.models = withDeepSeekOfficialModels(parsed.models);
+  parsed.models = deepSeekEnabled ? withDeepSeekOfficialModels(parsed.models) : parsed.models;
   const catalogKv = await getKv();
   const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
   parsed.models = filterWhitelistedCatalogModels(parsed.models, catalogWhitelist);
@@ -831,10 +856,10 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   return new Response(body, { status: 200, headers });
 };
 
-const meteredCatalogResponse = async (): Promise<Response | null> => {
-  const [metered, surplus] = await Promise.all([fetchMeteredModels({ force: true }), fetchSurplusModels({ force: true })]);
+const meteredCatalogResponse = async (selection: ProviderSelection | null): Promise<Response | null> => {
+  const [metered, surplus] = await enabledPaidCatalogSources(selection, { force: true });
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
-  const configured = deepSeekOfficialCodexModels();
+  const configured = isProviderEnabled("deepseek", selection) ? deepSeekOfficialCodexModels() : [];
   if (!paidModels.length && !configured.length) return null;
   return new Response(
     JSON.stringify({
@@ -890,7 +915,7 @@ type CodexUpstreamBodyRead = Readonly<{ body: string; readFailed: boolean }>;
 
 /** Answer with the metered catalog, or report the Codex catalog as unavailable. */
 const meteredCatalogOrError = async (message: string): Promise<Response> =>
-  (await meteredCatalogResponse()) ?? openaiError(502, message, "codex_catalog_unavailable");
+  (await meteredCatalogResponse(await loadProviderSelectionCached())) ?? openaiError(502, message, "codex_catalog_unavailable");
 
 /** Serve the catalog of the current authentication generation after a rotation. */
 const rotatedCatalogResponse = async (kv: Deno.Kv, req: Request, version: string): Promise<Response> => {

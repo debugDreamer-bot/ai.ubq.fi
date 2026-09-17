@@ -194,6 +194,7 @@ const viewTabUsers = mustGet("view-tab-users");
 const viewTabKernel = mustGet("view-tab-kernel");
 const viewTabPubkeys = mustGet("view-tab-pubkeys");
 const viewTabDefaults = mustGet("view-tab-defaults");
+const viewTabAnalytics = mustGet("view-tab-analytics");
 const viewTabProviders = mustGet("view-tab-providers");
 const viewTabErrors = mustGet("view-tab-errors");
 const viewTabModels = mustGet("view-tab-models");
@@ -204,6 +205,7 @@ const viewUsers = mustGet("view-users");
 const viewKernel = mustGet("view-kernel");
 const viewPubkeys = mustGet("view-pubkeys");
 const viewDefaults = mustGet("view-defaults");
+const viewAnalytics = mustGet("view-analytics");
 const viewProviders = mustGet("view-providers");
 const viewErrors = mustGet("view-errors");
 const viewModels = mustGet("view-models");
@@ -226,6 +228,21 @@ const modelsSummary = mustGet("models-whitelist-summary");
 const modelsWarning = mustGet("models-whitelist-warning");
 const modelsList = mustGet("models-whitelist-list");
 const modelsProviderButtons = [...document.querySelectorAll("[data-model-provider]")];
+
+const providersSelectionSave = mustGet("providers-selection-save");
+const providersSelectionBadge = mustGet("providers-selection-badge");
+const providersSearchInput = mustGet("providers-selection-search");
+const providersSortSelect = mustGet("providers-selection-sort");
+const providersOnlyActiveInput = mustGet("providers-selection-only-active");
+const providersCheckAllBtn = mustGet("providers-selection-check-all");
+const providersUncheckAllBtn = mustGet("providers-selection-uncheck-all");
+const providersInvertBtn = mustGet("providers-selection-invert");
+const providersDiscardBtn = mustGet("providers-selection-discard");
+const providersReloadBtn = mustGet("providers-selection-reload");
+const providersSummary = mustGet("providers-selection-summary");
+const providersWarning = mustGet("providers-selection-warning");
+const providersList = mustGet("providers-selection-list");
+const providersTierButtons = [...document.querySelectorAll("[data-provider-tier]")];
 
 const providerCapacityBadge = mustGet("provider-capacity-badge");
 const providerCapacityUpdated = mustGet("provider-capacity-updated");
@@ -3045,7 +3062,7 @@ const scheduleProviderCapacityChartResize = () => {
   if (capacityChartResizeFrame) return;
   capacityChartResizeFrame = globalThis.requestAnimationFrame(() => {
     capacityChartResizeFrame = 0;
-    if (currentAdminView !== "providers" || !latestProviderCapacityChartState) return;
+    if (currentAdminView !== "analytics" || !latestProviderCapacityChartState) return;
     renderProviderCapacityChart(
       latestProviderCapacityChartState.snapshot,
       latestProviderCapacityChartState.sources,
@@ -6878,7 +6895,7 @@ const updatePasskeyUserAdmin = async (id, isAdmin, checkbox) => {
 };
 
 const ADMIN_VIEW_DEFAULT = "loading";
-const ADMIN_VIEW_AUTHENTICATED_DEFAULT = "providers";
+const ADMIN_VIEW_AUTHENTICATED_DEFAULT = "analytics";
 const VIEW_HASHES = {
   loading: "loading",
   keys: "keys",
@@ -6886,6 +6903,7 @@ const VIEW_HASHES = {
   kernel: "kernel",
   pubkeys: "pubkeys",
   defaults: "defaults",
+  analytics: "analytics",
   providers: "providers",
   errors: "errors",
 };
@@ -6896,6 +6914,7 @@ const VIEW_REQUIREMENTS = {
   pubkeys: "admin",
   defaults: "admin",
   models: "admin",
+  analytics: "admin",
   providers: "admin",
   errors: "admin",
 };
@@ -6915,8 +6934,13 @@ const VIEW_HASH_ALIASES = new Map([
   ["view-pubkeys", "pubkeys"],
   ["defaults", "defaults"],
   ["view-defaults", "defaults"],
+  ["analytics", "analytics"],
+  ["view-analytics", "analytics"],
+  ["provider-analytics", "analytics"],
   ["providers", "providers"],
   ["view-providers", "providers"],
+  ["provider-selection", "providers"],
+  ["view-provider-selection", "providers"],
   ["models", "models"],
   ["view-models", "models"],
   ["errors", "errors"],
@@ -6982,6 +7006,7 @@ const bindTablistKeyboard = (tablist) => {
 };
 
 const viewTabs = {
+  analytics: viewTabAnalytics,
   providers: viewTabProviders,
   keys: viewTabKeys,
   users: viewTabUsers,
@@ -7000,6 +7025,7 @@ const viewSections = {
   pubkeys: viewPubkeys,
   models: viewModels,
   defaults: viewDefaults,
+  analytics: viewAnalytics,
   providers: viewProviders,
   errors: viewErrors,
 };
@@ -7193,8 +7219,10 @@ const startAdminPrefetch = () => {
     },
     {
       key: "providers",
-      load: loadProviders,
-      ready: () => providersLoadedAt > 0,
+      load: async () => {
+        await Promise.all([loadProviders(), loadProviderSelection()]);
+      },
+      ready: () => providersLoadedAt > 0 && providerSelectionLoadedAt > 0,
     },
   ];
 
@@ -7252,7 +7280,7 @@ const loadAdminView = (view) => {
   if (view === "models") {
     void loadModelsWhitelist();
   }
-  if (view === "providers") {
+  if (view === "analytics") {
     void loadProviders();
     if (!providerCapacityLoadedForOpen) {
       providerCapacityLoadedForOpen = true;
@@ -7269,6 +7297,12 @@ const loadAdminView = (view) => {
   } else {
     providerCapacityLoadedForOpen = false;
     quotaProjectionLoadedForOpen = false;
+  }
+  if (view === "providers") {
+    // The picker shows provider health beside each row, so the analytics
+    // snapshot is loaded here too; it is prefetched on sign-in either way.
+    void loadProviders();
+    void loadProviderSelection();
   }
   if (view === "errors" && (!errorsLoadedAt || Date.now() - errorsLoadedAt >= 10_000)) {
     void loadAdminErrors();
@@ -8537,6 +8571,534 @@ modelsWhitelistSave.addEventListener("click", () => {
   void saveModelsWhitelist();
 });
 
+// ── Provider selection picker ────────────────────────────────────────────────
+// The model picker chooses which models stay listed; this panel chooses which
+// upstream providers the gateway may dispatch to at all. The waterfall order is
+// fixed, so the ladder below is presentation only: checking a provider never
+// promotes it, and unchecking one removes its tier.
+const PROVIDER_ROSTER = [
+  {
+    id: "codex",
+    label: "Codex",
+    tier: "subscription",
+    detail: "ChatGPT subscription capacity. The waterfall always tries it first.",
+    endpoints: "/v1/responses · /v1/chat/completions",
+  },
+  {
+    id: "surplus",
+    label: "Metered 1",
+    tier: "paid",
+    detail: "Surplus Intelligence. Second tier of the paid waterfall.",
+    endpoints: "/v1/responses · /v1/chat/completions",
+  },
+  {
+    id: "openlux",
+    label: "Metered 2",
+    tier: "paid",
+    detail: "OpenLux. Last tier of the paid waterfall.",
+    endpoints: "/v1/responses · /v1/chat/completions",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    tier: "direct",
+    detail: "Official DeepSeek key, served on Chat Completions only.",
+    endpoints: "/v1/chat/completions",
+  },
+  {
+    id: "cerebras",
+    label: "Cerebras",
+    tier: "direct",
+    detail: "GPT-OSS 120B, served on Chat Completions only.",
+    endpoints: "/v1/chat/completions",
+  },
+];
+const PROVIDER_TIER_LABELS = { subscription: "Subscription", paid: "Paid fallback", direct: "Direct" };
+const PROVIDER_TIER_IDS = ["subscription", "paid", "direct"];
+/** The health snapshot reports the OpenLux tier under its upstream name. */
+const PROVIDER_HEALTH_KEYS = {
+  codex: "codex",
+  surplus: "surplus",
+  openlux: "metered",
+  deepseek: "deepseek",
+  cerebras: "cerebras",
+};
+const PROVIDER_SORT_STORAGE_KEY = "uos_ai.admin.providers_sort";
+const PROVIDER_TIER_STORAGE_KEY = "uos_ai.admin.providers_tier";
+const PROVIDER_ONLY_ACTIVE_STORAGE_KEY = "uos_ai.admin.providers_only_active";
+const PROVIDER_ALL_IDS = PROVIDER_ROSTER.map((provider) => provider.id);
+
+/** The roster the API last returned, the staged selection, and the saved one. */
+let providerRoster = [];
+let providerSelection = new Set();
+let providersSavedSelection = new Set();
+let providerTierFilter = "all";
+let providersVisibleIds = new Set();
+let providerSelectionLoadedAt = 0;
+let providerSelectionLoadId = 0;
+let providerSelectionSaving = false;
+let providerSelectionSaveError = "";
+
+const setProvidersSelectionBadge = (state, text) => setBadge(providersSelectionBadge, state, text);
+
+const providerRosterEntry = (id) => providerRoster.find((entry) => entry.id === id) ?? null;
+
+/** The loaded roster, so a retired provider never reaches the API again. */
+const providersRosterIds = () => (providerRoster.length ? providerRoster.map((entry) => entry.id) : PROVIDER_ALL_IDS);
+
+/**
+ * An empty saved selection is the documented "no filter" state, so the console
+ * shows every provider as active and never offers to save that empty state
+ * back: unchecking everything would silently re-enable everything.
+ */
+const providersEffectiveSelection = (providerIds) => new Set(providerIds.length ? providerIds : providersRosterIds());
+
+const providersSelectionFromIds = (ids) =>
+  providersEffectiveSelection(Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id) : []);
+
+const providersHasUnsavedChanges = () =>
+  providerSelection.size !== providersSavedSelection.size ||
+  [...providerSelection].some((id) => !providersSavedSelection.has(id));
+
+const providersSelectionIsEmpty = () => providerSelection.size === 0;
+
+/** Selected ids in roster order, or an empty list when every active provider is checked. */
+const providersSelectedIds = () => {
+  const rosterIds = providersRosterIds();
+  if (providersSelectionIsEmpty() || providerSelection.size >= rosterIds.length) return [];
+  return rosterIds.filter((id) => providerSelection.has(id));
+};
+
+const providersTierCounts = () => {
+  const counts = new Map([["all", providerRoster.length], ...PROVIDER_TIER_IDS.map((tier) => [tier, 0])]);
+  for (const entry of providerRoster) counts.set(entry.tier, (counts.get(entry.tier) ?? 0) + 1);
+  return counts;
+};
+
+const providersEntryMatchesQuery = (entry, query) => {
+  if (!query) return true;
+  return entry.id.toLowerCase().includes(query) ||
+    entry.label.toLowerCase().includes(query) ||
+    (PROVIDER_TIER_LABELS[entry.tier] ?? entry.tier).toLowerCase().includes(query) ||
+    String(entry.model_count ?? 0).includes(query) ||
+    entry.detail.toLowerCase().includes(query);
+};
+
+const providersFilterIsActive = () =>
+  providerTierFilter !== "all" || providersOnlyActiveInput.checked || providersSearchInput.value.trim().length > 0;
+
+/** Roster entries passing the search, tier, and active-only filters, in the selected order. */
+const providersVisibleEntries = () => {
+  const query = providersSearchInput.value.trim().toLowerCase();
+  const onlyActive = providersOnlyActiveInput.checked;
+  const visible = providerRoster.filter((entry) => {
+    if (providerTierFilter !== "all" && entry.tier !== providerTierFilter) return false;
+    if (onlyActive && !providerSelection.has(entry.id)) return false;
+    return providersEntryMatchesQuery(entry, query);
+  });
+  if (providersSortSelect.value === "models") {
+    return visible.sort((left, right) =>
+      Number(right.model_count ?? 0) - Number(left.model_count ?? 0) || left.id.localeCompare(right.id)
+    );
+  }
+  if (providersSortSelect.value === "id") {
+    return visible.sort((left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id));
+  }
+  return visible.sort((left, right) => PROVIDER_ALL_IDS.indexOf(left.id) - PROVIDER_ALL_IDS.indexOf(right.id));
+};
+
+const providerHealthFor = (id) => {
+  const key = PROVIDER_HEALTH_KEYS[id];
+  const entry = latestProviderHealth?.[key];
+  if (!entry || typeof entry !== "object") return null;
+  const state = typeof entry.state === "string" ? entry.state : entry.health?.state;
+  return {
+    state: typeof state === "string" ? state : null,
+    configured: entry.configured !== false,
+    accountCount: typeof entry.account_count === "number" ? entry.account_count : null,
+  };
+};
+
+const buildProviderOption = (entry) => {
+  const id = entry.id;
+  const option = document.createElement("label");
+  option.dataset.providerOption = "";
+  option.dataset.providerId = id;
+  option.dataset.checked = providerSelection.has(id) ? "true" : "false";
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.dataset.providerToggle = id;
+  checkbox.checked = providerSelection.has(id);
+
+  const body = document.createElement("span");
+  body.dataset.providerBody = "";
+
+  const name = document.createElement("span");
+  name.dataset.providerName = "";
+  name.textContent = entry.label;
+  body.append(name);
+
+  const badges = document.createElement("span");
+  badges.dataset.providerBadges = "";
+  const tier = document.createElement("span");
+  tier.dataset.providerTierBadge = entry.tier;
+  tier.textContent = PROVIDER_TIER_LABELS[entry.tier] ?? entry.tier;
+  badges.append(tier);
+  const health = providerHealthFor(id);
+  if (health) {
+    const healthBadge = document.createElement("span");
+    healthBadge.dataset.providerHealthBadge = health.state ?? "unknown";
+    healthBadge.textContent = health.configured === false ? "Not configured" : `Health ${health.state ?? "unknown"}`;
+    badges.append(healthBadge);
+  }
+  body.append(badges);
+
+  const detail = document.createElement("span");
+  detail.dataset.providerDetail = "";
+  detail.textContent = entry.detail;
+  body.append(detail);
+
+  const facts = [`${formatNumber(Number(entry.model_count ?? 0))} catalog models`, entry.endpoints];
+  if (entry.status && entry.status !== "available") facts.push("Catalog unavailable");
+  if (health?.accountCount) facts.push(`${formatNumber(health.accountCount)} accounts`);
+  const meta = document.createElement("span");
+  meta.dataset.providerMeta = "";
+  meta.textContent = facts.join(" · ");
+  body.append(meta);
+
+  option.append(checkbox, body);
+  return option;
+};
+
+const renderProvidersMessage = (message) => {
+  const empty = document.createElement("p");
+  empty.dataset.providerEmpty = "";
+  empty.textContent = message;
+  providersList.replaceChildren(empty);
+};
+
+/** Drop the loaded roster and both selections, e.g. after the token or target changes. */
+const invalidateProviderSelection = (message) => {
+  providerSelectionLoadId += 1;
+  providerSelectionSaving = false;
+  providerRoster = [];
+  providerSelection = new Set();
+  providersSavedSelection = new Set();
+  providersVisibleIds = new Set();
+  providerSelectionLoadedAt = 0;
+  providerSelectionSaveError = "";
+  setProvidersSelectionBadge("unknown", "Not loaded");
+  renderProvidersMessage(message);
+  updateProvidersStatus();
+};
+
+const providersEmptyWarning = () =>
+  providerRoster.length && providersSelectionIsEmpty()
+    ? "Nothing is checked. An empty selection removes the filter instead of disabling everything, so check the providers that should stay active."
+    : "";
+
+const providersRoutingWarnings = () => {
+  const warnings = [];
+  if (providersSelectionIsEmpty()) return warnings;
+  if (!providerSelection.has("codex")) {
+    warnings.push("Codex is off, so requests start at the paid tiers and the subscription capacity stays unused.");
+  }
+  if (!providerSelection.has("surplus") && !providerSelection.has("openlux")) {
+    warnings.push("Both paid tiers are off, so a model outside the Codex roster has no fallback left.");
+  }
+  return warnings;
+};
+
+const providersHealthWarning = () => {
+  const missing = PROVIDER_ALL_IDS.filter((id) => {
+    const health = providerHealthFor(id);
+    return providerSelection.has(id) && health?.configured === false;
+  });
+  if (!missing.length) return "";
+  const labels = missing.map((id) => providerRosterEntry(id)?.label ?? id);
+  return `${labels.join(", ")} ${
+    labels.length === 1 ? "is" : "are"
+  } active without a configured credential, so requests to ${
+    labels.length === 1 ? "it" : "them"
+  } will fail until a key is stored.`;
+};
+
+const updateProvidersStatus = () => {
+  const total = providerRoster.length;
+  const selected = providerSelection.size;
+  const visibleCount = providersVisibleIds.size;
+  const visibleChecked = [...providersVisibleIds].filter((id) => providerSelection.has(id)).length;
+  const unsaved = providersHasUnsavedChanges();
+  const saving = providerSelectionSaving;
+  const filterActive = providersSelectedIds().length > 0;
+
+  const activeLabels = providersRosterIds().filter((id) => providerSelection.has(id)).map((id) =>
+    providerRosterEntry(id)?.label ?? id
+  );
+  if (!providerSelectionLoadedAt && total === 0) {
+    providersSummary.textContent = "Waiting for the provider roster.";
+  } else if (selected === 0) {
+    providersSummary.textContent = "Nothing checked: check the providers that should stay active.";
+  } else if (!filterActive) {
+    providersSummary.textContent = `All ${
+      formatNumber(total)
+    } providers checked: no filter is saved, so every provider is active.`;
+  } else {
+    providersSummary.textContent =
+      `${formatNumber(selected)} of ${formatNumber(total)} providers active: ${activeLabels.join(", ")}.` +
+      (visibleCount < total ? ` Showing ${formatNumber(visibleCount)}.` : "");
+  }
+
+  const warnings = [providersEmptyWarning(), ...providersRoutingWarnings(), providersHealthWarning()].filter(Boolean);
+  providersWarning.textContent = warnings.join(" ");
+  providersWarning.hidden = warnings.length === 0;
+
+  if (saving) setProvidersSelectionBadge("busy", "Saving...");
+  else if (providerSelectionSaveError) setProvidersSelectionBadge("bad", providerSelectionSaveError);
+  else if (unsaved) setProvidersSelectionBadge("warning", "Unsaved changes");
+  else if (providerSelectionLoadedAt) {
+    setProvidersSelectionBadge("ok", filterActive ? `${formatNumber(selected)} active` : "No filter");
+  } else setProvidersSelectionBadge("unknown", "Not loaded");
+
+  const counts = providersTierCounts();
+  for (const button of providersTierButtons) {
+    const tier = button.dataset.providerTier;
+    const count = counts.get(tier) ?? 0;
+    button.setAttribute("aria-pressed", tier === providerTierFilter ? "true" : "false");
+    button.disabled = tier !== "all" && count === 0;
+    const countElement = button.querySelector("[data-provider-filter-count]");
+    if (countElement) countElement.textContent = formatNumber(count);
+  }
+
+  providersCheckAllBtn.disabled = saving || visibleCount === 0 || visibleChecked === visibleCount;
+  providersUncheckAllBtn.disabled = saving || visibleChecked === 0;
+  providersInvertBtn.disabled = saving || visibleCount === 0;
+  const scoped = providersFilterIsActive();
+  providersCheckAllBtn.textContent = scoped
+    ? `Check ${formatNumber(visibleCount)} shown`
+    : `Check all ${formatNumber(visibleCount)}`;
+  providersUncheckAllBtn.textContent = scoped
+    ? `Uncheck ${formatNumber(visibleCount)} shown`
+    : `Uncheck all ${formatNumber(visibleCount)}`;
+  providersDiscardBtn.disabled = saving || !unsaved;
+  // Saving nothing is not a state the API can store: an empty list clears the
+  // filter, so the button stays disabled until at least one provider is checked.
+  providersSelectionSave.disabled = saving || !unsaved || providersSelectionIsEmpty();
+};
+
+const renderProvidersPicker = () => {
+  const visible = providersVisibleEntries();
+  providersVisibleIds = new Set(visible.map((entry) => entry.id));
+  if (!providerRoster.length) {
+    renderProvidersMessage(providerSelectionLoadedAt ? "No providers were returned." : "Loading providers…");
+  } else if (!visible.length) {
+    renderProvidersMessage(
+      providersOnlyActiveInput.checked
+        ? "No active provider matches the current filters."
+        : "No provider matches the current filters.",
+    );
+  } else {
+    providersList.replaceChildren(...visible.map(buildProviderOption));
+  }
+  updateProvidersStatus();
+};
+
+const applyProvidersSelection = (mutate) => {
+  providerSelectionSaveError = "";
+  mutate(providersVisibleEntries());
+  if (providersOnlyActiveInput.checked) {
+    renderProvidersPicker();
+    return;
+  }
+  for (const option of providersList.querySelectorAll("[data-provider-option]")) {
+    const id = option.dataset.providerId;
+    const checked = typeof id === "string" && providerSelection.has(id);
+    const checkbox = option.querySelector("input[type=checkbox]");
+    if (checkbox) checkbox.checked = checked;
+    option.dataset.checked = checked ? "true" : "false";
+  }
+  updateProvidersStatus();
+};
+
+const loadProviderSelection = async (options = {}) => {
+  const token = getAdminToken();
+  if (!token && !hasAdminCredential()) {
+    setProvidersSelectionBadge("bad", "Missing token");
+    renderProvidersMessage("Sign in to load the provider roster.");
+    return false;
+  }
+  // Reopening the tab must not discard a selection the operator has not saved yet.
+  if (providersHasUnsavedChanges() && options.force !== true) {
+    setProvidersSelectionBadge("warning", "Unsaved changes");
+    return true;
+  }
+  const loadId = ++providerSelectionLoadId;
+  setProvidersSelectionBadge("unknown", providerSelectionLoadedAt ? "Cached · refreshing" : "Loading...");
+  try {
+    const response = await fetch(apiUrl("/admin/providers/selection"), {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+    const payload = await response.json().catch(() => null);
+    if (loadId !== providerSelectionLoadId) return false;
+    if (!response.ok || !Array.isArray(payload?.data?.providers)) {
+      if (providerSelectionLoadedAt) {
+        setProvidersSelectionBadge("unknown", "Cached · refresh unavailable");
+        return true;
+      }
+      setProvidersSelectionBadge("bad", payload?.error?.message ?? "Failed to load");
+      renderProvidersMessage(payload?.error?.message ?? "The provider roster could not be loaded.");
+      return false;
+    }
+    providerRoster = payload.data.providers
+      .filter((entry) => typeof entry?.id === "string" && entry.id)
+      .map((entry) => ({ ...(PROVIDER_ROSTER.find((known) => known.id === entry.id) ?? {}), ...entry }))
+      .filter((entry) => typeof entry.detail === "string");
+    providersSavedSelection = providersSelectionFromIds(payload.data.selection?.provider_ids);
+    providerSelection = new Set(providersSavedSelection);
+    providerSelectionSaveError = "";
+    providerSelectionLoadedAt = Date.now();
+    renderProvidersPicker();
+    return true;
+  } catch (error) {
+    if (loadId !== providerSelectionLoadId) return false;
+    if (providerSelectionLoadedAt) {
+      setProvidersSelectionBadge("unknown", "Cached · offline");
+      return true;
+    }
+    setProvidersSelectionBadge("bad", "Offline");
+    renderProvidersMessage("The provider roster could not be loaded.");
+    console.error("provider selection load error:", error);
+    return false;
+  }
+};
+
+const saveProviderSelection = async () => {
+  const token = getAdminToken();
+  if (!token && !hasAdminCredential()) {
+    setProvidersSelectionBadge("bad", "Missing token");
+    return;
+  }
+  if (providerSelectionSaving || !providersHasUnsavedChanges() || providersSelectionIsEmpty()) return;
+  providerSelectionSaving = true;
+  providerSelectionSaveError = "";
+  updateProvidersStatus();
+  try {
+    const response = await fetch(apiUrl("/admin/providers/selection"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify({ provider_ids: providersSelectedIds() }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      providerSelectionSaving = false;
+      providerSelectionSaveError = "Failed to save";
+      toast.error("Save failed", { description: payload?.error?.message ?? `HTTP ${response.status}` });
+      updateProvidersStatus();
+      return;
+    }
+    providerSelectionSaving = false;
+    providerSelectionSaveError = "";
+    const savedIds = Array.isArray(payload?.provider_ids) ? payload.provider_ids : providersSelectedIds();
+    providersSavedSelection = providersSelectionFromIds(savedIds);
+    providerSelection = new Set(providersSavedSelection);
+    providerSelectionLoadedAt = Date.now();
+    renderProvidersPicker();
+    toast.success(
+      savedIds.length === 0 ? "Filter cleared" : `${formatNumber(providerSelection.size)} providers active`,
+      {
+        description: savedIds.length === 0
+          ? "Every provider is eligible for routing again."
+          : "Routing, model listings, and the Codex catalog now skip the unchecked providers.",
+      },
+    );
+  } catch (error) {
+    providerSelectionSaving = false;
+    providerSelectionSaveError = "Save error";
+    toast.error("Save failed", { description: "Offline" });
+    updateProvidersStatus();
+    console.error("provider selection save error:", error);
+  }
+};
+
+const discardProviderChanges = () => {
+  if (!providersHasUnsavedChanges()) return;
+  providerSelectionSaveError = "";
+  providerSelection = new Set(providersSavedSelection);
+  renderProvidersPicker();
+  toast.success("Changes discarded");
+};
+
+const reloadProviderSelection = () => {
+  if (providersHasUnsavedChanges() && !globalThis.confirm("Discard the unsaved provider selection and reload?")) return;
+  providerSelection = new Set(providersSavedSelection);
+  void loadProviderSelection({ force: true });
+};
+
+providerTierFilter = readModelsFilterPreference(PROVIDER_TIER_STORAGE_KEY, "all", ["all", ...PROVIDER_TIER_IDS]);
+providersSortSelect.value = readModelsFilterPreference(PROVIDER_SORT_STORAGE_KEY, "roster", ["roster", "models", "id"]);
+providersOnlyActiveInput.checked = storage.get(PROVIDER_ONLY_ACTIVE_STORAGE_KEY) === "1";
+
+for (const button of providersTierButtons) {
+  button.addEventListener("click", () => {
+    providerTierFilter = button.dataset.providerTier ?? "all";
+    storage.set(PROVIDER_TIER_STORAGE_KEY, providerTierFilter);
+    renderProvidersPicker();
+  });
+}
+
+providersSearchInput.addEventListener("input", renderProvidersPicker);
+providersSortSelect.addEventListener("change", () => {
+  storage.set(PROVIDER_SORT_STORAGE_KEY, providersSortSelect.value);
+  renderProvidersPicker();
+});
+providersOnlyActiveInput.addEventListener("change", () => {
+  storage.set(PROVIDER_ONLY_ACTIVE_STORAGE_KEY, providersOnlyActiveInput.checked ? "1" : "0");
+  renderProvidersPicker();
+});
+
+providersList.addEventListener("change", (event) => {
+  const checkbox = event.target;
+  if (!(checkbox instanceof HTMLInputElement) || checkbox.type !== "checkbox") return;
+  const id = checkbox.dataset.providerToggle;
+  if (!id) return;
+  providerSelectionSaveError = "";
+  if (checkbox.checked) providerSelection.add(id);
+  else providerSelection.delete(id);
+  const option = checkbox.closest("[data-provider-option]");
+  if (option) option.dataset.checked = checkbox.checked ? "true" : "false";
+  if (providersOnlyActiveInput.checked) renderProvidersPicker();
+  else updateProvidersStatus();
+});
+
+providersCheckAllBtn.addEventListener("click", () => {
+  applyProvidersSelection((visible) => {
+    for (const entry of visible) providerSelection.add(entry.id);
+  });
+});
+
+providersUncheckAllBtn.addEventListener("click", () => {
+  applyProvidersSelection((visible) => {
+    for (const entry of visible) providerSelection.delete(entry.id);
+  });
+});
+
+providersInvertBtn.addEventListener("click", () => {
+  applyProvidersSelection((visible) => {
+    for (const entry of visible) {
+      if (providerSelection.has(entry.id)) providerSelection.delete(entry.id);
+      else providerSelection.add(entry.id);
+    }
+  });
+});
+
+providersDiscardBtn.addEventListener("click", discardProviderChanges);
+providersReloadBtn.addEventListener("click", reloadProviderSelection);
+providersSelectionSave.addEventListener("click", () => {
+  void saveProviderSelection();
+});
+
 const saveDefaults = async () => {
   if (!defaultsLoaded) return;
   const token = getAdminToken();
@@ -8868,6 +9430,7 @@ tokenInput.addEventListener("input", () => {
   persistTokenIfEnabled();
   invalidateAdminErrors("Sign in to load gateway errors.");
   invalidateAdminModels("Sign in to load the model catalog.");
+  invalidateProviderSelection("Sign in to load the provider roster.");
   keysLoadedAt = 0;
   passkeyUsersLoadedAt = 0;
   defaultsLoaded = false;
@@ -9060,6 +9623,7 @@ baseSelect.addEventListener("change", () => {
   setPasskeyUsersBadge("unknown", "Not loaded");
   invalidateAdminErrors("Target changed. Sign in to load gateway errors.");
   invalidateAdminModels("Target changed. Loading the model catalog...");
+  invalidateProviderSelection("Target changed. Loading the provider roster...");
   setDefaultsBadge("unknown", "Idle");
   setKernelListBadge("unknown", "Not loaded");
   setKernelNewBadge("unknown", "Idle");
@@ -9154,13 +9718,14 @@ viewTabKernel.addEventListener("click", () => setAdminView("kernel", { hashMode:
 viewTabPubkeys.addEventListener("click", () => setAdminView("pubkeys", { hashMode: "push", focusAuth: true }));
 viewTabDefaults.addEventListener("click", () => setAdminView("defaults", { hashMode: "push", focusAuth: true }));
 viewTabModels.addEventListener("click", () => setAdminView("models", { hashMode: "push", focusAuth: true }));
+viewTabAnalytics.addEventListener("click", () => setAdminView("analytics", { hashMode: "push", focusAuth: true }));
 viewTabProviders.addEventListener("click", () => setAdminView("providers", { hashMode: "push", focusAuth: true }));
 viewTabErrors.addEventListener("click", () => setAdminView("errors", { hashMode: "push", focusAuth: true }));
 bindTablistKeyboard(viewTabKeys.closest('[role="tablist"]'));
 bindTablistKeyboard(keysTabActive.closest('[role="tablist"]'));
 
 globalThis.setInterval(() => {
-  if (currentAdminView !== "providers" || document.visibilityState !== "visible") return;
+  if (currentAdminView !== "analytics" || document.visibilityState !== "visible") return;
   void loadProviders();
   void loadProviderCapacity();
   void loadQuotaProjection();

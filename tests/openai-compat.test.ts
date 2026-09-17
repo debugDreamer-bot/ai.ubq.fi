@@ -14489,6 +14489,124 @@ Deno.test("auth: kernel attestation tokens are reusable within TTL", async () =>
   assert.deepEqual(second, first);
 });
 
+// ── Admin provider selection ─────────────────────────────────────────────────
+
+const withProviderSelection = async <T>(providerIds: readonly string[] | null, run: () => Promise<T>): Promise<T> => {
+  const { PROVIDER_SELECTION_KV_KEY, resetProviderSelectionCacheForTest } = await import("../src/provider_selection.ts");
+  const encoded = keyToString(PROVIDER_SELECTION_KV_KEY);
+  const previous = kvStore.get(encoded);
+  if (providerIds === null) kvStore.delete(encoded);
+  else kvStore.set(encoded, { provider_ids: [...providerIds], updated_at_ms: Date.now() });
+  resetProviderSelectionCacheForTest();
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) kvStore.delete(encoded);
+    else kvStore.set(encoded, previous);
+    resetProviderSelectionCacheForTest();
+  }
+};
+
+const withDiscoveryKeys = async <T>(meteredKey: string | null, run: () => Promise<T>): Promise<T> => {
+  const previousMetered = Deno.env.get("METERED_API_KEY");
+  const previousSurplus = Deno.env.get("SURPLUS_API_KEY");
+  Deno.env.delete("SURPLUS_API_KEY");
+  if (meteredKey === null) Deno.env.delete("METERED_API_KEY");
+  else Deno.env.set("METERED_API_KEY", meteredKey);
+  try {
+    return await run();
+  } finally {
+    if (previousMetered === undefined) Deno.env.delete("METERED_API_KEY");
+    else Deno.env.set("METERED_API_KEY", previousMetered);
+    if (previousSurplus === undefined) Deno.env.delete("SURPLUS_API_KEY");
+    else Deno.env.set("SURPLUS_API_KEY", previousSurplus);
+  }
+};
+
+Deno.test("openai: a switched-off Codex provider with no paid tier fails closed instead of dispatching", async () => {
+  await withDiscoveryKeys(null, async () => {
+    await withProviderSelection(["deepseek"], async () => {
+      const dispatched: string[] = [];
+      const response = await withFetchMock(
+        (url) => {
+          dispatched.push(url);
+          throw new Error(`a switched-off provider must not be dispatched to: ${url}`);
+        },
+        () => handleResponses(responsesRequest({ input: "codex switched off" }))
+      );
+      assert.deepEqual(dispatched, [], "neither Codex nor a paid tier may be reached");
+      assert.equal(response.status, 503);
+      const payload = (await response.json()) as { error?: { code?: unknown; type?: unknown } };
+      assert.ok(payload.error, "a terminal provider error must carry an error body");
+      assert.equal(payload.error.code, "provider_disabled");
+      assert.equal(payload.error.type, "server_error");
+    });
+  });
+});
+
+Deno.test("openai: a switched-off Codex provider hands the request to the enabled paid tier", async () => {
+  resetMeteredModelsCacheForTest();
+  resetSurplusModelsCacheForTest();
+  await withDiscoveryKeys("metered-provider-selection-key", async () => {
+    try {
+      await fetchMeteredModels({
+        force: true,
+        fetcher: () =>
+          Promise.resolve(
+            Response.json({
+              data: [
+                {
+                  id: DEFAULT_TEST_MODEL,
+                  owned_by: "openlux",
+                  supported_endpoint_types: ["openai-response"],
+                },
+              ],
+            })
+          ),
+      });
+      await withProviderSelection(["openlux"], async () => {
+        const dispatched: string[] = [];
+        const response = await withFetchMock(
+          (url) => {
+            dispatched.push(url);
+            throw new Error(`the Codex transport must be skipped: ${url}`);
+          },
+          () => handleResponses(responsesRequest({ input: "paid tier only" }))
+        );
+        assert.deepEqual(dispatched, [], "a disabled Codex provider is not even probed");
+        assert.notEqual(response.headers.get("x-uos-upstream"), "chatgpt_codex");
+        // The request now needs paid admission, which this fixture deliberately
+        // cannot complete: what matters is that only the paid path was selected.
+        assert.equal(response.status, 503);
+        const payload = (await response.json()) as { error?: { code?: unknown } };
+        assert.equal(payload.error?.code, "paid_fallback_invalid_policy");
+      });
+    } finally {
+      resetMeteredModelsCacheForTest();
+      resetSurplusModelsCacheForTest();
+    }
+  });
+});
+
+Deno.test("openai: an empty provider selection keeps Codex as the primary provider", async () => {
+  for (const providerIds of [null, []] as const) {
+    let dispatched = 0;
+    const response = await withProviderSelection(providerIds, () =>
+      withFetchMock(
+        () => {
+          dispatched += 1;
+          return sseResponse(baseSseChunks());
+        },
+        () => handleResponses(responsesRequest({ input: "no provider filter" }))
+      )
+    );
+    assert.equal(dispatched, 1, `${JSON.stringify(providerIds)}: the Codex transport still runs`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-uos-upstream"), "chatgpt_codex");
+    await response.text();
+  }
+});
+
 addEventListener("unload", () => {
   setKvForTest(null);
 });

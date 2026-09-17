@@ -154,8 +154,9 @@ try {
   summary.replaceChildren(
     ...Object.entries(payload.sources ?? {})
       // Credential-gated providers that the gateway has no key for are absent
-      // on purpose, so they are not reported as unavailable sources.
-      .filter(([, source]) => source?.configured !== false)
+      // on purpose, so they are not reported as unavailable sources. Neither is
+      // a provider an operator switched off in the admin console.
+      .filter(([, source]) => source?.configured !== false && source?.disabled !== true)
       .map(([id, source]) => {
         const article = document.createElement("article");
         const name = document.createElement("h2");
