@@ -1725,6 +1725,99 @@ Deno.test("openai: Terra Chat Completions accepts but omits the unsupported Code
   assert.equal("temperature" in recorded, false);
 });
 
+Deno.test("openai: an id-less terminal response repeats Chat Completions content only once", async () => {
+  const messageText = "ALPHA-BRAVO";
+  const chatRequest = (stream: boolean): Request =>
+    new Request("https://ai.ubq.fi/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: TERRA_TEST_MODEL, messages: [{ role: "user", content: "ping" }], stream }),
+    });
+  // Surplus streams the message with its item id and then repeats the complete
+  // message inside `response.completed` without one.
+  const frames = [
+    `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_repeat", created_at: 1_780_000_000 } })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { id: "msg_repeat", type: "message", role: "assistant", content: [] } })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_repeat", output_index: 0, content_index: 0, delta: "ALPHA-" })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_repeat", output_index: 0, content_index: 0, delta: "BRAVO" })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_text.done", item_id: "msg_repeat", output_index: 0, content_index: 0, text: messageText })}\n\n`,
+    `data: ${JSON.stringify({
+      type: "response.content_part.done",
+      item_id: "msg_repeat",
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text", text: messageText },
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: { id: "msg_repeat", type: "message", role: "assistant", content: [{ type: "output_text", text: messageText }] },
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_repeat",
+        model: TERRA_TEST_MODEL,
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: messageText }] }],
+        usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 },
+      },
+    })}\n\n`,
+  ];
+
+  const streamed = await withFetchMock(
+    () => sseResponse(frames),
+    () => handleChatCompletions(chatRequest(true))
+  );
+  assert.equal(streamed.status, 200);
+  const streamedText = (await streamed.text())
+    .split("\n\n")
+    .filter((frame) => frame.startsWith("data: ") && frame !== "data: [DONE]")
+    .map((frame) => {
+      const chunk = JSON.parse(frame.slice(6)) as { choices?: { delta?: { content?: unknown } }[] };
+      const content = chunk.choices?.[0]?.delta?.content;
+      return typeof content === "string" ? content : "";
+    })
+    .join("");
+  assert.equal(streamedText, messageText);
+
+  const buffered = await withFetchMock(
+    () => sseResponse(frames),
+    () => handleChatCompletions(chatRequest(false))
+  );
+  assert.equal(buffered.status, 200);
+  const payload = (await buffered.json()) as { choices?: { message?: { content?: unknown } }[] };
+  assert.equal(payload.choices?.[0]?.message?.content, messageText);
+});
+
+Deno.test("openai: a terminal response with no id and no deltas is still delivered", async () => {
+  const messageText = "ALPHA-BRAVO";
+  const frames = [
+    `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_terminal_only", created_at: 1_780_000_000 } })}\n\n`,
+    `data: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        model: TERRA_TEST_MODEL,
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: messageText }] }],
+        usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 },
+      },
+    })}\n\n`,
+  ];
+  const response = await withFetchMock(
+    () => sseResponse(frames),
+    () =>
+      handleChatCompletions(
+        new Request("https://ai.ubq.fi/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: TERRA_TEST_MODEL, messages: [{ role: "user", content: "ping" }], stream: false }),
+        })
+      )
+  );
+  assert.equal(response.status, 200);
+  const payload = (await response.json()) as { choices?: { message?: { content?: unknown } }[] };
+  assert.equal(payload.choices?.[0]?.message?.content, messageText);
+});
+
 Deno.test("openai: prompt-cache sessions are stable within and isolated across authenticated principals", async () => {
   const identities: Record<string, string | null>[] = [];
   const responseStatuses = await withFetchMock(
