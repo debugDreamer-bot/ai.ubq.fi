@@ -8685,6 +8685,7 @@ viewTabUsers.addEventListener("click", () => setAdminView("users", { hashMode: "
 viewTabKernel.addEventListener("click", () => setAdminView("kernel", { hashMode: "push", focusAuth: true }));
 viewTabPubkeys.addEventListener("click", () => setAdminView("pubkeys", { hashMode: "push", focusAuth: true }));
 viewTabDefaults.addEventListener("click", () => setAdminView("defaults", { hashMode: "push", focusAuth: true }));
+viewTabModels.addEventListener("click", () => setAdminView("models", { hashMode: "push", focusAuth: true }));
 viewTabProviders.addEventListener("click", () => setAdminView("providers", { hashMode: "push", focusAuth: true }));
 viewTabErrors.addEventListener("click", () => setAdminView("errors", { hashMode: "push", focusAuth: true }));
 bindTablistKeyboard(viewTabKeys.closest('[role="tablist"]'));
