@@ -435,11 +435,11 @@ HTTP `429`), so the gateway forwards none for that provider.
 
 ### DeepSeek official
 
-`deepseek-flash` and its interchangeable legacy id `deepseek-v4-flash` are both sent to DeepSeek's official API at
-`https://api.deepseek.com/chat/completions` using the server-side `DEEPSEEK_API_KEY`. Both ids are advertised in
-`/v1/models`, `/uos/models/capabilities` and the Codex-native model catalog, and both reach the API as the canonical
-`deepseek-flash` model; the response echoes that canonical id. Other DeepSeek-named catalog models (for example
-`deepseek-v4-pro`) keep their existing catalog-proven provider. A missing `DEEPSEEK_API_KEY` fails with
+Every model the official API publishes is served here: `deepseek-flash`, its interchangeable legacy id
+`deepseek-v4-flash`, and `deepseek-v4-pro` are all sent to `https://api.deepseek.com/chat/completions` using the
+server-side `DEEPSEEK_API_KEY`. All three ids are advertised in `/v1/models`, `/uos/models/capabilities` and the
+Codex-native model catalog; the two flash ids reach the API as the canonical `deepseek-flash` model and the response
+echoes the canonical id, while `deepseek-v4-pro` is sent and echoed as itself. A missing `DEEPSEEK_API_KEY` fails with
 `503 deepseek_api_key_missing` before any provider dispatch.
 
 Reasoning follows the official contract: thinking mode is enabled by default at `high`, `reasoning_effort` accepts

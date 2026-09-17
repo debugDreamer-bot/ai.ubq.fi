@@ -14,7 +14,7 @@ import { getString, isRecord } from "./utils.ts";
  * Provider facts (https://api-docs.deepseek.com, read 2026-09-16):
  * - base URL `https://api.deepseek.com`, Chat Completions at `/chat/completions`
  * - model ids `deepseek-flash` and `deepseek-v4-pro`; the provider's own
- *   `GET /models` lists exactly those two
+ *   `GET /models` lists exactly those two, so both are served here
  * - `deepseek-v4-flash` is an accepted interchangeable alias: the API answers it
  *   with `"model": "deepseek-flash"`. It is NOT `deepseek-v4.1-flash`, which the
  *   API rejects ("The supported API model names are deepseek-flash,
@@ -36,7 +36,26 @@ export const DEEPSEEK_FLASH_MODEL = "deepseek-flash";
  * so both ids must route here.
  */
 export const DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash";
-export const DEEPSEEK_OFFICIAL_MODEL_IDS = [DEEPSEEK_FLASH_MODEL, DEEPSEEK_V4_FLASH_MODEL] as const;
+/** The provider's second published model, served under its own canonical id. */
+export const DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
+/** Operator-facing names, kept beside the ids they describe. */
+export const DEEPSEEK_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  [DEEPSEEK_FLASH_MODEL]: "DeepSeek Flash",
+  [DEEPSEEK_V4_FLASH_MODEL]: "DeepSeek Flash (legacy id)",
+  [DEEPSEEK_PRO_MODEL]: "DeepSeek Pro",
+};
+export const DEEPSEEK_OFFICIAL_MODEL_IDS = [DEEPSEEK_FLASH_MODEL, DEEPSEEK_V4_FLASH_MODEL, DEEPSEEK_PRO_MODEL] as const;
+
+/**
+ * Canonical upstream id for every client-facing id the provider publishes or
+ * accepts. The legacy flash alias is the only id that is not sent verbatim: the
+ * API serves it as `deepseek-flash`.
+ */
+const DEEPSEEK_UPSTREAM_MODEL_BY_ID: Readonly<Record<string, string>> = {
+  [DEEPSEEK_FLASH_MODEL]: DEEPSEEK_FLASH_MODEL,
+  [DEEPSEEK_V4_FLASH_MODEL]: DEEPSEEK_FLASH_MODEL,
+  [DEEPSEEK_PRO_MODEL]: DEEPSEEK_PRO_MODEL,
+};
 export const DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions";
 export const DEEPSEEK_CONTEXT_WINDOW_TOKENS = 1_000_000;
 /** Documented reasoning tiers, in ascending order. */
@@ -161,7 +180,7 @@ const requireDeepSeekApiKey = (supplied: string | null | undefined): string => {
  */
 export const deepSeekUpstreamModelFor = (model: string): string | null => {
   const normalized = model.trim().toLowerCase();
-  return DEEPSEEK_OFFICIAL_MODEL_ID_SET.has(normalized) ? DEEPSEEK_FLASH_MODEL : null;
+  return DEEPSEEK_UPSTREAM_MODEL_BY_ID[normalized] ?? null;
 };
 
 /** Maps a requested reasoning tier onto the documented DeepSeek wire tier. */

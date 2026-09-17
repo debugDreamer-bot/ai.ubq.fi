@@ -16,7 +16,7 @@ import { openaiError } from "./http.ts";
 import { getKv } from "./kv.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY, type RuntimeConfigV2 } from "./runtime_config.ts";
 import { getString, isRecord, sha256Hex } from "./utils.ts";
-import { DEEPSEEK_FLASH_MODEL, DEEPSEEK_OFFICIAL_MODEL_IDS, readDeepSeekApiKey } from "./deepseek.ts";
+import { DEEPSEEK_DISPLAY_NAMES, DEEPSEEK_OFFICIAL_MODEL_IDS, readDeepSeekApiKey } from "./deepseek.ts";
 import { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS } from "./metered.ts";
 import type { recordSentinelProviderDegradationFromEnvironment } from "./sentinel_incident_outbox.ts";
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "./surplus.ts";
@@ -700,7 +700,7 @@ const deepSeekOfficialCodexModels = (): Record<string, unknown>[] => {
     const context = recentModelContextFor(id);
     return {
       slug: id,
-      display_name: id === DEEPSEEK_FLASH_MODEL ? "DeepSeek Flash" : "DeepSeek Flash (legacy id)",
+      display_name: DEEPSEEK_DISPLAY_NAMES[id] ?? id,
       description: "DeepSeek official API (deepseek-flash) served by this gateway.",
       owned_by: "deepseek",
       supported_endpoint_types: ["openai-response", "openai-chat"],

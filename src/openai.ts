@@ -31,10 +31,10 @@ import { CEREBRAS_RATE_LIMIT_HEADERS } from "./cerebras_rate_limits.ts";
 import {
   DEEPSEEK_CONTEXT_WINDOW_TOKENS,
   DEEPSEEK_DEFAULT_REASONING_EFFORT,
+  DEEPSEEK_DISPLAY_NAMES,
   DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_OFFICIAL_MODEL_IDS,
   DEEPSEEK_REASONING_LEVELS,
-  DEEPSEEK_V4_FLASH_MODEL,
   DeepSeekError,
   DeepSeekStreamError,
   deepSeekChunkHasSemanticOutput,
@@ -5782,11 +5782,6 @@ const withConfiguredCerebrasModel = (models: readonly Record<string, unknown>[])
  * is dispatched to DeepSeek, a catalog row still naming the paid-fallback
  * provider (and its `["none"]` reasoning tiers) would misdescribe the route.
  */
-const DEEPSEEK_DISPLAY_NAMES: Readonly<Record<string, string>> = {
-  [DEEPSEEK_FLASH_MODEL]: "DeepSeek Flash",
-  [DEEPSEEK_V4_FLASH_MODEL]: "DeepSeek Flash (legacy id)",
-};
-
 const configuredDeepSeekModels = (): Record<string, unknown>[] =>
   readDeepSeekApiKey()
     ? DEEPSEEK_OFFICIAL_MODEL_IDS.map((id) => ({
@@ -7669,15 +7664,6 @@ const addPublicModelCatalogEntry = (models: Map<string, PublicModelCatalogEntry>
   models.set(id, publicModelCatalogEntry(id, provider, created));
 };
 
-const collectCodexCatalogModelIds = (codexModels: readonly Record<string, unknown>[]): Set<string> => {
-  const ids = new Set<string>();
-  for (const model of codexModels) {
-    const id = getString(model.id);
-    if (id) ids.add(id);
-  }
-  return ids;
-};
-
 export type ModelCatalogSourceId = "codex" | "openlux" | "surplus" | "deepseek" | "cerebras";
 
 export type ModelCatalogSource = Readonly<{
@@ -7706,39 +7692,35 @@ const credentialGatedCatalogSource = (configured: boolean, count: number): Model
 });
 
 /**
- * The official DeepSeek ids are served from the configured DeepSeek key, and
- * `/v1/models` REPLACES any discovered row for them. Replace the catalog
- * attribution the same way, so a row never names a provider that does not serve
- * it and the operator can select these ids at all.
+ * Every provider's models are listed, each attributed to every provider that
+ * publishes it. Nothing is filtered or re-attributed here: the operator's
+ * whitelist selection is the only thing that decides what the gateway
+ * advertises, so an id this route can serve must stay selectable.
  */
-const applyDeepSeekCatalogProvider = (models: Map<string, PublicModelCatalogEntry>): { configured: boolean; count: number } => {
-  if (!readDeepSeekApiKey()) return { configured: false, count: 0 };
-  const provider: PublicModelProvider = {
-    id: "deepseek",
-    owned_by: "deepseek",
-    supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
-  };
-  for (const id of DEEPSEEK_OFFICIAL_MODEL_IDS) models.set(id, publicModelCatalogEntry(id, provider, null));
-  return { configured: true, count: DEEPSEEK_OFFICIAL_MODEL_IDS.length };
-};
-
-/**
- * Cerebras advertises one id, and `/v1/models` only adds it when the Codex
- * snapshot does not already own that id. Mirror that precedence here: the id
- * stays attributed to Codex when Codex serves it, and otherwise it is
- * attributed to Cerebras instead of the discovered provider it displaces.
- */
-const applyCerebrasCatalogProvider = (
-  models: Map<string, PublicModelCatalogEntry>,
-  codexModelIds: ReadonlySet<string>
-): { configured: boolean; count: number } => {
-  if (!readCerebrasApiKey()) return { configured: false, count: 0 };
-  if (codexModelIds.has(CEREBRAS_GPT_OSS_120B_MODEL)) return { configured: true, count: 0 };
-  models.set(
-    CEREBRAS_GPT_OSS_120B_MODEL,
-    publicModelCatalogEntry(CEREBRAS_GPT_OSS_120B_MODEL, { id: "cerebras", owned_by: "cerebras", supported_endpoints: ["/v1/chat/completions"] }, null)
-  );
-  return { configured: true, count: 1 };
+const addCredentialGatedCatalogProviders = (models: Map<string, PublicModelCatalogEntry>): { deepseek: number; cerebras: number } => {
+  let deepseek = 0;
+  if (readDeepSeekApiKey()) {
+    const provider: PublicModelProvider = {
+      id: "deepseek",
+      owned_by: "deepseek",
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
+    };
+    for (const id of DEEPSEEK_OFFICIAL_MODEL_IDS) {
+      addPublicModelCatalogEntry(models, id, provider, null);
+      deepseek += 1;
+    }
+  }
+  let cerebras = 0;
+  if (readCerebrasApiKey()) {
+    addPublicModelCatalogEntry(
+      models,
+      CEREBRAS_GPT_OSS_120B_MODEL,
+      { id: "cerebras", owned_by: "cerebras", supported_endpoints: ["/v1/chat/completions"] },
+      null
+    );
+    cerebras = 1;
+  }
+  return { deepseek, cerebras };
 };
 
 /**
@@ -7753,11 +7735,7 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
   const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels({ requireApiKey: false })]);
   const codexModels = normalized?.data ?? [];
   const surplusModels = surplus?.models ?? [];
-  const codexModelIds = collectCodexCatalogModelIds(codexModels);
-  const otherProviderModelIds = new Set(codexModelIds);
-  for (const model of surplusModels) otherProviderModelIds.add(model.id);
   const models = new Map<string, PublicModelCatalogEntry>();
-  const includedOpenLuxModelIds = new Set<string>();
 
   for (const model of codexModels) {
     const id = getString(model.id);
@@ -7774,10 +7752,6 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
     );
   }
   for (const model of metered?.models ?? []) {
-    // OpenLux is a broad discovery source; only advertise it when another
-    // configured provider confirms the same model ID.
-    if (!otherProviderModelIds.has(model.id)) continue;
-    includedOpenLuxModelIds.add(model.id);
     addPublicModelCatalogEntry(
       models,
       model.id,
@@ -7802,8 +7776,7 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
     );
   }
 
-  const deepseek = applyDeepSeekCatalogProvider(models);
-  const cerebras = applyCerebrasCatalogProvider(models, codexModelIds);
+  const credentialGated = addCredentialGatedCatalogProviders(models);
 
   return {
     models: [...models.values()].sort((left, right) => left.id.localeCompare(right.id)),
@@ -7815,7 +7788,7 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
       },
       openlux: {
         status: catalogAvailabilityStatus(metered),
-        count: includedOpenLuxModelIds.size,
+        count: metered?.models.length ?? 0,
         updated_at_ms: metered?.updated_at_ms ?? null,
       },
       surplus: {
@@ -7823,8 +7796,8 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
         count: surplus?.models.length ?? 0,
         updated_at_ms: surplus?.updated_at_ms ?? null,
       },
-      deepseek: credentialGatedCatalogSource(deepseek.configured, deepseek.count),
-      cerebras: credentialGatedCatalogSource(cerebras.configured, cerebras.count),
+      deepseek: credentialGatedCatalogSource(readDeepSeekApiKey() !== null, credentialGated.deepseek),
+      cerebras: credentialGatedCatalogSource(readCerebrasApiKey() !== null, credentialGated.cerebras),
     },
   };
 };
@@ -9335,7 +9308,8 @@ const readDeepSeekChatCompletion = async (
   bytes: Uint8Array,
   upstreamStatus: number,
   providerRequestId: string | null,
-  usageContext: UsageContext | undefined
+  usageContext: UsageContext | undefined,
+  upstreamModel: string
 ): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; response: Response }> => {
   let payload: unknown;
   try {
@@ -9343,7 +9317,7 @@ const readDeepSeekChatCompletion = async (
   } catch {
     return { ok: false, response: await respondDeepSeekChatInvalidCompletion("invalid_json", upstreamStatus, providerRequestId, usageContext) };
   }
-  const normalized = normalizeDeepSeekChatCompletion(payload, DEEPSEEK_FLASH_MODEL);
+  const normalized = normalizeDeepSeekChatCompletion(payload, upstreamModel);
   if (!normalized.ok) {
     return { ok: false, response: await respondDeepSeekChatInvalidCompletion("invalid_completion_schema", upstreamStatus, providerRequestId, usageContext) };
   }
@@ -9436,14 +9410,15 @@ const streamDeepSeekChatCompletion = (
   providerRequestId: string | null,
   usageContext: UsageContext | undefined,
   downstreamSignal: AbortSignal,
-  requestSignal: AbortSignal
+  requestSignal: AbortSignal,
+  upstreamModel: string
 ): Response => {
   const encoder = new TextEncoder();
   const headers = new Headers(deepseekResponseHeaders(providerRequestId));
   headers.set("Content-Type", "text/event-stream");
   headers.set("Cache-Control", "no-cache");
 
-  const iterator = iterateDeepSeekChatCompletionStream(upstream, DEEPSEEK_FLASH_MODEL, { signal: requestSignal });
+  const iterator = iterateDeepSeekChatCompletionStream(upstream, upstreamModel, { signal: requestSignal });
   let closed = false;
   let terminalSettled = false;
   let semantic = false;
@@ -9577,6 +9552,9 @@ const handleDeepSeekChatCompletions = async (
   const parsedRequest = validateDeepSeekChatRequestFields(rawRecord);
   if (!parsedRequest.ok) return parsedRequest.response;
   const { reasoning, clientWantsStream } = parsedRequest.value;
+  // The canonical id the provider serves for this request; the buffered and
+  // streamed readers echo it, so an alias never reports a mismatched model.
+  const upstreamModel = deepSeekUpstreamModelFor(modelRaw) ?? DEEPSEEK_FLASH_MODEL;
 
   // Preserve the official nested Chat tools/tool_choice contract. In
   // particular, do not run the Codex-specific flattening that follows this
@@ -9611,7 +9589,7 @@ const handleDeepSeekChatCompletions = async (
   let providerRequestId = dispatched.providerRequestId;
 
   if (clientWantsStream) {
-    return streamDeepSeekChatCompletion(upstream, providerRequestId, usageContext, downstreamSignal, requestSignal);
+    return streamDeepSeekChatCompletion(upstream, providerRequestId, usageContext, downstreamSignal, requestSignal, upstreamModel);
   }
 
   const captured = await readBoundedResponseBody(upstream, {
@@ -9627,7 +9605,7 @@ const handleDeepSeekChatCompletions = async (
     return await respondDeepSeekChatIncompleteCapture(usageContext, downstreamSignal, requestSignal, providerRequestId);
   }
 
-  const completion = await readDeepSeekChatCompletion(captured.bytes, upstream.status, providerRequestId, usageContext);
+  const completion = await readDeepSeekChatCompletion(captured.bytes, upstream.status, providerRequestId, usageContext, upstreamModel);
   if (!completion.ok) return completion.response;
 
   if (deepseekChatCompletionHasSemanticOutput(completion.value)) markChatSemanticOutput(usageContext);
@@ -9655,6 +9633,7 @@ const handleDeepSeekResponses = async (req: Request, rawRecord: Record<string, u
   const clientWantsStream = parsedStream.value;
 
   const translated = toDeepSeekResponsesChatBody(rawRecord, modelRaw, clientWantsStream);
+  const upstreamModel = deepSeekUpstreamModelFor(modelRaw) ?? DEEPSEEK_FLASH_MODEL;
   if (!translated.ok) return openaiError(400, translated.message, "invalid_request_error", { param: translated.param });
   const { body: chatBody, toolNames, customToolNames } = translated.value;
 
@@ -9709,7 +9688,7 @@ const handleDeepSeekResponses = async (req: Request, rawRecord: Record<string, u
     return await respondDeepSeekChatIncompleteCapture(usageContext, downstreamSignal, requestSignal, providerRequestId);
   }
 
-  const completion = await readDeepSeekChatCompletion(captured.bytes, upstream.status, providerRequestId, usageContext);
+  const completion = await readDeepSeekChatCompletion(captured.bytes, upstream.status, providerRequestId, usageContext, upstreamModel);
   if (!completion.ok) return completion.response;
 
   providerRequestId ??= normalizeDeepSeekProviderRequestId(completion.value.id);
@@ -9746,7 +9725,7 @@ const streamDeepSeekResponses = (
   headers.set("Content-Type", "text/event-stream");
   headers.set("Cache-Control", "no-cache");
 
-  const iterator = iterateDeepSeekChatCompletionStream(upstream, DEEPSEEK_FLASH_MODEL, { signal: requestSignal });
+  const iterator = iterateDeepSeekChatCompletionStream(upstream, deepSeekUpstreamModelFor(requestedModel) ?? DEEPSEEK_FLASH_MODEL, { signal: requestSignal });
   const translator = createDeepSeekResponsesStreamTranslator(requestedModel, responseId, echo, createdAtSeconds, toolNames, customToolNames);
   const state = { settled: false, cancelled: false, semantic: false, usage: null as UsageTokens | null };
 
