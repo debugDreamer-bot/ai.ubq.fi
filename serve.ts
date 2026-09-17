@@ -3,6 +3,7 @@
 import { getKv } from "./src/kv.ts";
 import { config } from "./src/config.ts";
 import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseServeRuntimeOptions } from "./src/local_admin_auth.ts";
+import { ensureLocalDevelopmentApiKey } from "./src/local_development_key.ts";
 import { reconcileDuePaidFallbacksV3 } from "./src/paid_fallback_ledger.ts";
 import { prunePromptCacheAnalytics } from "./src/prompt_cache_analytics.ts";
 import { sampleProviderCapacityForCron } from "./src/provider_capacity.ts";
@@ -64,6 +65,23 @@ void Deno.cron("prune prompt cache analytics", "7 * * * *", async () => {
 const serveHandler = createServeHandler();
 
 const runtimeOptions = parseServeRuntimeOptions(Deno.args, { isDeploy: config.isDeploy });
+
+// `--disable-admin-auth` is loopback-only (a non-loopback listener fails at
+// startup), so provisioning here can never reach a hosted deployment. The local
+// development key makes loopback requests a super-admin inference principal
+// with unlimited paid-provider routing instead of a policy-free one.
+if (runtimeOptions.disableAdminAuth) {
+  try {
+    const kv = await getKv();
+    if (kv) {
+      const status = await ensureLocalDevelopmentApiKey(kv);
+      if (status === "created") console.log("[ai.ubq.fi] Provisioned the local development API key for loopback inference.");
+      else if (status === "revoked") console.warn("[ai.ubq.fi] The local development API key is revoked; local paid-provider routing stays off.");
+    }
+  } catch (error) {
+    console.warn("[ai.ubq.fi] Local development key provisioning failed:", error instanceof Error ? error.message : String(error));
+  }
+}
 
 const server: Deno.ServeDefaultExport = runtimeOptions.disableAdminAuth
   ? {

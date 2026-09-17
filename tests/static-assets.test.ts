@@ -70,7 +70,7 @@ Deno.test("static assets register frontend module dependencies", () => {
   ]) {
     assert.equal(hasStaticAsset(path), true, `${path} should be registered`);
   }
-  assert.match(chatHtml, /<script type="module" src="\/chat\.js\?v=20260903-chat-motion-v1"><\/script>/);
+  assert.match(chatHtml, /<script type="module" src="\/chat\.js\?v=20260917-local-development-auth-v1"><\/script>/);
   assert.match(chatScript, /from "\.\/chat-stats\.js\?v=20260827-response-stats-v4";/);
   assert.match(chatScript, /from "\.\/toast\.js\?v=20260903-toast-v1";/);
 });
@@ -88,6 +88,14 @@ Deno.test("chat response stats use one conversation bar below the composer", () 
   assert.match(chatCss, /\[data-chat-stats\]\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/s);
   assert.doesNotMatch(chatCss, /\[data-chat-stats\]\s*\{[^}]*(?:overflow:\s*hidden|white-space:\s*nowrap)/s);
   assert.doesNotMatch(chatCss, /\[data-message-stats\]/);
+});
+
+Deno.test("chat falls back to the loopback development principal without a token", () => {
+  assert.match(chatScript, /import \{\n(?:.|\n)*?isLocalDevelopmentOrigin,\n(?:.|\n)*?\} from "\.\/auth\.js";/);
+  assert.match(chatScript, /let localDevelopmentAuth = false;/);
+  assert.match(chatScript, /if \(!token && !localDevelopmentAuth\) \{/);
+  assert.match(chatScript, /if \(auth\?\.mode !== "disabled" \|\| auth\?\.is_admin !== true\) return null;/);
+  assert.match(chatScript, /const authHeaders = \(token = ""\) => \{/);
 });
 
 Deno.test("public models page is registered", () => {
