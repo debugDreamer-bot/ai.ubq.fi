@@ -6883,6 +6883,7 @@ const VIEW_REQUIREMENTS = {
   kernel: "admin",
   pubkeys: "admin",
   defaults: "admin",
+  models: "admin",
   providers: "admin",
   errors: "admin",
 };
