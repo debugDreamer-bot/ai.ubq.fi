@@ -69,23 +69,50 @@ const chatToolResultItem = (item: Record<string, unknown>): DeepSeekResponsesRes
   return { ok: true, value: { role: "tool", tool_call_id: callId, content } };
 };
 
+/**
+ * The chain-of-thought text a `reasoning` input item carries. Codex echoes the
+ * reasoning item this adapter emitted, either as `summary` parts or as
+ * `content` parts depending on the client version.
+ */
+const reasoningTextFromItem = (item: Record<string, unknown>): string => {
+  const parts = [item.summary, item.content].filter(Array.isArray).flat();
+  const texts = parts.map((part) => (isRecord(part) ? getString(part.text) : null)).filter((text): text is string => Boolean(text));
+  const direct = getString(item.text);
+  if (direct) texts.push(direct);
+  return texts.join("");
+};
+
 /** Appends one `function_call` item, merging consecutive calls into one assistant turn. */
-const appendToolCall = (messages: Record<string, unknown>[], call: Record<string, unknown>): void => {
+const appendToolCall = (messages: Record<string, unknown>[], call: Record<string, unknown>, pending: { reasoning: string }): void => {
   const previous = messages.at(-1);
   if (previous?.role === "assistant" && Array.isArray(previous.tool_calls) && previous.content === null) {
     previous.tool_calls.push(call);
     return;
   }
-  messages.push({ role: "assistant", content: null, tool_calls: [call] });
+  const turn: Record<string, unknown> = { role: "assistant", content: null, tool_calls: [call] };
+  if (pending.reasoning) {
+    turn.reasoning_content = pending.reasoning;
+    pending.reasoning = "";
+  }
+  messages.push(turn);
 };
 
-const appendMessageItem = (messages: Record<string, unknown>[], item: Record<string, unknown>): DeepSeekResponsesResult<void> => {
+const appendMessageItem = (
+  messages: Record<string, unknown>[],
+  item: Record<string, unknown>,
+  pending: { reasoning: string }
+): DeepSeekResponsesResult<void> => {
   const role = getString(item.role) ?? "user";
   if (role !== "user" && role !== "assistant" && role !== "developer") return failure("input.role", `input role '${role}' is not supported`);
   const content = chatContentFromResponseParts(item.content);
   if (!content.ok) return content;
+  const message: Record<string, unknown> = { role: role === "developer" ? "system" : role, content: content.value };
+  if (role === "assistant" && pending.reasoning) {
+    message.reasoning_content = pending.reasoning;
+    pending.reasoning = "";
+  }
   // DeepSeek, like OpenAI Chat, has no developer role.
-  messages.push({ role: role === "developer" ? "system" : role, content: content.value });
+  messages.push(message);
   return { ok: true, value: undefined };
 };
 
@@ -93,22 +120,25 @@ const appendMessageItem = (messages: Record<string, unknown>[], item: Record<str
  * Converts one Responses input array into Chat Completions messages. A
  * `function_call` item and its matching `function_call_output` become an
  * assistant turn carrying `tool_calls` followed by the tool result, which is
- * the only shape the Chat contract accepts. `reasoning` items are dropped: the
- * official API accepts its own `reasoning_content` only alongside tools, so
- * replaying it is never required for a correct answer.
+ * the only shape the Chat contract accepts. A `reasoning` item is carried onto
+ * the assistant turn that follows it as `reasoning_content`.
  */
-const appendInputItem = (messages: Record<string, unknown>[], rawItem: unknown): DeepSeekResponsesResult<void> => {
+const appendInputItem = (messages: Record<string, unknown>[], rawItem: unknown, pending: { reasoning: string }): DeepSeekResponsesResult<void> => {
   if (typeof rawItem === "string") {
     messages.push({ role: "user", content: rawItem });
     return { ok: true, value: undefined };
   }
   if (!isRecord(rawItem) || Array.isArray(rawItem)) return failure("input", "input items must be objects");
   const type = getString(rawItem.type) ?? "message";
-  if (type === "reasoning") return { ok: true, value: undefined };
+  if (type === "reasoning") {
+    // Held for the assistant turn that follows it rather than dropped.
+    pending.reasoning += reasoningTextFromItem(rawItem);
+    return { ok: true, value: undefined };
+  }
   if (type === "function_call") {
     const call = chatToolCallItem(rawItem);
     if (!call.ok) return call;
-    appendToolCall(messages, call.value);
+    appendToolCall(messages, call.value, pending);
     return { ok: true, value: undefined };
   }
   if (type === "function_call_output") {
@@ -118,7 +148,7 @@ const appendInputItem = (messages: Record<string, unknown>[], rawItem: unknown):
     return { ok: true, value: undefined };
   }
   if (type !== "message") return failure("input.type", `input item type '${type}' is not supported`);
-  return appendMessageItem(messages, rawItem);
+  return appendMessageItem(messages, rawItem, pending);
 };
 
 export const toDeepSeekChatMessages = (input: unknown, instructions: string | null): DeepSeekResponsesResult<Record<string, unknown>[]> => {
@@ -131,11 +161,30 @@ export const toDeepSeekChatMessages = (input: unknown, instructions: string | nu
   if (input === undefined || input === null) return { ok: true, value: messages };
   if (!Array.isArray(input)) return failure("input", "input must be a string or an array");
 
+  const pending = { reasoning: "" };
   for (const rawItem of input) {
-    const appended = appendInputItem(messages, rawItem);
+    const appended = appendInputItem(messages, rawItem, pending);
     if (!appended.ok) return appended;
   }
   return { ok: true, value: messages };
+};
+
+/**
+ * DeepSeek rejects a tool-bearing request when a historical assistant turn with
+ * tool calls omits `reasoning_content`:
+ *
+ *   "The `reasoning_content` in the thinking mode must be passed back to the API."
+ *
+ * The field is required even when the client cannot replay the original chain of
+ * thought, and the provider accepts an empty string, so a turn without captured
+ * reasoning is filled in rather than left absent. Without this, the second turn
+ * of any tool-using conversation failed with HTTP 400.
+ */
+const ensureToolTurnReasoning = (messages: readonly Record<string, unknown>[]): void => {
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    if (typeof message.reasoning_content !== "string") message.reasoning_content = "";
+  }
 };
 
 /**
@@ -308,6 +357,8 @@ export const toDeepSeekResponsesChatBody = (
   if (!reasoning.ok) return reasoning;
   const toolNames = applyTools(body, rawRecord);
   if (!toolNames.ok) return toolNames;
+  // Only a tool-bearing request makes the provider require replayed reasoning.
+  if (Array.isArray(body.tools) && body.tools.length) ensureToolTurnReasoning(messages.value);
   return { ok: true, value: { body, toolNames: toolNames.value } };
 };
 
