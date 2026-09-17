@@ -17,7 +17,7 @@ import {
   modelSupportsReasoningNone,
   setReasoningPlaceholder as setSharedReasoningPlaceholder,
   updateReasoningSelectForModel,
-} from "./reasoning-select.js?v=20260827-cerebras-none-v1";
+} from "./reasoning-select.js?v=20260917-dynamic-metadata-v1";
 import {
   createChatMessageElement,
   createChatStatsAccumulator,

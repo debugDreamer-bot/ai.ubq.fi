@@ -179,6 +179,16 @@ body[data-page="models"] [data-auto-compact] {
   font-variant-numeric: tabular-nums;
 }
 
+body[data-page="models"] [data-metadata-source] {
+  color: var(--muted-2);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+body[data-page="models"] [data-metadata-source="unknown"] {
+  opacity: 0.65;
+}
+
 @media (prefers-reduced-motion: reduce) {
   body[data-page="models"] [data-source-summary] article,
   body[data-page="models"] [data-model-list] {

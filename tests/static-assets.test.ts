@@ -93,11 +93,11 @@ Deno.test("chat response stats use one conversation bar below the composer", () 
 Deno.test("public models page is registered", () => {
   assert.equal(hasStaticAsset("/models"), true);
   assert.equal(hasStaticAsset("/models.html"), true);
-  assert.match(modelsHtml, /<script type="module" src="\/models\.js\?v=app-minimal-20260912"><\/script>/);
+  assert.match(modelsHtml, /<script type="module" src="\/models\.js\?v=app-minimal-20260917"><\/script>/);
 });
 
 Deno.test("public console pages share versioned styles, canonical navigation, and accurate active states", () => {
-  const assetVersion = "app-minimal-20260912";
+  const assetVersion = "app-minimal-20260917";
   const canonicalLinks = [
     { href: "/models", label: "Models" },
     { href: "/developers", label: "Developers" },

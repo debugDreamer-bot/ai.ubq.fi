@@ -21,7 +21,7 @@ import {
 } from "./auth-relay.js?v=passkey-relay-20260823-v4";
 import { createAdminSnapshotCache } from "./admin-cache.js?v=admin-indexeddb-cache-20260830-v7";
 import { bindForegroundRefresh } from "./foreground-refresh.js";
-import { getRecentModelReasoning, setReasoningPlaceholder, updateReasoningSelectForModel } from "./reasoning-select.js";
+import { setReasoningPlaceholder, updateReasoningSelectForModel } from "./reasoning-select.js";
 import { toast } from "./toast.js?v=20260903-toast-v1";
 
 const STORAGE_KEYS = {
@@ -8085,12 +8085,13 @@ const modelsReasoningFor = (entry) => {
   const advertised = modelsReasoningLevels(entry?.supported_reasoning_levels);
   if (advertised.length) {
     return {
-      modelClass: entry.model_class ?? null,
       levels: advertised,
       defaultLevel: entry.default_reasoning_effort ?? null,
     };
   }
-  return getRecentModelReasoning(entry?.id);
+  // The catalog endpoint serves the tiers a source actually published, so there
+  // is no client-side table left to consult for the ones it omits.
+  return null;
 };
 
 const modelsEntryMatchesQuery = (entry, query) => {
@@ -8100,7 +8101,6 @@ const modelsEntryMatchesQuery = (entry, query) => {
   const maxContextWindow = modelsPositiveTokenCount(entry.max_context_window_tokens);
   const autoCompact = modelsPositiveTokenCount(entry.auto_compact_token_limit_tokens);
   const contextSearch = [
-    entry.model_class,
     contextWindow && MODEL_TOKEN_FORMAT.format(contextWindow),
     maxContextWindow && MODEL_TOKEN_FORMAT.format(maxContextWindow),
     autoCompact && MODEL_TOKEN_FORMAT.format(autoCompact),
@@ -8110,7 +8110,6 @@ const modelsEntryMatchesQuery = (entry, query) => {
     (entry.providers ?? []).some((provider) =>
       (MODEL_PROVIDER_LABELS[provider.id] ?? provider.id).toLowerCase().includes(query)
     ) ||
-    reasoning?.modelClass?.includes(query) ||
     reasoning?.levels?.some((level) => level.includes(query)) ||
     contextSearch.includes(query);
 };

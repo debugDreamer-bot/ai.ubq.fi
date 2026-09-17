@@ -1,4 +1,3 @@
-import { getRecentModelReasoning } from "./reasoning-select.js?v=20260824-recent-reasoning-v2";
 import { toast } from "./toast.js?v=20260903-toast-v1";
 
 const summary = document.querySelector("[data-source-summary]");
@@ -16,6 +15,14 @@ const providerNames = {
   surplus: "Metered 1",
   deepseek: "DeepSeek",
   cerebras: "Cerebras",
+  openrouter: "OpenRouter",
+};
+// Where a row's numbers came from. The catalog reports one source per field
+// group, so a row can honestly read "Codex catalog + OpenRouter".
+const metadataSourceNames = {
+  codex_upload: "Codex catalog",
+  provider_discovery: "Provider discovery",
+  openrouter: "OpenRouter",
 };
 const reasoningOrder = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const tokenNumber = new Intl.NumberFormat("en-US");
@@ -32,16 +39,20 @@ const normalizeReasoningLevels = (value) => {
   });
 };
 
+// The catalog serves the reasoning tiers themselves, so the page renders what
+// the gateway knows and nothing else: no client-side table fills the gap for a
+// model no source describes.
 const reasoningFor = (model) => {
-  const advertised = normalizeReasoningLevels(model.supported_reasoning_levels);
-  if (advertised.length) {
-    return {
-      modelClass: model.model_class ?? null,
-      levels: advertised,
-      defaultLevel: model.default_reasoning_effort ?? null,
-    };
-  }
-  return getRecentModelReasoning(model.id);
+  const levels = normalizeReasoningLevels(model.supported_reasoning_levels);
+  if (!levels.length) return null;
+  return { levels, defaultLevel: model.default_reasoning_effort ?? null };
+};
+
+const metadataSourceLabel = (model) => {
+  const names = [model.context_source, model.reasoning_source]
+    .map((source) => metadataSourceNames[source])
+    .filter((name, index, all) => name !== undefined && all.indexOf(name) === index);
+  return names.length ? names.join(" + ") : "No upstream metadata";
 };
 
 const positiveTokenCount = (value) =>
@@ -60,7 +71,6 @@ const render = () => {
     const maxContextWindow = positiveTokenCount(model.max_context_window_tokens);
     const autoCompact = positiveTokenCount(model.auto_compact_token_limit_tokens);
     const contextSearch = [
-      model.model_class,
       contextWindow && tokenNumber.format(contextWindow),
       maxContextWindow && tokenNumber.format(maxContextWindow),
       autoCompact && tokenNumber.format(autoCompact),
@@ -68,7 +78,7 @@ const render = () => {
     ].filter(Boolean).join(" ").toLowerCase();
     return !query || model.id.toLowerCase().includes(query) ||
       model.providers.some((provider) => (providerNames[provider.id] ?? provider.id).toLowerCase().includes(query)) ||
-      reasoning?.modelClass?.includes(query) ||
+      metadataSourceLabel(model).toLowerCase().includes(query) ||
       reasoning?.levels.some((level) => level.includes(query)) ||
       contextSearch.includes(query);
   });
@@ -87,6 +97,14 @@ const render = () => {
       providers.append(badge);
     }
     article.append(heading, providers);
+
+    // Coverage is part of the page: a row states which source described it, and
+    // a row no source described says so instead of quietly showing nothing.
+    const source = document.createElement("div");
+    source.dataset.metadataSource = model.context_source ?? "unknown";
+    source.textContent = `Metadata · ${metadataSourceLabel(model)}`;
+    article.append(source);
+
     const details = document.createElement("details");
     details.dataset.disclosure = "";
     const detailsTitle = document.createElement("summary");
@@ -97,8 +115,7 @@ const render = () => {
     if (reasoning?.levels.length) {
       const levels = document.createElement("div");
       levels.dataset.reasoningLevels = "";
-      const classLabel = reasoning.modelClass ? `${reasoning.modelClass}: ` : "";
-      levels.textContent = `Reasoning · ${classLabel}${reasoning.levels.join(", ")}`;
+      levels.textContent = `Reasoning · ${reasoning.levels.join(", ")}`;
       if (reasoning.defaultLevel) levels.title = `Default: ${reasoning.defaultLevel}`;
       details.append(levels);
     }
@@ -113,7 +130,6 @@ const render = () => {
         ? ` / ${tokenNumber.format(maxContextWindow)} max`
         : "";
       context.textContent = `Context · ${tokenNumber.format(contextWindow)} tokens${maxSuffix}`;
-      if (model.model_class) context.title = `Model class: ${model.model_class}`;
       article.append(context);
     }
     if (autoCompact) {

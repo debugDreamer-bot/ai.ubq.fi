@@ -16,11 +16,12 @@ import { openaiError } from "./http.ts";
 import { getKv } from "./kv.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY, type RuntimeConfigV2 } from "./runtime_config.ts";
 import { getString, isRecord, sha256Hex } from "./utils.ts";
-import { DEEPSEEK_FLASH_MODEL, DEEPSEEK_OFFICIAL_MODEL_IDS, readDeepSeekApiKey } from "./deepseek.ts";
+import { DEEPSEEK_CONTEXT_WINDOW_TOKENS, DEEPSEEK_FLASH_MODEL, DEEPSEEK_OFFICIAL_MODEL_IDS, readDeepSeekApiKey } from "./deepseek.ts";
 import { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS } from "./metered.ts";
 import type { recordSentinelProviderDegradationFromEnvironment } from "./sentinel_incident_outbox.ts";
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "./surplus.ts";
-import { recentModelContextFor } from "./recent_model_context.ts";
+import { resolveModelMetadata } from "./model_metadata.ts";
+import { warmOpenRouterModels } from "./openrouter_models.ts";
 
 export const CODEX_CATALOG_FRESH_MS = 5 * 60_000;
 export const CODEX_CATALOG_RETENTION_MS = 24 * 60 * 60_000;
@@ -619,6 +620,13 @@ const etagMatches = (requestValue: string | null, etag: string | null): boolean 
   return requestValue.split(",").some((candidate) => candidate.trim() === "*" || candidate.trim() === etag);
 };
 
+/**
+ * Codex requires a human description next to every advertised effort. The
+ * description is a UI label, so a tier discovered dynamically gets a generic one
+ * rather than a claim about what the model does.
+ */
+const codexReasoningEffortDescription = (effort: string): string => (effort === "none" ? "No reasoning" : `Reasoning effort: ${effort}`);
+
 const meteredCodexModelRecord = (
   model: Readonly<{
     id: string;
@@ -627,31 +635,29 @@ const meteredCodexModelRecord = (
     supported_endpoint_types: readonly string[];
   }>
 ) => {
-  const context = recentModelContextFor(model.id);
+  // Discovery states an id, not its capabilities: every value here comes from
+  // the dynamic resolver, and an id no source describes keeps the no-reasoning
+  // default rather than inheriting a curated guess.
+  const resolved = resolveModelMetadata(model.id);
+  const levels = resolved.supported_reasoning_levels;
   return {
     slug: model.id,
     display_name: model.id,
     description: model.description,
     owned_by: model.owned_by,
     supported_endpoint_types: [...model.supported_endpoint_types],
-    supported_reasoning_levels: /^deepseek-v4-flash(?:-0731|:web)?$/.test(model.id)
-      ? [
-          { effort: "none", description: "Disable optional reasoning" },
-          { effort: "low", description: "Reasoning effort: low" },
-          { effort: "high", description: "Reasoning effort: high" },
-          { effort: "max", description: "Maximum reasoning depth" },
-        ]
+    supported_reasoning_levels: levels?.length
+      ? levels.map((effort) => ({ effort, description: codexReasoningEffortDescription(effort) }))
       : [{ effort: "none", description: "No reasoning" }],
-    default_reasoning_level: /^deepseek-v4-flash(?:-0731|:web)?$/.test(model.id) ? "high" : "none",
-    ...(context
-      ? {
-          model_class: context.model_class,
-          context_window: context.context_window_tokens,
-          max_context_window: context.max_context_window_tokens,
-          auto_compact_token_limit: context.auto_compact_token_limit_tokens,
-          effective_context_window_percent: context.effective_context_window_percent,
-        }
-      : {}),
+    default_reasoning_level: resolved.default_reasoning_effort ?? "none",
+    ...(resolved.context_window_tokens === null
+      ? {}
+      : {
+          context_window: resolved.context_window_tokens,
+          max_context_window: resolved.max_context_window_tokens,
+          ...(resolved.auto_compact_token_limit_tokens === null ? {} : { auto_compact_token_limit: resolved.auto_compact_token_limit_tokens }),
+          ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+        }),
     shell_type: "shell_command",
     visibility: "list",
     supported_in_api: true,
@@ -697,7 +703,11 @@ const uniqueResponsesModels = <
 const deepSeekOfficialCodexModels = (): Record<string, unknown>[] => {
   if (!readDeepSeekApiKey()) return [];
   return DEEPSEEK_OFFICIAL_MODEL_IDS.map((id) => {
-    const context = recentModelContextFor(id);
+    // The route declares one window for both interchangeable ids; anything more
+    // specific comes from the dynamic sources.
+    const resolved = resolveModelMetadata(id, {
+      provider: { context_window_tokens: DEEPSEEK_CONTEXT_WINDOW_TOKENS, max_context_window_tokens: DEEPSEEK_CONTEXT_WINDOW_TOKENS },
+    });
     return {
       slug: id,
       display_name: id === DEEPSEEK_FLASH_MODEL ? "DeepSeek Flash" : "DeepSeek Flash (legacy id)",
@@ -711,15 +721,14 @@ const deepSeekOfficialCodexModels = (): Record<string, unknown>[] => {
         { effort: "max", description: "Thinking effort: maximum" },
       ],
       default_reasoning_level: "high",
-      ...(context
-        ? {
-            model_class: context.model_class,
-            context_window: context.context_window_tokens,
-            max_context_window: context.max_context_window_tokens,
-            auto_compact_token_limit: context.auto_compact_token_limit_tokens,
-            effective_context_window_percent: context.effective_context_window_percent,
-          }
-        : {}),
+      ...(resolved.context_window_tokens === null
+        ? {}
+        : {
+            context_window: resolved.context_window_tokens,
+            max_context_window: resolved.max_context_window_tokens,
+            ...(resolved.auto_compact_token_limit_tokens === null ? {} : { auto_compact_token_limit: resolved.auto_compact_token_limit_tokens }),
+            ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+          }),
       shell_type: "shell_command",
       visibility: "list",
       supported_in_api: true,
@@ -780,6 +789,10 @@ const refreshExpiredModelList = (nowMs: number, updatedAtMs: number, ttlMs: numb
 };
 
 const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheState: string): Promise<Response> => {
+  // Rows this response appends are resolved dynamically, so start an enrichment
+  // refresh without waiting for it; the stored catalog already carries Codex's
+  // own metadata for every id it lists.
+  warmOpenRouterModels();
   const headers = new Headers({
     "Content-Type": catalog.metadata.content_type,
     "Cache-Control": "private, max-age=300",

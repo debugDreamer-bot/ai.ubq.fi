@@ -70,6 +70,7 @@ const catalogFixture = () => ({
     surplus: { status: "available" as const, count: 1, updated_at_ms: 2 },
     deepseek: { status: "available" as const, count: 1, updated_at_ms: null, configured: true },
     cerebras: { status: "unavailable" as const, count: 0, updated_at_ms: null, configured: false },
+    openrouter: { status: "unavailable" as const, count: 0, updated_at_ms: null },
   },
 });
 
@@ -142,7 +143,7 @@ Deno.test("the official DeepSeek ids are cataloged as their own provider categor
         "the official route replaces a discovered attribution"
       );
       assert.deepEqual(row.providers[0].supported_endpoints, ["/v1/chat/completions", "/v1/responses"]);
-      assert.equal(row.model_class, "deepseek-v4");
+      assert.equal(row.context_source, "provider_discovery");
       assert.equal(row.context_window_tokens, 1_000_000);
     }
     assert.deepEqual(catalog.sources.deepseek, { status: "available", count: 2, updated_at_ms: null, configured: true });
