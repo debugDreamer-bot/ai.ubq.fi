@@ -29,6 +29,16 @@ const sampleCapacity = async () => {
 // delay startup and the job runs in the background for the process lifetime.
 void Deno.cron("sample Mac provider capacity", "*/15 * * * *", sampleCapacity);
 await sampleCapacity();
+const { fetchOpenRouterModels } = await import(new URL("src/openrouter_models.ts", release).href);
+const refreshModelMetadata = async () => {
+  try {
+    await fetchOpenRouterModels();
+  } catch (error) {
+    console.error("[ai.ubq.fi] Mac model metadata refresh failed:", error);
+  }
+};
+void Deno.cron("refresh Mac model metadata", "*/5 * * * *", refreshModelMetadata);
+await refreshModelMetadata();
 const { configureAdminAuthForListener, configureAdminAuthPeerForRequest } = await import(new URL("src/local_admin_auth.ts", release).href);
 const server = Deno.serve(
   {

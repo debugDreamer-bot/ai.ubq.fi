@@ -6,6 +6,7 @@ import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseS
 import { reconcileDuePaidFallbacksV3 } from "./src/paid_fallback_ledger.ts";
 import { prunePromptCacheAnalytics } from "./src/prompt_cache_analytics.ts";
 import { sampleProviderCapacityForCron } from "./src/provider_capacity.ts";
+import { fetchOpenRouterModels } from "./src/openrouter_models.ts";
 import { createServeHandler } from "./src/serve_handler.ts";
 const isProductionRuntime = (): boolean => Deno.env.get("DENO_TIMELINE") === "production";
 
@@ -31,6 +32,18 @@ void Deno.cron("sample Codex provider capacity", "*/15 * * * *", async () => {
     await sampleProviderCapacityForCron({ kv });
   } catch (error) {
     console.error("[ai.ubq.fi] Provider capacity sampler failed:", error instanceof Error ? error.message : String(error));
+  }
+});
+
+void Deno.cron("refresh model metadata enrichment", "*/5 * * * *", async () => {
+  if (!isProductionRuntime()) return;
+  try {
+    // TTL-aware: a request that already refreshed the snapshot inside the window
+    // makes this cheap, so the catalog stays warm without polling harder than the
+    // cache needs. A failed refresh keeps the last good snapshot.
+    await fetchOpenRouterModels();
+  } catch (error) {
+    console.error("[ai.ubq.fi] Model metadata refresh failed:", error instanceof Error ? error.message : String(error));
   }
 });
 

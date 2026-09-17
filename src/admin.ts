@@ -127,7 +127,9 @@ import {
 import { readJsonBody } from "./request.ts";
 import { getString, isRecord, sha256Base64Url, sha256Hex } from "./utils.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, ApiKeyUsageWindowV3, CodexAuthPoolState, CodexAuthState } from "./types.ts";
-import { MeteredError } from "./metered.ts";
+import { fetchMeteredModels, MeteredError } from "./metered.ts";
+import { fetchSurplusModels } from "./surplus.ts";
+import { fetchOpenRouterModels, openRouterModelsSnapshot, type OpenRouterModelsSnapshot } from "./openrouter_models.ts";
 import {
   getConfiguredMeteredQuotaSnapshot,
   getMeteredQuotaDiagnostics,
@@ -653,6 +655,46 @@ export const handleAdminModelsCatalogGet = async (dependencies: Readonly<{ build
         // An empty (or absent) whitelist applies no filter at all, which is the
         // documented behaviour the picker has to explain to the operator.
         filter_active: modelIds.length > 0,
+      },
+    },
+    { "Cache-Control": "no-store" }
+  );
+};
+
+/**
+ * Force a metadata refresh from every upstream the catalog draws on, so the
+ * operator can make the picker current on demand instead of waiting for a TTL or
+ * for the next request to warm a cache.
+ *
+ * The refreshers are injectable for tests, matching the other admin handlers.
+ */
+export const handleAdminModelsRefresh = async (
+  dependencies: Readonly<{
+    refreshEnrichment?: () => Promise<OpenRouterModelsSnapshot | null>;
+    refreshOpenlux?: typeof fetchMeteredModels;
+    refreshSurplus?: typeof fetchSurplusModels;
+  }> = {}
+): Promise<Response> => {
+  const before = openRouterModelsSnapshot();
+  const refreshEnrichment = dependencies.refreshEnrichment ?? (() => fetchOpenRouterModels({ force: true }));
+  const refreshOpenlux = dependencies.refreshOpenlux ?? fetchMeteredModels;
+  const refreshSurplus = dependencies.refreshSurplus ?? fetchSurplusModels;
+  const [enrichment, openlux, surplus] = await Promise.all([refreshEnrichment(), refreshOpenlux({ force: true }), refreshSurplus({ force: true })]);
+  const enrichmentUpdatedAt = enrichment?.updated_at_ms ?? null;
+  return json(
+    200,
+    {
+      ok: true,
+      data: {
+        // A failed refresh keeps the last good snapshot, so the caller is told
+        // both what is now cached and whether this call actually changed it.
+        openrouter: {
+          upstream_models: enrichment?.models.length ?? 0,
+          updated_at_ms: enrichmentUpdatedAt,
+          refreshed: enrichmentUpdatedAt !== (before?.updated_at_ms ?? null),
+        },
+        openlux: { models: openlux?.models.length ?? 0, updated_at_ms: openlux?.updated_at_ms ?? null },
+        surplus: { models: surplus?.models.length ?? 0, updated_at_ms: surplus?.updated_at_ms ?? null },
       },
     },
     { "Cache-Control": "no-store" }
