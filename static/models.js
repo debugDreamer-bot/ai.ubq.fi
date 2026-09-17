@@ -127,10 +127,13 @@ const render = () => {
     if (contextWindow) {
       const context = document.createElement("div");
       context.dataset.contextWindow = "";
-      const maxSuffix = maxContextWindow && maxContextWindow !== contextWindow
-        ? ` / ${tokenNumber.format(maxContextWindow)} max`
-        : "";
-      context.textContent = `Context · ${tokenNumber.format(contextWindow)} tokens${maxSuffix}`;
+      context.textContent = `Context · ${tokenNumber.format(contextWindow)} tokens`;
+      // The catalog's maximum is the ceiling a client config may override the
+      // window to, not a window the provider serves, so it belongs in the
+      // tooltip rather than next to the served number.
+      if (maxContextWindow && maxContextWindow !== contextWindow) {
+        context.title = `Client override ceiling: ${tokenNumber.format(maxContextWindow)} tokens`;
+      }
       article.append(context);
     }
     if (autoCompact) {
