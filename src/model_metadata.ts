@@ -3,16 +3,19 @@ import { openRouterMetadataFor, type OpenRouterModelMetadata } from "./openroute
 import { CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT, resolvedAutoCompactTokenLimit } from "./recent_model_context.ts";
 
 /**
- * One place resolves what the gateway knows about a model, from the sources that
- * actually know it, in this order:
+ * One place resolves what the gateway knows about a model.
  *
- * 1. `codex_upload` — the Codex client's uploaded catalog. Authoritative for
- *    every id it lists, including the reasoning tier strings the gateway must
- *    preserve verbatim.
- * 2. `provider_discovery` — the provider that serves the id, as discovered from
- *    its own `/v1/models` response.
- * 3. `openrouter` — the third-party public catalog, for ids the first two are
- *    silent about.
+ * Context windows come from `openrouter`, which publishes the model's real
+ * maximum. The Codex endpoint's own catalog understates what it accepts: 916,463
+ * tokens verified for `gpt-6-astra` against a 272,000 served window and an
+ * 872,000 override cap that Codex clamps client overrides to. OpenRouter leads
+ * the candidate list and breaks ties; a narrower third-party entry never shrinks
+ * a route below what that route itself declares, and the Codex subscription bound
+ * is the last resort so a Codex-served id is never reported as unknown.
+ *
+ * Reasoning tiers keep the opposite order — `codex_upload`, then the serving
+ * provider, then OpenRouter — because the uploaded catalog is authoritative for
+ * the tier strings the gateway must preserve verbatim.
  *
  * The curated per-model tables this replaced are commented out in
  * `src/recent_model_context.ts`. Nothing here invents a value: an id no source
@@ -155,22 +158,34 @@ export const codexSubscriptionMetadataHint = (): ModelMetadataHint => ({
   max_context_window_tokens: CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS,
 });
 
-/** True when a source published either context window, in either spelling. */
-const statesContext = (hint: ModelMetadataHint | null): boolean =>
-  hint !== null && (positiveTokenCount(hint.context_window_tokens) !== null || positiveTokenCount(hint.max_context_window_tokens) !== null);
-
-const contextSourceOf = (
-  codex: ModelMetadataHint | null,
-  subscription: ModelMetadataHint | null,
-  provider: ModelMetadataHint | null,
-  enrichment: ModelMetadataHint | null
-): ModelMetadataSource => {
-  if (statesContext(codex)) return "codex_upload";
-  if (statesContext(subscription)) return "codex_subscription";
-  if (statesContext(provider)) return "provider_discovery";
-  if (statesContext(enrichment)) return "openrouter";
-  return "unknown";
+/**
+ * OpenRouter is the capability catalog for context windows: it publishes the
+ * model's real maximum, while the Codex endpoint's catalog understates what it
+ * accepts (916,463 tokens verified for `gpt-6-astra` against a 272,000 served
+ * window and an 872,000 override cap). First-party statements only fill ids
+ * OpenRouter does not know, in descending authority. A client that wants to stay
+ * inside a cheaper tier sets its own window or compaction limit.
+ */
+const windowFrom = (
+  candidates: readonly (readonly [ModelMetadataSource, number | null])[]
+): Readonly<{ tokens: number | null; source: ModelMetadataSource }> => {
+  let tokens: number | null = null;
+  let source: ModelMetadataSource = "unknown";
+  for (const [candidateSource, value] of candidates) {
+    const count = positiveTokenCount(value);
+    if (count === null) continue;
+    // OpenRouter leads the list, so it also breaks ties. A narrower third-party
+    // entry never shrinks a route below what the route itself declares.
+    if (tokens === null || count > tokens) {
+      tokens = count;
+      source = candidateSource;
+    }
+  }
+  return { tokens, source };
 };
+
+const hintWindow = (hint: ModelMetadataHint | null): number | null =>
+  positiveTokenCount(hint?.context_window_tokens) ?? positiveTokenCount(hint?.max_context_window_tokens);
 
 /** The wider of a declared maximum and the active window it has to contain. */
 const containingWindow = (contextWindow: number | null, declaredMaxWindow: number | null): number | null => {
@@ -210,14 +225,21 @@ export const resolveModelMetadata = (modelId: string, sources: ModelMetadataSour
   const provider = sources.provider ?? null;
   const enrichment = openRouter ? openRouterHint(openRouter) : null;
 
-  // A Codex-served id never advertises more than the subscription bound: the
-  // uploaded window wins when it exists, otherwise the bound replaces what
-  // enrichment would have claimed.
-  const windowHint = statesContext(codex) ? codex : subscription;
-  const contextWindow = firstTokenCount(windowHint?.context_window_tokens, provider?.context_window_tokens, enrichment?.context_window_tokens);
-  const declaredMaxWindow = firstTokenCount(windowHint?.max_context_window_tokens, provider?.max_context_window_tokens, enrichment?.max_context_window_tokens);
-  const declaredAutoCompact = firstTokenCount(windowHint?.auto_compact_token_limit_tokens, provider?.auto_compact_token_limit_tokens);
-  const declaredPercent = windowHint?.effective_context_window_percent ?? provider?.effective_context_window_percent;
+  const resolvedWindow = windowFrom([
+    ["openrouter", hintWindow(enrichment)],
+    ["codex_upload", hintWindow(codex)],
+    ["provider_discovery", hintWindow(provider)],
+    ["codex_subscription", hintWindow(subscription)],
+  ]);
+  const contextWindow = resolvedWindow.tokens;
+  const declaredMaxWindow = windowFrom([
+    ["openrouter", positiveTokenCount(enrichment?.max_context_window_tokens)],
+    ["codex_upload", positiveTokenCount(codex?.max_context_window_tokens)],
+    ["provider_discovery", positiveTokenCount(provider?.max_context_window_tokens)],
+    ["codex_subscription", positiveTokenCount(subscription?.max_context_window_tokens)],
+  ]).tokens;
+  const declaredAutoCompact = firstTokenCount(codex?.auto_compact_token_limit_tokens, provider?.auto_compact_token_limit_tokens);
+  const declaredPercent = codex?.effective_context_window_percent ?? provider?.effective_context_window_percent;
   const reasoning = reasoningFrom(codex, provider, enrichment);
 
   return {
@@ -227,7 +249,7 @@ export const resolveModelMetadata = (modelId: string, sources: ModelMetadataSour
     effective_context_window_percent: positiveTokenCount(declaredPercent) ?? (contextWindow === null ? null : CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT),
     supported_reasoning_levels: reasoning.levels.length ? reasoning.levels : null,
     default_reasoning_effort: reasoning.defaultLevel,
-    context_source: contextSourceOf(codex, subscription, provider, enrichment),
+    context_source: resolvedWindow.source,
     reasoning_source: reasoning.source,
   };
 };
