@@ -2097,3 +2097,169 @@ body[data-page="admin"] [data-key="gateway-error"] [data-meta="usage"] {
   grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 12px;
 }
+
+body[data-page="admin"] [data-model-controls] {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(140px, 200px);
+  align-items: end;
+  gap: 12px;
+}
+
+body[data-page="admin"] [data-model-controls] [data-model-filters],
+body[data-page="admin"] [data-model-controls] [data-check] {
+  grid-column: 1 / -1;
+}
+
+body[data-page="admin"] [data-model-filters] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+body[data-page="admin"] [data-model-filters] button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+body[data-page="admin"] [data-model-filters] button[aria-pressed="true"] {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.11);
+  color: var(--text);
+}
+
+body[data-page="admin"] [data-model-filters] button:disabled {
+  opacity: 0.45;
+}
+
+body[data-page="admin"] [data-model-filter-count] {
+  color: var(--muted-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+body[data-page="admin"] [data-model-status] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+body[data-page="admin"] [data-model-summary] {
+  margin: 0;
+  color: #9ea7b3;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+body[data-page="admin"] [data-model-summary] strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+body[data-page="admin"] [data-model-actions] {
+  align-items: center;
+}
+
+body[data-page="admin"] [data-model-picker] {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 8px;
+  max-height: min(60vh, 680px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+body[data-page="admin"] [data-model-option] {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.032);
+  cursor: pointer;
+  content-visibility: auto;
+  contain-intrinsic-size: 96px;
+}
+
+body[data-page="admin"] [data-model-option]:hover {
+  border-color: rgba(255, 255, 255, 0.13);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+body[data-page="admin"] [data-model-option][data-checked="true"] {
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.075);
+}
+
+body[data-page="admin"] [data-model-option]:focus-within {
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 0 3px var(--focus-ring-soft);
+}
+
+body[data-page="admin"] [data-model-option] input[type="checkbox"] {
+  margin-top: 2px;
+}
+
+body[data-page="admin"] [data-model-body] {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+body[data-page="admin"] [data-model-id] {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+body[data-page="admin"] [data-model-providers] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+body[data-page="admin"] [data-model-provider-badge] {
+  padding: 3px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+body[data-page="admin"] [data-model-meta] {
+  color: #77818e;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+body[data-page="admin"] [data-model-empty] {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 14px 2px;
+  color: #9ea7b3;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+@media (max-width: 760px) {
+  body[data-page="admin"] [data-model-controls] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  body[data-page="admin"] [data-model-picker] {
+    grid-template-columns: minmax(0, 1fr);
+    max-height: none;
+  }
+}

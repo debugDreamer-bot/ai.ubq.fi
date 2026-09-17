@@ -92,7 +92,8 @@ import { acquireKernelDefaultWindowCutover, type KernelDefaultWindowCutoverGuard
 import { listKernelPolicyQueue } from "./kernel_policy_queue.ts";
 import { defaultIncludeLegacyForProfile, importKvMigrationLines, type KvMigrationProfile, validateKvMigrationTarget } from "./kv_migration.ts";
 import { getKv } from "./kv.ts";
-import { loadCodexModelsWhitelist, storeCodexModelsWhitelist } from "./codex_models_whitelist.ts";
+import { loadCodexModelsWhitelist, normalizeWhitelistModelIds, storeCodexModelsWhitelist } from "./codex_models_whitelist.ts";
+import { buildModelCatalogSnapshot } from "./openai.ts";
 import { listCodexResetShadowDecisions } from "./codex_banked_reset.ts";
 import {
   assertPromptCacheScopeExperimentTelemetryBaseline,
@@ -610,7 +611,7 @@ export const handleAdminCodexPromptsPurge = async (): Promise<Response> => {
 export const handleAdminCodexModelsWhitelistGet = async (): Promise<Response> => {
   const kv = await getKv();
   if (!kv) {
-    return openaiError(500, "Deno KV is not available; cannot read model whitelist", "server_error");
+    return openaiError(500, "Deno KV is not available; cannot read model whitelist", "server_error", { type: "server_error" });
   }
   const whitelist = await loadCodexModelsWhitelist(kv);
   if (!whitelist) {
@@ -619,10 +620,42 @@ export const handleAdminCodexModelsWhitelistGet = async (): Promise<Response> =>
   return json(200, { ok: true, data: { model_ids: [...whitelist.model_ids], updated_at_ms: whitelist.updated_at_ms } });
 };
 
+/**
+ * Operator-facing model picker data: the complete discovered catalog (including
+ * every model the whitelist currently hides) plus the stored whitelist, so the
+ * admin console can render one consistent checkbox list from a single read.
+ *
+ * `buildCatalog` is injectable for tests, matching the other admin handlers.
+ */
+export const handleAdminModelsCatalogGet = async (dependencies: Readonly<{ buildCatalog?: typeof buildModelCatalogSnapshot }> = {}): Promise<Response> => {
+  const kv = await getKv();
+  if (!kv) {
+    return openaiError(500, "Deno KV is not available; cannot read the model catalog", "server_error", { type: "server_error" });
+  }
+  const buildCatalog = dependencies.buildCatalog ?? buildModelCatalogSnapshot;
+  const [catalog, whitelist] = await Promise.all([buildCatalog(), loadCodexModelsWhitelist(kv)]);
+  const modelIds = whitelist ? [...whitelist.model_ids] : [];
+  return json(
+    200,
+    {
+      ok: true,
+      data: {
+        models: catalog.models,
+        sources: catalog.sources,
+        whitelist: { model_ids: modelIds, updated_at_ms: whitelist?.updated_at_ms ?? 0 },
+        // An empty (or absent) whitelist applies no filter at all, which is the
+        // documented behaviour the picker has to explain to the operator.
+        filter_active: modelIds.length > 0,
+      },
+    },
+    { "Cache-Control": "no-store" }
+  );
+};
+
 export const handleAdminCodexModelsWhitelistSet = async (req: Request): Promise<Response> => {
   const kv = await getKv();
   if (!kv) {
-    return openaiError(500, "Deno KV is not available; cannot store model whitelist", "server_error");
+    return openaiError(500, "Deno KV is not available; cannot store model whitelist", "server_error", { type: "server_error" });
   }
   const raw = await readJsonBody(req);
   if (!raw || !isRecord(raw)) return openaiError(400, "Invalid JSON body", "invalid_request_error");
@@ -630,10 +663,19 @@ export const handleAdminCodexModelsWhitelistSet = async (req: Request): Promise<
   if (!Array.isArray(rawIds)) {
     return openaiError(400, "model_ids must be an array", "invalid_request_error");
   }
-  const modelIds = rawIds.map((id: unknown) => (typeof id === "string" ? id.trim() : "")).filter((id: string) => id.length > 0);
+  // Every entry has to be a string: silently dropping a bad entry would store a
+  // selection the operator never made, and the console would show it as saved.
+  if (rawIds.some((id: unknown) => typeof id !== "string")) {
+    return openaiError(400, "model_ids must contain only strings", "invalid_request_error");
+  }
+  const modelIds = normalizeWhitelistModelIds(rawIds);
+  const size = estimateJsonSize({ model_ids: modelIds });
+  if (size === null || size > SAFE_KV_BYTES) {
+    return openaiError(413, `model_ids payload too large (max ${MAX_KV_BYTES} bytes).`, "invalid_request_error");
+  }
   const stored = await storeCodexModelsWhitelist(kv, modelIds);
   if (!stored) {
-    return openaiError(500, "Deno KV is not available; cannot persist model whitelist", "server_error");
+    return openaiError(500, "Deno KV is not available; cannot persist model whitelist", "server_error", { type: "server_error" });
   }
   return json(200, { ok: true, stored: true, model_ids: modelIds, updated_at_ms: Date.now() });
 };

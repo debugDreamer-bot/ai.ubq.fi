@@ -21,7 +21,7 @@ import {
 } from "./auth-relay.js?v=passkey-relay-20260823-v4";
 import { createAdminSnapshotCache } from "./admin-cache.js?v=admin-indexeddb-cache-20260830-v7";
 import { bindForegroundRefresh } from "./foreground-refresh.js";
-import { setReasoningPlaceholder, updateReasoningSelectForModel } from "./reasoning-select.js";
+import { getRecentModelReasoning, setReasoningPlaceholder, updateReasoningSelectForModel } from "./reasoning-select.js";
 import { toast } from "./toast.js?v=20260903-toast-v1";
 
 const STORAGE_KEYS = {
@@ -211,9 +211,21 @@ const errorsBadge = mustGet("errors-badge");
 const errorsUpdated = mustGet("errors-updated");
 const errorsList = mustGet("errors-list");
 
-const modelsWhitelistInput = mustGet("models-whitelist-input");
 const modelsWhitelistSave = mustGet("models-whitelist-save");
 const modelsWhitelistBadge = mustGet("models-whitelist-badge");
+const modelsSearchInput = mustGet("models-whitelist-search");
+const modelsSortSelect = mustGet("models-whitelist-sort");
+const modelsOnlySelectedInput = mustGet("models-whitelist-only-selected");
+const modelsCheckAllBtn = mustGet("models-whitelist-check-all");
+const modelsUncheckAllBtn = mustGet("models-whitelist-uncheck-all");
+const modelsInvertBtn = mustGet("models-whitelist-invert");
+const modelsDropMissingBtn = mustGet("models-whitelist-drop-missing");
+const modelsDiscardBtn = mustGet("models-whitelist-discard");
+const modelsReloadBtn = mustGet("models-whitelist-reload");
+const modelsSummary = mustGet("models-whitelist-summary");
+const modelsWarning = mustGet("models-whitelist-warning");
+const modelsList = mustGet("models-whitelist-list");
+const modelsProviderButtons = [...document.querySelectorAll("[data-model-provider]")];
 
 const providerCapacityBadge = mustGet("provider-capacity-badge");
 const providerCapacityUpdated = mustGet("provider-capacity-updated");
@@ -7996,80 +8008,520 @@ const loadDefaults = async (options = {}) => {
   }
 };
 
-let modelsWhitelistLoadedAt = 0;
+// ── Model whitelist picker ───────────────────────────────────────────────────
+// The public Models page renders providers, reasoning tiers, and context sizes
+// for each catalog entry; this panel reuses that presentation with a checkbox
+// per model so an operator can switch visibility on and off.
+const MODEL_PROVIDER_LABELS = { codex: "Codex", openlux: "Metered 2", surplus: "Metered 1" };
+const MODEL_PROVIDER_IDS = ["codex", "openlux", "surplus"];
+const MODEL_REASONING_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+const MODEL_TOKEN_FORMAT = new Intl.NumberFormat("en-US");
+const MODEL_DATE_FORMAT = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "2-digit" });
+const MODEL_SORT_STORAGE_KEY = "uos_ai.admin.models_sort";
+const MODEL_PROVIDER_STORAGE_KEY = "uos_ai.admin.models_provider";
+const MODEL_ONLY_SELECTED_STORAGE_KEY = "uos_ai.admin.models_only_selected";
 
-const setModelsWhitelistBadge = (state, text) => {
-  modelsWhitelistBadge.dataset.state = state;
-  modelsWhitelistBadge.textContent = text;
+/** Discovered catalog entries, the staged selection, and the last saved selection. */
+let modelsCatalog = [];
+let modelsCatalogSources = {};
+let modelsSelection = new Set();
+let modelsSavedSelection = new Set();
+let modelsProviderFilter = "all";
+let modelsVisibleIds = new Set();
+let modelsLoadedAt = 0;
+let modelsLoadId = 0;
+let modelsSaving = false;
+let modelsSaveError = "";
+
+const setModelsWhitelistBadge = (state, text) => setBadge(modelsWhitelistBadge, state, text);
+
+const modelsSelectedIds = () => [...modelsSelection].sort();
+
+/**
+ * Saved identifiers the discovered catalog no longer contains. They cannot be
+ * unchecked from the picker, and while they are saved they keep the filter
+ * active, so the panel has to surface them and offer to drop them.
+ */
+const modelsMissingIds = () => {
+  const catalogIds = new Set(modelsCatalog.map((entry) => entry.id));
+  return [...modelsSelection].filter((id) => !catalogIds.has(id)).sort();
 };
 
-const loadModelsWhitelist = async () => {
-  const token = getAdminToken();
-  if (!token && sessionStatus !== "authenticated") {
-    setModelsWhitelistBadge("bad", "Missing token");
+const modelsHasUnsavedChanges = () =>
+  modelsSelection.size !== modelsSavedSelection.size ||
+  [...modelsSelection].some((id) => !modelsSavedSelection.has(id));
+
+const modelsSelectionFromIds = (ids) =>
+  new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id) : []);
+
+const modelsPositiveTokenCount = (
+  value,
+) => (typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null);
+
+const modelsCreatedSeconds = (entry) =>
+  typeof entry?.created === "number" && Number.isSafeInteger(entry.created) && entry.created > 0 ? entry.created : 0;
+
+/** Reasoning tiers advertised by an entry, ordered from cheapest to most expensive. */
+const modelsReasoningLevels = (value) => {
+  if (!Array.isArray(value)) return [];
+  const levels = value
+    .map((level) => (typeof level === "string" ? level : level?.effort))
+    .filter((level) => typeof level === "string" && level.length > 0);
+  return [...new Set(levels)].sort((left, right) => {
+    const leftIndex = MODEL_REASONING_ORDER.indexOf(left);
+    const rightIndex = MODEL_REASONING_ORDER.indexOf(right);
+    return (leftIndex < 0 ? MODEL_REASONING_ORDER.length : leftIndex) -
+      (rightIndex < 0 ? MODEL_REASONING_ORDER.length : rightIndex);
+  });
+};
+
+const modelsReasoningFor = (entry) => {
+  const advertised = modelsReasoningLevels(entry?.supported_reasoning_levels);
+  if (advertised.length) {
+    return {
+      modelClass: entry.model_class ?? null,
+      levels: advertised,
+      defaultLevel: entry.default_reasoning_effort ?? null,
+    };
+  }
+  return getRecentModelReasoning(entry?.id);
+};
+
+const modelsEntryMatchesQuery = (entry, query) => {
+  if (!query) return true;
+  const reasoning = modelsReasoningFor(entry);
+  const contextWindow = modelsPositiveTokenCount(entry.context_window_tokens);
+  const maxContextWindow = modelsPositiveTokenCount(entry.max_context_window_tokens);
+  const autoCompact = modelsPositiveTokenCount(entry.auto_compact_token_limit_tokens);
+  const contextSearch = [
+    entry.model_class,
+    contextWindow && MODEL_TOKEN_FORMAT.format(contextWindow),
+    maxContextWindow && MODEL_TOKEN_FORMAT.format(maxContextWindow),
+    autoCompact && MODEL_TOKEN_FORMAT.format(autoCompact),
+    contextWindow ? "context compact compression" : "",
+  ].filter(Boolean).join(" ").toLowerCase();
+  return String(entry.id ?? "").toLowerCase().includes(query) ||
+    (entry.providers ?? []).some((provider) =>
+      (MODEL_PROVIDER_LABELS[provider.id] ?? provider.id).toLowerCase().includes(query)
+    ) ||
+    reasoning?.modelClass?.includes(query) ||
+    reasoning?.levels?.some((level) => level.includes(query)) ||
+    contextSearch.includes(query);
+};
+
+const modelsFilterIsActive = () =>
+  modelsProviderFilter !== "all" || modelsOnlySelectedInput.checked || modelsSearchInput.value.trim().length > 0;
+
+/** Entries passing the current search, provider, and checked-only filters, in the selected order. */
+const modelsVisibleEntries = () => {
+  const query = modelsSearchInput.value.trim().toLowerCase();
+  const onlySelected = modelsOnlySelectedInput.checked;
+  const visible = modelsCatalog.filter((entry) => {
+    if (
+      modelsProviderFilter !== "all" &&
+      !(entry.providers ?? []).some((provider) => provider.id === modelsProviderFilter)
+    ) return false;
+    if (onlySelected && !modelsSelection.has(entry.id)) return false;
+    return modelsEntryMatchesQuery(entry, query);
+  });
+  const sorted = modelsSortSelect.value === "created"
+    ? visible.sort((left, right) =>
+      modelsCreatedSeconds(right) - modelsCreatedSeconds(left) || left.id.localeCompare(right.id)
+    )
+    : visible.sort((left, right) => left.id.localeCompare(right.id));
+  return sorted;
+};
+
+const modelsProviderCounts = () => {
+  const counts = new Map([["all", modelsCatalog.length], ...MODEL_PROVIDER_IDS.map((id) => [id, 0])]);
+  for (const entry of modelsCatalog) {
+    for (const provider of entry.providers ?? []) {
+      if (counts.has(provider.id)) counts.set(provider.id, counts.get(provider.id) + 1);
+    }
+  }
+  return counts;
+};
+
+const buildModelOption = (entry) => {
+  const id = entry.id;
+  const option = document.createElement("label");
+  option.dataset.modelOption = "";
+  option.dataset.modelId = id;
+  option.dataset.checked = modelsSelection.has(id) ? "true" : "false";
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.dataset.modelToggle = id;
+  checkbox.checked = modelsSelection.has(id);
+
+  const body = document.createElement("span");
+  body.dataset.modelBody = "";
+
+  const name = document.createElement("span");
+  name.dataset.modelName = "";
+  name.textContent = id;
+  body.append(name);
+
+  const providers = document.createElement("span");
+  providers.dataset.modelProviders = "";
+  for (const provider of entry.providers ?? []) {
+    const badge = document.createElement("span");
+    badge.dataset.modelProviderBadge = "";
+    badge.textContent = MODEL_PROVIDER_LABELS[provider.id] ?? provider.id;
+    badge.title = (provider.supported_endpoints ?? []).join(", ");
+    providers.append(badge);
+  }
+  if (providers.childElementCount) body.append(providers);
+
+  const facts = [];
+  const contextWindow = modelsPositiveTokenCount(entry.context_window_tokens);
+  if (contextWindow) facts.push(`Context ${MODEL_TOKEN_FORMAT.format(contextWindow)}`);
+  const reasoning = modelsReasoningFor(entry);
+  if (reasoning?.levels?.length) facts.push(`Reasoning ${reasoning.levels.join(", ")}`);
+  const created = modelsCreatedSeconds(entry);
+  if (created) facts.push(`Added ${MODEL_DATE_FORMAT.format(new Date(created * 1000))}`);
+  if (facts.length) {
+    const meta = document.createElement("span");
+    meta.dataset.modelMeta = "";
+    meta.textContent = facts.join(" · ");
+    body.append(meta);
+  }
+
+  option.append(checkbox, body);
+  return option;
+};
+
+const renderModelsMessage = (message) => {
+  const empty = document.createElement("p");
+  empty.dataset.modelEmpty = "";
+  empty.textContent = message;
+  modelsList.replaceChildren(empty);
+};
+
+/** Drop the loaded catalog and both selections, e.g. after the token or target changes. */
+const invalidateAdminModels = (message) => {
+  modelsLoadId += 1;
+  modelsSaving = false;
+  modelsCatalog = [];
+  modelsCatalogSources = {};
+  modelsSelection = new Set();
+  modelsSavedSelection = new Set();
+  modelsVisibleIds = new Set();
+  modelsLoadedAt = 0;
+  modelsSaveError = "";
+  setModelsWhitelistBadge("unknown", "Not loaded");
+  renderModelsMessage(message);
+  updateModelsStatus();
+};
+
+const modelsCatalogWarning = () => {
+  const unavailable = MODEL_PROVIDER_IDS
+    .filter((id) => modelsCatalogSources?.[id]?.status && modelsCatalogSources[id].status !== "available")
+    .map((id) => MODEL_PROVIDER_LABELS[id]);
+  if (!unavailable.length) return "";
+  return `${
+    unavailable.join(", ")
+  } could not be read, so those models are missing from this list. Reload before saving a selection.`;
+};
+
+const modelsMissingWarning = () => {
+  const missing = modelsMissingIds();
+  if (!missing.length) return "";
+  const shown = missing.slice(0, 5).join(", ");
+  const rest = missing.length > 5 ? `, and ${formatNumber(missing.length - 5)} more` : "";
+  return `${formatNumber(missing.length)} saved model ${
+    missing.length === 1 ? "identifier is" : "identifiers are"
+  } missing from the catalog: ${shown}${rest}.`;
+};
+
+const modelsDefaultModelWarning = () => {
+  if (modelsSelection.size === 0 || !defaultsLoaded) return "";
+  const defaultModel = defaultsModelSelect.value.trim();
+  if (!defaultModel || modelsSelection.has(defaultModel)) return "";
+  return `The default model ${defaultModel} is not checked, so it will disappear from /v1/models while this selection is saved.`;
+};
+
+const updateModelsStatus = () => {
+  const total = modelsCatalog.length;
+  const selected = modelsSelection.size;
+  const visibleCount = modelsVisibleIds.size;
+  const visibleChecked = [...modelsVisibleIds].filter((id) => modelsSelection.has(id)).length;
+  const unsaved = modelsHasUnsavedChanges();
+  const saving = modelsSaving;
+
+  const missing = modelsMissingIds();
+  modelsSummary.textContent = !modelsLoadedAt && total === 0
+    ? "Waiting for the catalog."
+    : total === 0
+    ? "No models were discovered from the configured providers."
+    : selected === 0
+    ? `No models checked: the filter is off, so all ${formatNumber(total)} discovered models stay listed.`
+    : `${formatNumber(selected)} of ${formatNumber(total)} models checked: only those stay listed.` +
+      (missing.length ? ` ${formatNumber(missing.length)} of them are missing from the catalog.` : "") +
+      (visibleCount < total ? ` Showing ${formatNumber(visibleCount)}.` : "");
+
+  const warnings = [modelsCatalogWarning(), modelsMissingWarning(), modelsDefaultModelWarning()].filter(Boolean);
+  modelsWarning.textContent = warnings.join(" ");
+  modelsWarning.hidden = warnings.length === 0;
+
+  if (saving) setModelsWhitelistBadge("busy", "Saving...");
+  else if (modelsSaveError) setModelsWhitelistBadge("bad", modelsSaveError);
+  else if (unsaved) setModelsWhitelistBadge("warning", "Unsaved changes");
+  else if (modelsLoadedAt) {
+    setModelsWhitelistBadge("ok", selected === 0 ? "No filter" : `${formatNumber(selected)} checked`);
+  } else setModelsWhitelistBadge("unknown", "Not loaded");
+
+  const counts = modelsProviderCounts();
+  for (const button of modelsProviderButtons) {
+    const id = button.dataset.modelProvider;
+    const count = counts.get(id) ?? 0;
+    button.setAttribute("aria-pressed", id === modelsProviderFilter ? "true" : "false");
+    button.disabled = id !== "all" && count === 0;
+    const countElement = button.querySelector("[data-model-filter-count]");
+    if (countElement) countElement.textContent = formatNumber(count);
+  }
+
+  modelsCheckAllBtn.disabled = saving || visibleCount === 0 || visibleChecked === visibleCount;
+  modelsUncheckAllBtn.disabled = saving || visibleChecked === 0;
+  modelsInvertBtn.disabled = saving || visibleCount === 0;
+  const scoped = modelsFilterIsActive();
+  modelsCheckAllBtn.textContent = scoped
+    ? `Check ${formatNumber(visibleCount)} shown`
+    : `Check all ${formatNumber(visibleCount)}`;
+  modelsUncheckAllBtn.textContent = scoped
+    ? `Uncheck ${formatNumber(visibleCount)} shown`
+    : `Uncheck all ${formatNumber(visibleCount)}`;
+  modelsDiscardBtn.disabled = saving || !unsaved;
+  modelsWhitelistSave.disabled = saving || !unsaved;
+  modelsDropMissingBtn.disabled = saving || missing.length === 0;
+  modelsDropMissingBtn.textContent = missing.length
+    ? `Remove ${formatNumber(missing.length)} missing`
+    : "Remove missing";
+  modelsDropMissingBtn.hidden = modelsCatalog.length === 0;
+};
+
+const renderModelsPicker = () => {
+  const visible = modelsVisibleEntries();
+  modelsVisibleIds = new Set(visible.map((entry) => entry.id));
+  if (!modelsCatalog.length) {
+    renderModelsMessage(modelsLoadedAt ? "No models discovered." : "Loading catalog…");
+  } else if (!visible.length) {
+    renderModelsMessage(
+      modelsOnlySelectedInput.checked
+        ? "No checked model matches the current filters."
+        : "No model matches the current filters.",
+    );
+  } else {
+    modelsList.replaceChildren(...visible.map(buildModelOption));
+  }
+  updateModelsStatus();
+};
+
+const applyModelsSelection = (mutate) => {
+  modelsSaveError = "";
+  mutate(modelsVisibleEntries());
+  if (modelsOnlySelectedInput.checked) {
+    renderModelsPicker();
     return;
   }
+  for (const option of modelsList.querySelectorAll("[data-model-option]")) {
+    const id = option.dataset.modelId;
+    const checked = typeof id === "string" && modelsSelection.has(id);
+    const checkbox = option.querySelector("input[type=checkbox]");
+    if (checkbox) checkbox.checked = checked;
+    option.dataset.checked = checked ? "true" : "false";
+  }
+  updateModelsStatus();
+};
+
+const loadModelsWhitelist = async (options = {}) => {
+  const token = getAdminToken();
+  if (!token && !hasAdminCredential()) {
+    setModelsWhitelistBadge("bad", "Missing token");
+    renderModelsMessage("Sign in to load the model catalog.");
+    return;
+  }
+  // Reopening the tab must not discard a selection the operator has not saved yet.
+  if (modelsHasUnsavedChanges() && options.force !== true) {
+    setModelsWhitelistBadge("warning", "Unsaved changes");
+    return;
+  }
+  const loadId = ++modelsLoadId;
+  setModelsWhitelistBadge("unknown", modelsLoadedAt ? "Cached · refreshing" : "Loading...");
   try {
-    const headers = { "Cache-Control": "no-cache" };
-    if (token) headers["Authorization"] = "Bearer " + token;
-    const response = await fetch(apiUrl("/admin/models/whitelist"), { headers });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      setModelsWhitelistBadge("bad", "Failed to load");
-      console.error("whitelist load failed:", response.status, text);
+    const response = await fetch(apiUrl("/admin/models/catalog"), {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+    const payload = await response.json().catch(() => null);
+    if (loadId !== modelsLoadId) return;
+    if (!response.ok || !Array.isArray(payload?.data?.models)) {
+      if (modelsLoadedAt) {
+        setModelsWhitelistBadge("unknown", "Cached · refresh unavailable");
+        return;
+      }
+      setModelsWhitelistBadge("bad", payload?.error?.message ?? "Failed to load");
+      renderModelsMessage(payload?.error?.message ?? "The model catalog could not be loaded.");
       return;
     }
-    const body = await response.json();
-    const ids = body?.data?.model_ids;
-    if (Array.isArray(ids)) {
-      modelsWhitelistInput.value = ids.join("\n");
-    } else {
-      modelsWhitelistInput.value = "";
-    }
-    modelsWhitelistLoadedAt = Date.now();
-    setModelsWhitelistBadge("ok", "Loaded");
+    modelsCatalog = payload.data.models.filter((entry) => typeof entry?.id === "string" && entry.id);
+    modelsCatalogSources = payload.data.sources ?? {};
+    modelsSavedSelection = modelsSelectionFromIds(payload.data.whitelist?.model_ids);
+    modelsSelection = new Set(modelsSavedSelection);
+    modelsSaveError = "";
+    modelsLoadedAt = Date.now();
+    renderModelsPicker();
   } catch (error) {
-    if (modelsWhitelistLoadedAt) {
-      setModelsWhitelistBadge("unknown", "Offline");
+    if (loadId !== modelsLoadId) return;
+    if (modelsLoadedAt) {
+      setModelsWhitelistBadge("unknown", "Cached · offline");
       return;
     }
     setModelsWhitelistBadge("bad", "Offline");
-    console.error("whitelist load error:", error);
+    renderModelsMessage("The model catalog could not be loaded.");
+    console.error("model catalog load error:", error);
   }
 };
 
 const saveModelsWhitelist = async () => {
   const token = getAdminToken();
-  if (!token) {
+  if (!token && !hasAdminCredential()) {
     setModelsWhitelistBadge("bad", "Missing token");
     return;
   }
-  setModelsWhitelistBadge("busy", "Saving...");
+  if (modelsSaving || !modelsHasUnsavedChanges()) return;
+  modelsSaving = true;
+  modelsSaveError = "";
+  updateModelsStatus();
   try {
-    const raw = modelsWhitelistInput.value;
-    const modelIds = raw
-      .split(/[\r\n]+/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
     const response = await fetch(apiUrl("/admin/models/whitelist"), {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ model_ids: modelIds }),
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify({ model_ids: modelsSelectedIds() }),
     });
+    const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      setModelsWhitelistBadge("bad", "Failed to save");
-      console.error("whitelist save failed:", response.status, text);
+      modelsSaving = false;
+      modelsSaveError = "Failed to save";
+      toast.error("Save failed", { description: payload?.error?.message ?? `HTTP ${response.status}` });
+      updateModelsStatus();
       return;
     }
-    setModelsWhitelistBadge("ok", "Saved");
+    modelsSaving = false;
+    modelsSaveError = "";
+    modelsSavedSelection = modelsSelectionFromIds(payload?.model_ids ?? modelsSelectedIds());
+    modelsSelection = new Set(modelsSavedSelection);
+    modelsLoadedAt = Date.now();
+    renderModelsPicker();
+    toast.success(
+      modelsSelection.size === 0 ? "Filter cleared" : `${formatNumber(modelsSelection.size)} models listed`,
+      {
+        description: modelsSelection.size === 0
+          ? "Every discovered model is listed again."
+          : "Unchecked models are hidden from the public catalog.",
+      },
+    );
   } catch (error) {
-    setModelsWhitelistBadge("bad", "Save error");
-    console.error("whitelist save error:", error);
+    modelsSaving = false;
+    modelsSaveError = "Save error";
+    toast.error("Save failed", { description: "Offline" });
+    updateModelsStatus();
+    console.error("model whitelist save error:", error);
   }
 };
 
-modelsWhitelistSave.addEventListener("click", saveModelsWhitelist);
+const discardModelsChanges = () => {
+  if (!modelsHasUnsavedChanges()) return;
+  modelsSaveError = "";
+  modelsSelection = new Set(modelsSavedSelection);
+  renderModelsPicker();
+  toast.success("Changes discarded");
+};
+
+const reloadModelsWhitelist = () => {
+  if (modelsHasUnsavedChanges() && !globalThis.confirm("Discard the unsaved model selection and reload?")) return;
+  modelsSelection = new Set(modelsSavedSelection);
+  void loadModelsWhitelist({ force: true });
+};
+
+const readModelsFilterPreference = (key, fallback, allowed) => {
+  const stored = storage.get(key);
+  return allowed.includes(stored) ? stored : fallback;
+};
+
+modelsProviderFilter = readModelsFilterPreference(MODEL_PROVIDER_STORAGE_KEY, "all", ["all", ...MODEL_PROVIDER_IDS]);
+modelsSortSelect.value = readModelsFilterPreference(MODEL_SORT_STORAGE_KEY, "id", ["id", "created"]);
+modelsOnlySelectedInput.checked = storage.get(MODEL_ONLY_SELECTED_STORAGE_KEY) === "1";
+
+for (const button of modelsProviderButtons) {
+  button.addEventListener("click", () => {
+    modelsProviderFilter = button.dataset.modelProvider ?? "all";
+    storage.set(MODEL_PROVIDER_STORAGE_KEY, modelsProviderFilter);
+    renderModelsPicker();
+  });
+}
+
+modelsSearchInput.addEventListener("input", renderModelsPicker);
+modelsSortSelect.addEventListener("change", () => {
+  storage.set(MODEL_SORT_STORAGE_KEY, modelsSortSelect.value);
+  renderModelsPicker();
+});
+modelsOnlySelectedInput.addEventListener("change", () => {
+  storage.set(MODEL_ONLY_SELECTED_STORAGE_KEY, modelsOnlySelectedInput.checked ? "1" : "0");
+  renderModelsPicker();
+});
+
+modelsList.addEventListener("change", (event) => {
+  const checkbox = event.target;
+  if (!(checkbox instanceof HTMLInputElement) || checkbox.type !== "checkbox") return;
+  const id = checkbox.dataset.modelToggle;
+  if (!id) return;
+  modelsSaveError = "";
+  if (checkbox.checked) modelsSelection.add(id);
+  else modelsSelection.delete(id);
+  const option = checkbox.closest("[data-model-option]");
+  if (option) option.dataset.checked = checkbox.checked ? "true" : "false";
+  if (modelsOnlySelectedInput.checked) renderModelsPicker();
+  else updateModelsStatus();
+});
+
+modelsCheckAllBtn.addEventListener("click", () => {
+  applyModelsSelection((visible) => {
+    for (const entry of visible) modelsSelection.add(entry.id);
+  });
+});
+
+modelsUncheckAllBtn.addEventListener("click", () => {
+  applyModelsSelection((visible) => {
+    for (const entry of visible) modelsSelection.delete(entry.id);
+  });
+});
+
+modelsInvertBtn.addEventListener("click", () => {
+  applyModelsSelection((visible) => {
+    for (const entry of visible) {
+      if (modelsSelection.has(entry.id)) modelsSelection.delete(entry.id);
+      else modelsSelection.add(entry.id);
+    }
+  });
+});
+
+modelsDropMissingBtn.addEventListener("click", () => {
+  const missing = modelsMissingIds();
+  if (!missing.length) return;
+  for (const id of missing) modelsSelection.delete(id);
+  modelsSaveError = "";
+  renderModelsPicker();
+  toast.success(
+    `Removed ${formatNumber(missing.length)} missing ${missing.length === 1 ? "identifier" : "identifiers"}`,
+  );
+});
+
+modelsDiscardBtn.addEventListener("click", discardModelsChanges);
+modelsReloadBtn.addEventListener("click", reloadModelsWhitelist);
+modelsWhitelistSave.addEventListener("click", () => {
+  void saveModelsWhitelist();
+});
 
 const saveDefaults = async () => {
   if (!defaultsLoaded) return;
@@ -8401,6 +8853,7 @@ tokenInput.addEventListener("input", () => {
   }
   persistTokenIfEnabled();
   invalidateAdminErrors("Sign in to load gateway errors.");
+  invalidateAdminModels("Sign in to load the model catalog.");
   keysLoadedAt = 0;
   passkeyUsersLoadedAt = 0;
   defaultsLoaded = false;
@@ -8592,6 +9045,7 @@ baseSelect.addEventListener("change", () => {
   setKeysBadge("unknown", "Not loaded");
   setPasskeyUsersBadge("unknown", "Not loaded");
   invalidateAdminErrors("Target changed. Sign in to load gateway errors.");
+  invalidateAdminModels("Target changed. Loading the model catalog...");
   setDefaultsBadge("unknown", "Idle");
   setKernelListBadge("unknown", "Not loaded");
   setKernelNewBadge("unknown", "Idle");
