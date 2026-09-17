@@ -673,6 +673,17 @@ directly without the baked-in flag:
 deno serve --host 127.0.0.1 --allow-env --allow-net --allow-read --unstable-kv serve.ts
 ```
 
+A loopback server with disabled admin authentication also provisions one unrestricted API key named
+`Local development (loopback)` in its own KV at startup, and every local inference request is authenticated as that key.
+Local requests are therefore a super-admin principal with no request limit and unlimited paid-provider routing instead
+of a policy-free one — which is why `/chat` needs no sign-in locally and why models that route directly to a paid
+provider (for example while Codex is switched off in the provider picker) still answer. The key's credential is minted,
+stored, and never printed; nothing authenticates with it as a bearer token. Revoke it in `/admin` to switch local
+paid-provider routing off — local requests then fall back to the policy-free principal and paid-only models are refused
+— unrevoke it to restore the behavior, and delete it to have the next local start provision a fresh key with the current
+pricing. Provisioning is gated on the loopback-only `--disable-admin-auth` flag, so it never runs on a hosted
+deployment.
+
 The equivalent direct command that mirrors the dev task's behavior must place the application flag after the entry
 point:
 

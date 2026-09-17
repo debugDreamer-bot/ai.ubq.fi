@@ -4,6 +4,7 @@ import {
   formatAuthSessionLabel,
   hasAuthPasskeyCredential,
   hasStoredPasskeyCredentials,
+  isLocalDevelopmentOrigin,
   registerPasskey,
   resolveBackendBase,
   signInWithPasskey,
@@ -115,13 +116,36 @@ const buildBackendAwareMessage = (baseUrl, fallback) => {
   return `${fallback} Re-sign in on the active backend at ${target}.`;
 };
 
+// The loopback development server disables client auth and authenticates every
+// local request as its own unlimited super-admin principal. `localDevelopmentAuth`
+// records that this page probed the active backend and was told so, which is what
+// lets the composer work with no token at all.
+let localDevelopmentAuth = false;
+
+const LOCAL_DEVELOPMENT_PRINCIPAL = "local-development";
+
+/** Bearer headers for a token, or none in loopback development mode. */
+const authHeaders = (token = "") => {
+  const trimmed = String(token ?? "").trim();
+  return trimmed ? { Authorization: `Bearer ${trimmed}` } : {};
+};
+
+/** The identity the model catalog was loaded for: a token, or the local principal. */
+const currentPrincipal = () => tokenInput.value.trim() || (localDevelopmentAuth ? LOCAL_DEVELOPMENT_PRINCIPAL : "");
+
+const clearLocalDevelopmentAuth = () => {
+  localDevelopmentAuth = false;
+};
+
 const setSignedInState = (signedIn, options = {}) => {
+  const localDevelopment = localDevelopmentAuth && !signedIn && !tokenInput.value.trim();
   const deviceRegistered = options.deviceRegistered ?? hasStoredPasskeyCredentials();
   const canRegisterPasskey = options.canRegisterPasskey ?? false;
-  passkeyLoginBtn.hidden = signedIn;
-  passkeyRegisterBtn.hidden = deviceRegistered || (signedIn && !canRegisterPasskey);
-  signOutBtn.hidden = !signedIn;
+  passkeyLoginBtn.hidden = signedIn || localDevelopment;
+  passkeyRegisterBtn.hidden = localDevelopment || deviceRegistered || (signedIn && !canRegisterPasskey);
+  signOutBtn.hidden = !signedIn || localDevelopment;
   if (signedIn) setPasskeyStatus("ok", options.statusText ?? "Token active");
+  else if (localDevelopment) setPasskeyStatus("ok", "Auth disabled on this loopback server");
   else setPasskeyStatus("unknown", "Passkey idle");
 };
 
@@ -225,7 +249,7 @@ const setReasoningPlaceholder = (label) => {
 const loadDefaultModelFromAdmin = async (token, baseUrl) => {
   try {
     const response = await fetch(buildBackendUrl("/admin/defaults", baseUrl), {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: authHeaders(token),
       cache: "no-store",
     });
     if (!response.ok) return "";
@@ -291,21 +315,22 @@ const resetModelCatalog = (label = "Authenticate to load models") => {
 
 const loadModels = async (token, options = {}) => {
   const trimmed = token.trim();
-  if (!trimmed) return;
-  if (!options.force && trimmed === modelsLoadedToken) return;
+  const principal = trimmed || (localDevelopmentAuth ? LOCAL_DEVELOPMENT_PRINCIPAL : "");
+  if (!principal) return;
+  if (!options.force && principal === modelsLoadedToken) return;
   const requestId = ++modelsRequestId;
   const backendBase = getActiveBackendBase();
   try {
     const [modelsResponse, capabilitiesResponse, defaultsResponse] = await Promise.all([
       fetch(buildBackendUrl("/v1/models", backendBase), {
-        headers: { Authorization: `Bearer ${trimmed}` },
+        headers: authHeaders(trimmed),
         cache: "no-store",
       }).then(
         async (res) => ({ res, data: await res.json().catch(() => null) }),
       ),
       fetch(
         buildBackendUrl("/uos/models/capabilities", backendBase),
-        { headers: { Authorization: `Bearer ${trimmed}` }, cache: "no-store" },
+        { headers: authHeaders(trimmed), cache: "no-store" },
       ).then(
         async (res) => ({ res, data: await res.json().catch(() => null) }),
       ).catch((error) => ({ error })),
@@ -316,7 +341,7 @@ const loadModels = async (token, options = {}) => {
     ]);
     const { res, data } = modelsResponse;
     if (requestId !== modelsRequestId) return;
-    if (trimmed !== tokenInput.value.trim()) return;
+    if (principal !== currentPrincipal()) return;
     if (!res.ok) {
       if (res.status === 401) {
         setModelPlaceholder(buildBackendAwareMessage(backendBase, "Auth failed for the configured backend."));
@@ -357,7 +382,7 @@ const loadModels = async (token, options = {}) => {
     } else if (selected) {
       preferredModel = selected;
     }
-    modelsLoadedToken = trimmed;
+    modelsLoadedToken = principal;
     preferredReasoningEffort = updateReasoningForModel(selected || modelInput.value.trim(), preferredReasoningEffort) ??
       "";
     updateStreamControl(selected || modelInput.value.trim());
@@ -400,6 +425,7 @@ const checkAuthToken = async () => {
     }
     const mode = data?.auth?.mode;
     setAuthBadge("ok", mode ? `OK (${mode})` : "OK");
+    clearLocalDevelopmentAuth();
     setSignedInState(true, {
       canRegisterPasskey: data?.auth?.is_admin === true,
       deviceRegistered: hasAuthPasskeyCredential(data?.auth) || hasStoredPasskeyCredentials(),
@@ -411,6 +437,50 @@ const checkAuthToken = async () => {
     setAuthBadge("bad", "Offline");
     setSignedInState(false);
   }
+};
+
+/**
+ * Loopback development has no credential to obtain, so the page asks the active
+ * backend whether it disables client auth and reports a super admin. Only a
+ * same-origin HTTP-loopback backend may answer for this page, so the localhost
+ * convenience can never authorize a remote gateway.
+ */
+const probeLocalDevelopmentAuth = async () => {
+  if (!isLocalDevelopmentOrigin()) return null;
+  const backendBase = getActiveBackendBase();
+  if (formatBackendLabel(backendBase) !== globalThis.location.origin) return null;
+  try {
+    const res = await fetch(buildBackendUrl("/uos/auth", backendBase), { cache: "no-store" });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    const auth = data?.auth;
+    if (auth?.mode !== "disabled" || auth?.is_admin !== true) return null;
+    return auth;
+  } catch {
+    return null;
+  }
+};
+
+const applyLocalDevelopmentAuth = (auth) => {
+  localDevelopmentAuth = true;
+  setAuthBadge("ok", auth?.is_super_admin === true ? "Local super admin" : "Local development");
+  setSignedInState(false);
+  void loadModels("");
+};
+
+const initializeLocalDevelopmentAuth = async () => {
+  if (tokenInput.value.trim()) return;
+  const requestId = ++authCheckId;
+  const auth = await probeLocalDevelopmentAuth();
+  // A token typed while the probe was in flight wins.
+  if (requestId !== authCheckId || tokenInput.value.trim()) return;
+  if (!auth) {
+    setAuthBadge("bad", "Missing token");
+    setSignedInState(false);
+    resetModelCatalog();
+    return;
+  }
+  applyLocalDevelopmentAuth(auth);
 };
 
 const scheduleAuthCheck = debounce(() => {
@@ -500,13 +570,12 @@ if (tokenInput.value.trim()) {
   setAuthBadge("unknown", "Checking...");
   void checkAuthToken();
 } else {
-  setAuthBadge("bad", "Missing token");
-  resetModelCatalog();
+  setAuthBadge("unknown", "Checking...");
+  void initializeLocalDevelopmentAuth();
 }
 
 bindForegroundRefresh(() => {
-  const token = tokenInput.value.trim();
-  if (token) void loadModels(token, { force: true });
+  if (currentPrincipal()) void loadModels(tokenInput.value.trim(), { force: true });
 });
 
 showTokenInput.addEventListener("change", () => {
@@ -519,12 +588,15 @@ tokenInput.addEventListener("input", () => {
   scheduleTokenPersist();
   const token = tokenInput.value.trim();
   if (!token) {
-    setAuthBadge("bad", "Missing token");
+    clearLocalDevelopmentAuth();
+    setAuthBadge("unknown", "Checking...");
     setSignedInState(false);
     resetModelCatalog();
     setReasoningPlaceholder("No model selected");
+    void initializeLocalDevelopmentAuth();
     return;
   }
+  clearLocalDevelopmentAuth();
   if (token !== modelsLoadedToken) resetModelCatalog("Checking token...");
   setAuthBadge("unknown", "Checking...");
   scheduleAuthCheck();
@@ -550,6 +622,7 @@ const applySignedInToken = (token, options = {}) => {
   rememberTokenInput.checked = true;
   storage.set(STORAGE_KEYS.rememberToken, "1");
   storage.set(STORAGE_KEYS.token, token);
+  clearLocalDevelopmentAuth();
   setSignedInState(true, options);
   authCheckId += 1;
   modelsRequestId += 1;
@@ -611,10 +684,12 @@ signOutBtn.addEventListener("click", async () => {
     rememberTokenInput.checked = false;
     authCheckId += 1;
     modelsRequestId += 1;
-    setAuthBadge("bad", "Missing token");
+    clearLocalDevelopmentAuth();
+    setAuthBadge("unknown", "Checking...");
     setSignedInState(false);
     resetModelCatalog();
     signOutBtn.disabled = false;
+    void initializeLocalDevelopmentAuth();
   }
 });
 
@@ -636,23 +711,27 @@ globalThis.addEventListener("storage", (event) => {
     tokenInput.value = "";
     authCheckId += 1;
     modelsRequestId += 1;
-    setAuthBadge("bad", "Missing token");
+    clearLocalDevelopmentAuth();
+    setAuthBadge("unknown", "Checking...");
     setSignedInState(false);
     resetModelCatalog();
+    void initializeLocalDevelopmentAuth();
     return;
   }
   if (!rememberTokenInput.checked) return;
   tokenInput.value = event.newValue ?? "";
   authCheckId += 1;
   modelsRequestId += 1;
+  clearLocalDevelopmentAuth();
   if (tokenInput.value.trim()) {
     setAuthBadge("unknown", "Checking...");
     void checkAuthToken();
     return;
   }
-  setAuthBadge("bad", "Missing token");
+  setAuthBadge("unknown", "Checking...");
   setSignedInState(false);
   resetModelCatalog();
+  void initializeLocalDevelopmentAuth();
 });
 
 const handleModelChange = () => {
@@ -740,8 +819,8 @@ const streamSse = async (response, onEvent) => {
 
 const sendPrompt = async () => {
   const token = tokenInput.value.trim();
-  if (!token) {
-    appendMessage("error", "Sign in with a passkey first, or use the fallback gateway token under Auth.");
+  if (!token && !localDevelopmentAuth) {
+    appendMessage("error", "Sign in with a passkey first, or use the fallback gateway token under Account.");
     passkeyLoginBtn.focus();
     return;
   }
@@ -781,7 +860,7 @@ const sendPrompt = async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token),
       },
       body: JSON.stringify(payload),
       signal: abortController.signal,

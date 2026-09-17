@@ -7,6 +7,7 @@ import { resolveKernelQuotaPolicyState } from "./kernel_usage.ts";
 import { recordKernelPolicyQueue } from "./kernel_policy_queue.ts";
 import { getKv } from "./kv.ts";
 import { isAdminAuthDisabledForRequest } from "./local_admin_auth.ts";
+import { resolveLocalDevelopmentApiKeyPolicy } from "./local_development_key.ts";
 import { getPasskeySessionForRequest, isPasskeyUserAdmin } from "./passkeys.ts";
 import { getString, isRecord, sha256Base64Url, sha256Hex } from "./utils.ts";
 import type { ApiKeyRecord } from "./types.ts";
@@ -806,6 +807,19 @@ export const authenticateClient = async (req: Request): Promise<AuthenticateClie
     });
   };
   if (localAuthDisabled) {
+    // A loopback development server provisions one unlimited local key so the
+    // bypass principal is a super admin with a real paid-provider policy. The
+    // key is optional: without it (or once it is revoked) the principal stays
+    // policy-free, exactly as before.
+    const localDevelopmentPolicy = await resolveLocalDevelopmentApiKeyPolicy(kv);
+    if (localDevelopmentPolicy) {
+      logClientAuth({ ok: true, method: "local_development_key" });
+      return {
+        ok: true,
+        token,
+        method: { kind: "kv_api_key", key_id: localDevelopmentPolicy.key_id, policy: localDevelopmentPolicy },
+      };
+    }
     logClientAuth({ ok: true, method: "disabled" });
     return { ok: true, token, method: { kind: "disabled" } };
   }
