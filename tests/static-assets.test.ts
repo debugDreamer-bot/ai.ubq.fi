@@ -320,8 +320,8 @@ Deno.test("admin provider view places capacity history before current providers"
 
   assert.match(adminHtml, /id="card-provider-capacity">Providers/);
   assert.doesNotMatch(adminHtml, /Fifteen-minute capacity, cached-input, and cache-write history/);
-  assert.match(adminHtml, /admin\.css\?v=app-minimal-20260912/);
-  assert.match(adminHtml, /admin\.js\?v=20260917-models-tab-v1/);
+  assert.match(adminHtml, /admin\.css\?v=20260917-model-picker-v1/);
+  assert.match(adminHtml, /admin\.js\?v=20260917-model-picker-v1/);
   assert.doesNotMatch(adminHtml, /removed_provider-failover|debug-routing/);
   assert.doesNotMatch(adminScript, /RemovedProviderFailover|refresh=live/);
   assert.match(adminScript, /fetch\(apiUrl\("\/admin\/providers\/capacity"\)/);

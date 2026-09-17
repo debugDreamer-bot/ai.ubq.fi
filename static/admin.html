@@ -11,7 +11,7 @@
     <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="icon" href="/favicon.png" type="image/png" sizes="256x256" />
     <link rel="stylesheet" href="/style.css?v=app-minimal-20260912" />
-    <link rel="stylesheet" href="/admin.css?v=app-minimal-20260912" />
+    <link rel="stylesheet" href="/admin.css?v=20260917-model-picker-v1" />
   </head>
   <body data-page="admin" data-role="admin" data-auth-widget="collapsed" data-auth-scope="none">
     <div data-shell>
@@ -666,18 +666,82 @@
           <article data-card aria-labelledby="card-models">
             <header>
               <h2 id="card-models">Model Whitelist</h2>
-              <p>When non-empty, only whitelisted model IDs appear on model-list endpoints. An empty list shows all models. This does not block inference.</p>
+              <p>
+                Check every model the gateway may advertise on <code>/models</code>, <code>/v1/models</code>, and the
+                Codex catalog. Checked models stay listed; unchecked models are hidden while at least one model is
+                checked. Saving an empty selection removes the filter, so every discovered model is listed again.
+                Inference is never blocked.
+              </p>
             </header>
             <div data-card-body>
-              <label data-field>
-                <span data-label>Whitelisted model IDs</span>
-                <textarea id="models-whitelist-input" rows="8" placeholder="gpt-5.4-codex&#10;gpt-5.6-sol"
-                  style="font-family:monospace;font-size:0.875rem;width:100%"></textarea>
-              </label>
-              <div data-layout="row">
-                <button id="models-whitelist-save" type="button">Save</button>
-                <span id="models-whitelist-badge" data-badge data-state="unknown">Idle</span>
+              <div data-model-controls>
+                <label data-field>
+                  <span data-label>Search models</span>
+                  <input
+                    id="models-whitelist-search"
+                    type="search"
+                    placeholder="Search by model, provider, or context size"
+                    autocomplete="off"
+                  />
+                </label>
+                <label data-field>
+                  <span data-label>Sort</span>
+                  <select id="models-whitelist-sort">
+                    <option value="id">Model A–Z</option>
+                    <option value="created">Newest first</option>
+                  </select>
+                </label>
+                <div data-model-filters role="group" aria-label="Filter by provider">
+                  <button id="models-whitelist-provider-all" type="button" data-model-provider="all"
+                    aria-pressed="true">
+                    All <span data-model-filter-count>0</span>
+                  </button>
+                  <button id="models-whitelist-provider-codex" type="button" data-model-provider="codex"
+                    aria-pressed="false">
+                    Codex <span data-model-filter-count>0</span>
+                  </button>
+                  <button id="models-whitelist-provider-openlux" type="button" data-model-provider="openlux"
+                    aria-pressed="false">
+                    Metered 2 <span data-model-filter-count>0</span>
+                  </button>
+                  <button id="models-whitelist-provider-surplus" type="button" data-model-provider="surplus"
+                    aria-pressed="false">
+                    Metered 1 <span data-model-filter-count>0</span>
+                  </button>
+                </div>
+                <label data-check="only-selected">
+                  <input id="models-whitelist-only-selected" type="checkbox" />
+                  <span>Only checked</span>
+                </label>
               </div>
+              <div data-model-status>
+                <span id="models-whitelist-badge" data-badge data-state="unknown">Not loaded</span>
+                <p id="models-whitelist-summary" data-model-summary aria-live="polite">Waiting for the catalog.</p>
+              </div>
+              <p id="models-whitelist-warning" data-help data-tone="warning" hidden></p>
+              <div data-layout="row" data-model-actions>
+                <button id="models-whitelist-check-all" type="button">Check all shown</button>
+                <button id="models-whitelist-uncheck-all" type="button">Uncheck all shown</button>
+                <button id="models-whitelist-invert" type="button">Invert shown</button>
+                <button id="models-whitelist-drop-missing" type="button" hidden>Remove missing</button>
+                <button id="models-whitelist-discard" type="button" disabled>Discard changes</button>
+                <button
+                  id="models-whitelist-reload"
+                  type="button"
+                  data-icon-button
+                  data-tooltip="Reload the catalog and the saved selection"
+                  aria-label="Reload the catalog and the saved selection"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v6h-6" />
+                  </svg>
+                </button>
+                <button id="models-whitelist-save" type="button" data-variant="primary" disabled>Save</button>
+              </div>
+              <div id="models-whitelist-list" data-model-picker role="group" aria-label="Catalog models"></div>
+              <p data-field-help>
+                To re-pick your favorites: uncheck every model, check the ones you want to keep listed, then save.
+              </p>
             </div>
           </article>
         </section>
@@ -797,6 +861,6 @@
         </button>
       </section>
     </div>
-    <script type="module" src="/admin.js?v=20260917-models-tab-v1"></script>
+    <script type="module" src="/admin.js?v=20260917-model-picker-v1"></script>
   </body>
 </html>

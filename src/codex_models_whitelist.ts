@@ -36,6 +36,25 @@ export const normalizeCodexModelsWhitelist = (value: unknown): CodexModelsWhitel
 // ── KV helpers ───────────────────────────────────────────────────────────────
 
 /**
+ * Canonical form of a submitted model-ID list: non-empty identifiers only, in
+ * first-seen order, without duplicates. Storage and the wire response both use
+ * this form so a re-save of an already-normalized selection is a no-op.
+ */
+export const normalizeWhitelistModelIds = (rawIds: readonly unknown[]): string[] => {
+  const modelIds: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawIds) {
+    const id = getString(raw);
+    if (!id) continue;
+    const trimmed = id.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    modelIds.push(trimmed);
+  }
+  return modelIds;
+};
+
+/**
  * Load the whitelist from KV. Returns `null` when KV is unavailable or the value
  * is absent/invalid.
  */
@@ -48,9 +67,10 @@ export const loadCodexModelsWhitelist = async (kv: Deno.Kv | null): Promise<Code
 /**
  * Store a whitelist to KV.
  * `modelIds` is the list of model identifiers to allow. An empty list clears the filter.
+ * Identifiers are trimmed and de-duplicated before they are persisted.
  */
 export const storeCodexModelsWhitelist = async (kv: Deno.Kv, modelIds: readonly string[]): Promise<boolean> => {
-  const whitelist: CodexModelsWhitelist = { model_ids: [...modelIds], updated_at_ms: Date.now() };
+  const whitelist: CodexModelsWhitelist = { model_ids: normalizeWhitelistModelIds(modelIds), updated_at_ms: Date.now() };
   const commit = await kv.set(CODEX_MODELS_WHITELIST_KV_KEY, whitelist);
   return commit.ok;
 };

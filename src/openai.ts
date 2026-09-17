@@ -7620,9 +7620,10 @@ type PublicModelProvider = Readonly<{
   supported_endpoints: readonly string[];
 }>;
 
-type PublicModelCatalogEntry = {
+export type PublicModelCatalogEntry = {
   id: string;
   providers: PublicModelProvider[];
+  created?: number;
   model_class?: string;
   context_window_tokens?: number;
   max_context_window_tokens?: number;
@@ -7637,11 +7638,13 @@ const providerSupportedEndpointPaths = (supportedEndpointTypes: readonly string[
 
 const catalogAvailabilityStatus = (available: unknown): "available" | "unavailable" => (available ? "available" : "unavailable");
 
-const publicModelCatalogEntry = (id: string, provider: PublicModelProvider): PublicModelCatalogEntry => {
+const publicModelCatalogEntry = (id: string, provider: PublicModelProvider, created: unknown): PublicModelCatalogEntry => {
   const context = recentModelContextFor(id);
+  const createdSeconds = typeof created === "number" && Number.isSafeInteger(created) && created > 0 ? created : null;
   return {
     id,
     providers: [provider],
+    ...(createdSeconds === null ? {} : { created: createdSeconds }),
     ...(context
       ? {
           model_class: context.model_class,
@@ -7654,13 +7657,16 @@ const publicModelCatalogEntry = (id: string, provider: PublicModelProvider): Pub
   };
 };
 
-const addPublicModelCatalogEntry = (models: Map<string, PublicModelCatalogEntry>, id: string, provider: PublicModelProvider): void => {
+const addPublicModelCatalogEntry = (models: Map<string, PublicModelCatalogEntry>, id: string, provider: PublicModelProvider, created: unknown = null): void => {
   const existing = models.get(id);
   if (existing) {
     existing.providers.push(provider);
+    if (existing.created === undefined && typeof created === "number" && Number.isSafeInteger(created) && created > 0) {
+      existing.created = created;
+    }
     return;
   }
-  models.set(id, publicModelCatalogEntry(id, provider));
+  models.set(id, publicModelCatalogEntry(id, provider, created));
 };
 
 const collectCodexCatalogModelIds = (codexModels: readonly Record<string, unknown>[]): Set<string> => {
@@ -7672,7 +7678,26 @@ const collectCodexCatalogModelIds = (codexModels: readonly Record<string, unknow
   return ids;
 };
 
-export const handlePublicModelCatalog = async (): Promise<Response> => {
+export type ModelCatalogSourceId = "codex" | "openlux" | "surplus";
+
+export type ModelCatalogSource = Readonly<{
+  status: "available" | "unavailable";
+  count: number;
+  updated_at_ms: number | null;
+}>;
+
+export type ModelCatalogSnapshot = Readonly<{
+  models: PublicModelCatalogEntry[];
+  sources: Readonly<Record<ModelCatalogSourceId, ModelCatalogSource>>;
+}>;
+
+/**
+ * Build the complete provider-discovered catalog without applying the operator
+ * whitelist. `/uos/models/catalog` filters this snapshot for the public page,
+ * while the admin console reads it unfiltered so a disabled model stays visible
+ * (and can be switched back on) in the operator's picker.
+ */
+export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot> => {
   const snapshot = await loadCodexModelsSnapshot();
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
   const [metered, surplus] = await Promise.all([fetchMeteredModels(), fetchSurplusModels({ requireApiKey: false })]);
@@ -7686,38 +7711,48 @@ export const handlePublicModelCatalog = async (): Promise<Response> => {
   for (const model of codexModels) {
     const id = getString(model.id);
     if (!id) continue;
-    addPublicModelCatalogEntry(models, id, {
-      id: "codex",
-      owned_by: getString(model.owned_by) ?? "openai",
-      supported_endpoints: ["/v1/responses", "/v1/chat/completions"],
-    });
+    addPublicModelCatalogEntry(
+      models,
+      id,
+      {
+        id: "codex",
+        owned_by: getString(model.owned_by) ?? "openai",
+        supported_endpoints: ["/v1/responses", "/v1/chat/completions"],
+      },
+      model.created
+    );
   }
   for (const model of metered?.models ?? []) {
     // OpenLux is a broad discovery source; only advertise it when another
     // configured provider confirms the same model ID.
     if (!otherProviderModelIds.has(model.id)) continue;
     includedOpenLuxModelIds.add(model.id);
-    addPublicModelCatalogEntry(models, model.id, {
-      id: "openlux",
-      owned_by: model.owned_by,
-      supported_endpoints: providerSupportedEndpointPaths(model.supported_endpoint_types),
-    });
+    addPublicModelCatalogEntry(
+      models,
+      model.id,
+      {
+        id: "openlux",
+        owned_by: model.owned_by,
+        supported_endpoints: providerSupportedEndpointPaths(model.supported_endpoint_types),
+      },
+      model.created
+    );
   }
   for (const model of surplusModels) {
-    addPublicModelCatalogEntry(models, model.id, {
-      id: "surplus",
-      owned_by: model.owned_by,
-      supported_endpoints: providerSupportedEndpointPaths(model.supported_endpoint_types),
-    });
+    addPublicModelCatalogEntry(
+      models,
+      model.id,
+      {
+        id: "surplus",
+        owned_by: model.owned_by,
+        supported_endpoints: providerSupportedEndpointPaths(model.supported_endpoint_types),
+      },
+      model.created
+    );
   }
 
-  const catalogKv = await getKv();
-  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
-  const allCatalogEntries = [...models.values()].sort((left, right) => left.id.localeCompare(right.id));
-  const filteredCatalogEntries = filterWhitelistedModelMap(allCatalogEntries, catalogWhitelist);
-  return json(200, {
-    object: "uos.model_catalog",
-    data: filteredCatalogEntries,
+  return {
+    models: [...models.values()].sort((left, right) => left.id.localeCompare(right.id)),
     sources: {
       codex: {
         status: catalogAvailabilityStatus(normalized),
@@ -7735,6 +7770,17 @@ export const handlePublicModelCatalog = async (): Promise<Response> => {
         updated_at_ms: surplus?.updated_at_ms ?? null,
       },
     },
+  };
+};
+
+export const handlePublicModelCatalog = async (): Promise<Response> => {
+  const catalog = await buildModelCatalogSnapshot();
+  const catalogKv = await getKv();
+  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
+  return json(200, {
+    object: "uos.model_catalog",
+    data: filterWhitelistedModelMap(catalog.models, catalogWhitelist),
+    sources: catalog.sources,
   });
 };
 
