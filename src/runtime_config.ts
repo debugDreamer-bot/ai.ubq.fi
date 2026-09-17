@@ -55,10 +55,11 @@ const reasoningLevel = (value: unknown): ReasoningEffort | null => {
 };
 
 const compactReasoningLevels = (model: Record<string, unknown>): ReasoningEffort[] => {
+  // Verbatim advertised tiers only: a null entry is the upstream's own `none`, and
+  // no tier is added because the endpoint rejects an effort its catalog omits.
   const levels = Array.isArray(model.supported_reasoning_levels)
     ? model.supported_reasoning_levels.map(reasoningLevel).filter((value): value is ReasoningEffort => value !== null)
     : [];
-  if (!levels.includes("none")) levels.unshift("none");
   return Array.from(new Set(levels));
 };
 

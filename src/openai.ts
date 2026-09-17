@@ -3641,7 +3641,9 @@ const extractSnapshotReasoningEffortWireMap = (model: Record<string, unknown> | 
 const getCodexModelReasoning = (record: Record<string, unknown> | null): CodexModelReasoning => {
   const defaultLevel = normalizeSnapshotReasoningEffort(record?.default_reasoning_level);
   const catalogLevels = extractSnapshotReasoningLevels(record);
-  const levels = catalogLevels.includes("none") ? catalogLevels : ["none", ...catalogLevels];
+  // Advertised tiers are preserved verbatim; `none` is never added, because the
+  // upstream rejects an effort its catalog does not list.
+  const levels = [...catalogLevels];
   return {
     levels: defaultLevel && !levels.includes(defaultLevel) ? [...levels, defaultLevel] : levels,
     defaultLevel,

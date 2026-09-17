@@ -1397,8 +1397,8 @@ Deno.test("codex catalog: third-party enrichment fills rows no first-party sourc
     assert.ok(deepseek, "the discovery-only id is still advertised");
     assert.deepEqual(
       (deepseek.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
-      ["none", "max", "high", "low"],
-      "an optional-reasoning model gains the gateway's none tier alongside the advertised ones"
+      ["max", "high", "low"],
+      "the advertised tiers pass through verbatim"
     );
     assert.equal(deepseek.default_reasoning_level, "high");
     assert.equal(deepseek.context_window, 1_048_576);
@@ -1462,8 +1462,8 @@ Deno.test("codex catalog: a Codex-served id advertises the widest window a sourc
     assert.equal(astra.auto_compact_token_limit, 892_500);
     assert.deepEqual(
       (astra.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
-      ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
-      "the uploaded Codex tiers still win"
+      ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "the uploaded Codex tiers pass through verbatim"
     );
     // An id no source widens keeps the endpoint's own numbers.
     const untouched = payload.models.find((model) => model.slug === "gpt-reserve");

@@ -47,7 +47,7 @@ Deno.test("reasoning stays Codex-authoritative while the window follows the wide
   assert.equal(resolved.context_window_tokens, 1_050_000);
   assert.equal(resolved.max_context_window_tokens, 1_050_000);
   assert.equal(resolved.context_source, "openrouter");
-  assert.deepEqual(resolved.supported_reasoning_levels, ["none", "low", "high"]);
+  assert.deepEqual(resolved.supported_reasoning_levels, ["low", "high"]);
   assert.equal(resolved.default_reasoning_effort, "high");
   assert.equal(resolved.reasoning_source, "codex_upload");
 });
@@ -61,7 +61,7 @@ Deno.test("a serving provider's own declaration outranks a narrower enrichment e
   assert.equal(resolved.context_source, "provider_discovery");
   // Reasoning was not declared by the provider, so enrichment supplies it.
   assert.equal(resolved.reasoning_source, "openrouter");
-  assert.deepEqual(resolved.supported_reasoning_levels, ["none", "max", "high", "medium"]);
+  assert.deepEqual(resolved.supported_reasoning_levels, ["max", "high", "medium"]);
 });
 
 Deno.test("enrichment is the last resort, and the resolved context derives the auto-compact limit", () => {
@@ -194,5 +194,5 @@ Deno.test("a Codex record without an explicit default keeps no default effort", 
   assert.equal(hint.default_reasoning_effort, undefined);
   const resolved = resolveModelMetadata("any-model", { codex: hint, openRouter: null });
   assert.equal(resolved.default_reasoning_effort, null);
-  assert.deepEqual(resolved.supported_reasoning_levels, ["none", "low", "high"]);
+  assert.deepEqual(resolved.supported_reasoning_levels, ["low", "high"]);
 });
