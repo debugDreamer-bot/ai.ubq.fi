@@ -69,6 +69,7 @@ import {
   deletePaidFallbackStateV3,
   getPaidFallbackProviderUsageV3,
   getPaidFallbackWindowProjectionV3,
+  reconcileDuePaidFallbacksV3,
   listPaidFallbackRequestsV3,
   paidFallbackDeletionGuardV3Key,
 } from "./paid_fallback_ledger.ts";
@@ -1628,6 +1629,9 @@ export const handleAdminApiKeysPaidFallbacks = async (req: Request, keyId: strin
   const limit = Math.min(requestedLimit, 100);
 
   try {
+    // An operator reading the ledger settles whatever its terminal events made
+    // due, so the view cannot sit on unreconciled rows with no traffic arriving.
+    void reconcileDuePaidFallbacksV3(Date.now(), kv).catch(() => {});
     const records = (await listPaidFallbackRequestsV3(normalizedKeyId, limit, kv)).map(paidFallbackHistoryRecord);
     return json(200, { object: "list", data: records }, { "Cache-Control": "no-store" });
   } catch (error) {

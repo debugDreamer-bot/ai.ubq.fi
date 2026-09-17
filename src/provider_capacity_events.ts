@@ -5,6 +5,7 @@ import {
   parseCodexResetShadowDecisionRecord,
 } from "./codex_banked_reset.ts";
 import { getKv } from "./kv.ts";
+import { PROVIDER_CAPACITY_HISTORY_BUCKET_MS } from "./provider_capacity_contract.ts";
 import { isRecord } from "./utils.ts";
 
 /** Redacted, short-lived evidence used only to annotate the capacity chart. */
@@ -324,4 +325,29 @@ export const listProviderCapacityResetEvents = async (
   }
 
   return [...events.values()].sort((left, right) => left.observed_at_ms - right.observed_at_ms || left.event_id.localeCompare(right.event_id));
+};
+
+/**
+ * One capacity probe per history bucket, driven by an observation rather than a
+ * clock. This lives beside the event recorders and imports the sampler lazily so
+ * the Codex request path can report an observation without importing the sampler
+ * module, which imports the Codex module back.
+ *
+ * `PROVIDER_CAPACITY_HISTORY_BUCKET_MS` is the debounce: the first observation in
+ * a bucket samples, later observations in the same bucket are no-ops. The sampler
+ * keeps its own lease, so two processes cannot probe at once. Fire-and-forget:
+ * telemetry never delays inference or an admin read.
+ */
+let lastSampledBucketStartAtMs = 0;
+
+export const resetProviderCapacityEventTriggerForTest = (): void => {
+  lastSampledBucketStartAtMs = 0;
+};
+
+export const triggerProviderCapacitySample = (options: Readonly<{ now?: () => number }> = {}): void => {
+  const nowMs = (options.now ?? Date.now)();
+  const bucketStartAtMs = Math.floor(nowMs / PROVIDER_CAPACITY_HISTORY_BUCKET_MS) * PROVIDER_CAPACITY_HISTORY_BUCKET_MS;
+  if (bucketStartAtMs <= lastSampledBucketStartAtMs) return;
+  lastSampledBucketStartAtMs = bucketStartAtMs;
+  void import("./provider_capacity.ts").then((sampler) => sampler.sampleProviderCapacityOnEvent({ now: () => nowMs })).catch(() => {});
 };

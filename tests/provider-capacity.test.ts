@@ -17,7 +17,7 @@ import {
   type ProviderCapacityCodexSource,
   providerCapacityHistoryKey,
   refreshProviderCapacity,
-  sampleProviderCapacityForCron,
+  sampleProviderCapacityOnEvent,
 } from "../src/provider_capacity.ts";
 import { PROMPT_CACHE_ANALYTICS_BUCKET_MS, promptCacheAnalyticsCounterKey } from "../src/prompt_cache_analytics.ts";
 import {
@@ -1259,7 +1259,7 @@ Deno.test("cron sampler persists capacity without building the discarded admin p
     setKvForTest(samplerKv as unknown as Deno.Kv);
     const samplerCalls: { account: string | null; authorization: string | null; url: string }[] = [];
     const finishSamplerBudget = samplerKv.beginMeasurement({ authKind: "background", outcome: "capacity_sampler" });
-    await sampleProviderCapacityForCron({
+    await sampleProviderCapacityOnEvent({
       kv: samplerKv as unknown as Deno.Kv,
       fetcher: createFetcher(samplerCalls),
       now: () => nowMs,
@@ -1325,14 +1325,14 @@ Deno.test("cron sampler preserves a same-bucket reset transition", async () => {
     const calls: { account: string | null; authorization: string | null; url: string }[] = [];
     const fetcher = createFetcher(calls, null, {}, () => (phase === 0 ? [100, 100] : [0, 0]));
 
-    await sampleProviderCapacityForCron({
+    await sampleProviderCapacityOnEvent({
       kv: countingKv as unknown as Deno.Kv,
       fetcher,
       now: () => nowMs,
       createLeaseOwner: () => "exhausted",
     });
     phase = 1;
-    await sampleProviderCapacityForCron({
+    await sampleProviderCapacityOnEvent({
       kv: countingKv as unknown as Deno.Kv,
       fetcher,
       now: () => nowMs + 1_000,
@@ -1366,7 +1366,7 @@ Deno.test("concurrent cron samplers keep one provider probe under the durable le
     const baseFetcher = createFetcher(calls);
     const fetcher = createGatedFetcher(baseFetcher, fetchReleased);
 
-    const first = sampleProviderCapacityForCron({
+    const first = sampleProviderCapacityOnEvent({
       kv: countingKv as unknown as Deno.Kv,
       fetcher,
       now: () => nowMs,
@@ -1377,7 +1377,7 @@ Deno.test("concurrent cron samplers keep one provider probe under the durable le
       assert.ok(Date.now() < waitDeadline, "first cron sampler did not issue all provider calls");
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    const second = sampleProviderCapacityForCron({
+    const second = sampleProviderCapacityOnEvent({
       kv: countingKv as unknown as Deno.Kv,
       fetcher,
       now: () => nowMs,

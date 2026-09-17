@@ -2,6 +2,7 @@ import { apiKeyIdKey, MICROCREDITS_PER_CREDIT, PAID_FALLBACK_NO_LIMIT } from "./
 import {
   admitPaidFallbackV3,
   markPaidFallbackTerminalV3,
+  reconcileDuePaidFallbacksV3,
   releasePaidFallbackBeforeProviderFetchV3,
   settlePaidFallbackUsageV3,
   updatePaidFallbackRequestV3,
@@ -298,6 +299,10 @@ export const recordMeteredAmbiguousFailure = async (
     dispatch_state: "dispatched",
   });
   await markPaidFallbackTerminalV3(reservation, "ambiguous");
+  // A terminal event is what makes pending marks due; settle them now instead of
+  // waiting for the retired every-minute cron. Fire-and-forget so provider-log
+  // reads never delay the response, and gate-guarded so an idle sweep is one read.
+  void reconcileDuePaidFallbacksV3().catch(() => {});
 };
 
 export const recordMeteredUndispatchedCancellation = async (reservation: PaidFallbackReservation): Promise<void> => {
@@ -314,6 +319,9 @@ export const recordMeteredTerminal = async (
   provider: PaidFallbackProvider = "metered"
 ): Promise<void> => {
   await markPaidFallbackTerminalV3(reservation, terminalState, provider);
+  // Same event-driven settlement as the ambiguous path: the request is over, so
+  // reconcile what its terminal state made due without blocking anything.
+  void reconcileDuePaidFallbacksV3().catch(() => {});
 };
 
 export type SurplusBillingPricing = Readonly<{

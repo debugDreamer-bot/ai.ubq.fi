@@ -12,9 +12,11 @@ import {
   type ProviderCapacityRateLimitResetEvent,
   providerCapacityRateLimitResetEventKey,
   type ProviderCapacityResetEvent,
+  triggerProviderCapacitySample,
 } from "./provider_capacity_events.ts";
 import { readPromptCacheAnalytics } from "./prompt_cache_analytics.ts";
-import { PROVIDER_CAPACITY_SNAPSHOT_KEY } from "./provider_capacity_contract.ts";
+import { PROVIDER_CAPACITY_HISTORY_BUCKET_MS, PROVIDER_CAPACITY_SNAPSHOT_KEY } from "./provider_capacity_contract.ts";
+export { PROVIDER_CAPACITY_HISTORY_BUCKET_MS } from "./provider_capacity_contract.ts";
 import { getConfiguredMeteredQuotaSnapshot, METERED_QUOTA_FRESH_MS, type MeteredQuotaSnapshot } from "./metered_quota.ts";
 import { isRecord, sha256Hex } from "./utils.ts";
 
@@ -22,7 +24,6 @@ export { PROVIDER_CAPACITY_SNAPSHOT_KEY } from "./provider_capacity_contract.ts"
 export const PROVIDER_CAPACITY_LEASE_KEY = ["uos_ai", "provider_capacity", "v1", "lease"] as const;
 export const PROVIDER_CAPACITY_HISTORY_KEY_PREFIX = ["uos_ai", "provider_capacity", "v1", "history"] as const;
 const PROVIDER_CAPACITY_LAST_AVAILABLE_KEY_PREFIX = ["uos_ai", "provider_capacity", "v1", "last_available"] as const;
-export const PROVIDER_CAPACITY_HISTORY_BUCKET_MS = 15 * 60_000;
 export const PROVIDER_CAPACITY_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60_000;
 // Keep this name for callers that used the old snapshot retention constant.
 export const PROVIDER_CAPACITY_SNAPSHOT_RETENTION_MS = PROVIDER_CAPACITY_HISTORY_RETENTION_MS;
@@ -1264,16 +1265,23 @@ export const refreshProviderCapacity = async (options: ProviderCapacitySnapshotO
 };
 
 /**
- * Persist one scheduled capacity sample without building the admin projection.
+ * Persist one capacity sample for an observed event, without building the admin
+ * projection.
  *
- * The deploy cron does not consume a ProviderCapacityView, so scanning the
- * seven-day history and reset-event ledgers before and after every sample only
- * pays to construct a discarded response. Keep the capture, routing
- * observations, lease, snapshot/history write, and same-bucket reset
- * transition exactly on the durable sampler path. Admin callers continue to
- * use refreshProviderCapacity() when they need the full projection.
+ * Replaces the retired fifteen-minute deploy cron. The trigger is a capacity observation
+ * - a Codex rate-limit reset, an upstream downtime - or an operator opening the
+ * capacity view; `triggerProviderCapacitySample` is the fire-and-forget entry
+ * point and debounces to one probe per history bucket. Nothing here runs because
+ * time passed.
+ *
+ * The caller does not consume a ProviderCapacityView, so scanning the seven-day
+ * history and reset-event ledgers before and after every sample only pays to
+ * construct a discarded response. Keep the capture, routing observations, lease,
+ * snapshot/history write, and same-bucket reset transition exactly on the
+ * durable sampler path. Admin callers continue to use refreshProviderCapacity()
+ * when they need the full projection.
  */
-export const sampleProviderCapacityForCron = async (options: ProviderCapacitySnapshotOptions = {}): Promise<void> => {
+export const sampleProviderCapacityOnEvent = async (options: ProviderCapacitySnapshotOptions = {}): Promise<void> => {
   const nowMs = safeNow(options.now ?? Date.now);
   const kv = options.kv === undefined ? await getKv() : options.kv;
   // A scheduled sample without durable storage would only create provider
@@ -1288,9 +1296,9 @@ export const sampleProviderCapacityForCron = async (options: ProviderCapacitySna
         entry: { key: PROVIDER_CAPACITY_LEASE_KEY, value: null, versionstamp: null },
       }) as { acquired: boolean; entry: Deno.KvEntryMaybe<CapacityLease> }
   );
-  // The scheduled caller has no view to return. A competing live refresh or
-  // cron owns the only probe, so avoid both a duplicate probe and the old
-  // coalesced-view polling loop.
+  // The event caller has no view to return. A competing live refresh owns the
+  // only probe, so avoid both a duplicate probe and the old coalesced-view
+  // polling loop.
   if (!lease.acquired) return;
 
   let persisted = false;
@@ -1309,6 +1317,10 @@ export const handleProviderCapacity = async (
   options: ProviderCapacitySnapshotOptions = {}
 ): Promise<Response> => {
   const promptCache = readPromptCacheAnalytics({ kv: options.kv, now: options.now });
+  // Opening the capacity view is an event: sample the current bucket in the
+  // background so the persisted view this dashboard reads keeps up without a
+  // scheduled sampler.
+  triggerProviderCapacitySample(options);
   try {
     const live = new URL(request.url).searchParams.get("refresh") === "live";
     const view = live ? await refreshProviderCapacity(options) : await getPersistedProviderCapacityView(options);
