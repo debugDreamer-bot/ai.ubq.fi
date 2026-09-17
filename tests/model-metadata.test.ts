@@ -33,7 +33,7 @@ Deno.test("an id no source describes resolves to unknown instead of a curated gu
   }
 });
 
-Deno.test("the uploaded Codex catalog outranks every other source", () => {
+Deno.test("reasoning stays Codex-authoritative while the window follows the widest source", () => {
   const resolved = resolveModelMetadata("gpt-5.6-sol", {
     codex: {
       context_window_tokens: 272_000,
@@ -44,15 +44,15 @@ Deno.test("the uploaded Codex catalog outranks every other source", () => {
     provider: { context_window_tokens: 1_000_000, supported_reasoning_levels: ["none"] },
     openRouter: enrichment(),
   });
-  assert.equal(resolved.context_window_tokens, 272_000);
-  assert.equal(resolved.max_context_window_tokens, 400_000);
-  assert.equal(resolved.context_source, "codex_upload");
+  assert.equal(resolved.context_window_tokens, 1_050_000);
+  assert.equal(resolved.max_context_window_tokens, 1_050_000);
+  assert.equal(resolved.context_source, "openrouter");
   assert.deepEqual(resolved.supported_reasoning_levels, ["none", "low", "high"]);
   assert.equal(resolved.default_reasoning_effort, "high");
   assert.equal(resolved.reasoning_source, "codex_upload");
 });
 
-Deno.test("a serving provider's own declaration outranks enrichment", () => {
+Deno.test("a serving provider's own declaration outranks a narrower enrichment entry", () => {
   const resolved = resolveModelMetadata("deepseek-flash", {
     provider: { context_window_tokens: 1_000_000, max_context_window_tokens: 1_000_000 },
     openRouter: enrichment({ id: "~deepseek/deepseek-flash-latest", context_window_tokens: 65_536, max_context_window_tokens: 65_536 }),
@@ -74,39 +74,71 @@ Deno.test("enrichment is the last resort, and the resolved context derives the a
   assert.equal(resolved.default_reasoning_effort, "medium");
 });
 
-Deno.test("a declared auto-compact limit inside the resolved window is preserved", () => {
-  const resolved = resolveModelMetadata("gpt-5.6-sol", {
+Deno.test("a declared auto-compact limit is preserved inside the resolved window", () => {
+  const narrow = resolveModelMetadata("gpt-5.6-sol", {
+    codex: { context_window_tokens: 272_000, auto_compact_token_limit_tokens: 200_000 },
+    openRouter: null,
+  });
+  assert.equal(narrow.context_window_tokens, 272_000);
+  assert.equal(narrow.auto_compact_token_limit_tokens, 200_000);
+
+  // Widening the advertised window does not discard a first-party compaction
+  // limit: it is advice the client may follow or override.
+  const widened = resolveModelMetadata("gpt-5.6-sol", {
     codex: { context_window_tokens: 272_000, auto_compact_token_limit_tokens: 200_000 },
     openRouter: enrichment(),
   });
-  assert.equal(resolved.context_window_tokens, 272_000);
-  assert.equal(resolved.auto_compact_token_limit_tokens, 200_000);
+  assert.equal(widened.context_window_tokens, 1_050_000);
+  assert.equal(widened.auto_compact_token_limit_tokens, 200_000);
 });
 
-Deno.test("the Codex subscription bound outranks enrichment for a Codex-served id", () => {
-  // OpenRouter publishes the API-level maximum; a subscription serves less, so
-  // the conservative bound has to win when the upload states no window.
+Deno.test("OpenRouter's window wins when it knows the id, so the gateway advertises the real capability", () => {
+  // The Codex catalog understates what the endpoint accepts (916k verified), so a
+  // wider third-party window is advertised and the client chooses its own budget.
   const resolved = resolveModelMetadata("gpt-5.6-sol", {
-    codex: { supported_reasoning_levels: ["low", "high"] },
+    codex: { context_window_tokens: 272_000, max_context_window_tokens: 872_000, supported_reasoning_levels: ["low", "high"] },
     codexSubscription: codexSubscriptionMetadataHint(),
     openRouter: enrichment({ context_window_tokens: 1_050_000, max_context_window_tokens: 1_050_000 }),
   });
-  assert.equal(resolved.context_window_tokens, CODEX_SUBSCRIPTION_CONTEXT_WINDOW_TOKENS);
-  assert.equal(resolved.max_context_window_tokens, CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS);
-  assert.equal(resolved.auto_compact_token_limit_tokens, 222_000);
-  assert.equal(resolved.context_source, "codex_subscription");
-  // Tiers still come from the upload, which is authoritative for them.
+  assert.equal(resolved.context_window_tokens, 1_050_000);
+  assert.equal(resolved.max_context_window_tokens, 1_050_000);
+  assert.equal(resolved.auto_compact_token_limit_tokens, 892_500);
+  assert.equal(resolved.context_source, "openrouter");
+  // Tiers still come from the upload, which stays authoritative for them.
   assert.equal(resolved.reasoning_source, "codex_upload");
 });
 
-Deno.test("an uploaded Codex window beats the subscription bound", () => {
+Deno.test("first-party windows fill ids OpenRouter does not know, and the subscription bound fills the rest", () => {
+  const firstParty = resolveModelMetadata("codex-only-model", {
+    codex: { context_window_tokens: 8_000 },
+    openRouter: null,
+  });
+  assert.equal(firstParty.context_window_tokens, 8_000);
+  assert.equal(firstParty.context_source, "codex_upload");
+
+  const silent = resolveModelMetadata("codex-only-model", { codexSubscription: codexSubscriptionMetadataHint(), openRouter: null });
+  assert.equal(silent.context_window_tokens, CODEX_SUBSCRIPTION_CONTEXT_WINDOW_TOKENS);
+  assert.equal(silent.max_context_window_tokens, CODEX_SUBSCRIPTION_MAX_CONTEXT_WINDOW_TOKENS);
+  assert.equal(silent.context_source, "codex_subscription");
+});
+
+Deno.test("a narrower third-party entry never shrinks a first-party window", () => {
   const resolved = resolveModelMetadata("gpt-5.6-sol", {
     codex: { context_window_tokens: 400_000, max_context_window_tokens: 400_000 },
     codexSubscription: codexSubscriptionMetadataHint(),
-    openRouter: enrichment(),
+    openRouter: enrichment({ context_window_tokens: 300_000, max_context_window_tokens: 300_000 }),
   });
   assert.equal(resolved.context_window_tokens, 400_000);
   assert.equal(resolved.context_source, "codex_upload");
+});
+
+Deno.test("OpenRouter breaks ties, keeping capability provenance when widths agree", () => {
+  const tied = resolveModelMetadata("gpt-5.6-sol", {
+    codex: { context_window_tokens: 1_050_000 },
+    openRouter: enrichment({ context_window_tokens: 1_050_000, max_context_window_tokens: 1_050_000 }),
+  });
+  assert.equal(tied.context_window_tokens, 1_050_000);
+  assert.equal(tied.context_source, "openrouter");
 });
 
 Deno.test("ids Codex does not serve keep their provider or enrichment window", () => {

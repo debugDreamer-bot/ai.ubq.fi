@@ -1415,15 +1415,15 @@ Deno.test("codex catalog: third-party enrichment fills rows no first-party sourc
   }
 });
 
-Deno.test("codex catalog: a Codex-served id keeps the Codex endpoint window, not enrichment", async () => {
+Deno.test("codex catalog: a Codex-served id advertises the widest window a source states", async () => {
   seedBaseState("0.200.0");
   resetSurplusModelsCacheForTest();
   resetOpenRouterModelsCacheForTest();
   const originalFetch = globalThis.fetch;
   const originalSurplusKey = Deno.env.get("SURPLUS_API_KEY");
   Deno.env.set("SURPLUS_API_KEY", "surplus-catalog-test-key");
-  // The paid route serves this id too, and OpenRouter advertises the API-level
-  // maximum for it. The Codex endpoint serves less, and that has to win.
+  // The endpoint's catalog says 272k/872k and understates what it accepts; the
+  // gateway advertises the model's real window so a client can choose its budget.
   await fetchSurplusModels({
     apiKey: "surplus-catalog-test-key",
     force: true,
@@ -1451,21 +1451,26 @@ Deno.test("codex catalog: a Codex-served id keeps the Codex endpoint window, not
   };
 
   try {
-    // A version with no stored catalog takes the paid-only path, which is where
-    // the enrichment leak reached Codex clients.
+    // A version with no stored catalog takes the paid-only path.
     const response = await handleCodexCatalogModels(request("0.155.0"), "0.155.0");
     assert.equal(response.status, 200);
     const payload = (await response.json()) as { models: Record<string, unknown>[] };
     const astra = payload.models.find((model) => model.slug === "gpt-6-astra");
     assert.ok(astra, "the paid route still advertises the Codex-served id");
-    assert.equal(astra.context_window, 272_000, "the Codex endpoint window wins over the API-level maximum");
-    assert.equal(astra.max_context_window, 872_000);
-    assert.equal(astra.auto_compact_token_limit, 222_000);
+    assert.equal(astra.context_window, 1_050_000, "the widest stated window is advertised");
+    assert.equal(astra.max_context_window, 1_050_000);
+    assert.equal(astra.auto_compact_token_limit, 892_500);
     assert.deepEqual(
       (astra.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
       ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
       "the uploaded Codex tiers still win"
     );
+    // An id no source widens keeps the endpoint's own numbers.
+    const untouched = payload.models.find((model) => model.slug === "gpt-reserve");
+    if (untouched) {
+      assert.equal(untouched.context_window, 272_000);
+      assert.equal(untouched.max_context_window, 872_000);
+    }
   } finally {
     globalThis.fetch = originalFetch;
     resetSurplusModelsCacheForTest();

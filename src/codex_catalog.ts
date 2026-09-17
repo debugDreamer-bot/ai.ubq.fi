@@ -28,7 +28,7 @@ import { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS } from "./metered.ts";
 import type { recordSentinelProviderDegradationFromEnvironment } from "./sentinel_incident_outbox.ts";
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "./surplus.ts";
 import { codexSnapshotMetadataHint, codexSubscriptionMetadataHint, resolveModelMetadata } from "./model_metadata.ts";
-import { warmOpenRouterModels } from "./openrouter_models.ts";
+import { openRouterMetadataFor, warmOpenRouterModels } from "./openrouter_models.ts";
 import { isProviderEnabled, loadProviderSelectionCached, type ProviderSelection } from "./provider_selection.ts";
 
 export const CODEX_CATALOG_FRESH_MS = 5 * 60_000;
@@ -280,6 +280,66 @@ const trimmedHeaderValue = (value: string | null | undefined): string | null => 
   return trimmed;
 };
 
+/**
+ * Widen a Codex-facing catalog record to the model's real window when a source
+ * states a larger one.
+ *
+ * The endpoint's catalog understates what it accepts: on 2026-09-17, direct
+ * Codex-endpoint requests with coding headers were accepted at 916,463 input
+ * tokens for `gpt-6-astra` and 918,450 for `gpt-5.6-luna`, while that catalog
+ * advertises `context_window` 272,000 capped at `max_context_window` 872,000, and
+ * Codex clamps an explicit `model_context_window` override to that maximum.
+ * Advertising the model's actual window lets any client use it, and a client that
+ * wants to stay inside a cheaper tier sets its own window or compaction limit.
+ *
+ * Enrichment supplies the wider window when it knows the id; ids no source widens
+ * keep the endpoint's own numbers, so nothing unverified is inflated. Applied when
+ * a catalog is stored, so every read path - including the verbatim-body fast path -
+ * serves the widened values with matching integrity metadata.
+ */
+const widenCodexModelWindows = (record: Record<string, unknown>): boolean => {
+  const id = getString(record.slug) ?? getString(record.id) ?? getString(record.model) ?? getString(record.name);
+  if (!id) return false;
+  const enrichment = openRouterMetadataFor(id);
+  if (!enrichment) return false;
+  const endpointWindow = positiveWindowCount(record.context_window);
+  const endpointCeiling = positiveWindowCount(record.max_context_window);
+  const widest = widestWindowCount(endpointWindow, endpointCeiling, enrichment.context_window_tokens, enrichment.max_context_window_tokens);
+  if (widest === null) return false;
+  let changed = false;
+  if (endpointWindow === null || widest > endpointWindow) {
+    record.context_window = widest;
+    changed = true;
+  }
+  if (endpointCeiling === null || widest > endpointCeiling) {
+    record.max_context_window = widest;
+    changed = true;
+  }
+  return changed;
+};
+
+const widenCodexCatalogWindows = (body: string): string | null => {
+  const parsed = parseCatalogBody(body);
+  if (!parsed) return null;
+  let changed = false;
+  for (const model of parsed.models as unknown[]) {
+    if (!isRecord(model)) continue;
+    if (widenCodexModelWindows(model)) changed = true;
+  }
+  return changed ? JSON.stringify(parsed) : null;
+};
+
+const positiveWindowCount = (value: unknown): number | null => (typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null);
+
+const widestWindowCount = (...values: readonly (number | null)[]): number | null => {
+  let widest: number | null = null;
+  for (const value of values) {
+    if (value === null) continue;
+    if (widest === null || value > widest) widest = value;
+  }
+  return widest;
+};
+
 export const storeCodexCatalog = async (
   kv: Deno.Kv,
   input: Readonly<{
@@ -293,7 +353,8 @@ export const storeCodexCatalog = async (
 ): Promise<boolean> => {
   if (!parseCodexClientVersion(input.clientVersion) || !parseCatalogBody(input.body)) return false;
   const fetchedAtMs = input.fetchedAtMs ?? Date.now();
-  const compressed = await gzip(input.body);
+  const body = widenCodexCatalogWindows(input.body) ?? input.body;
+  const compressed = await gzip(body);
   const bodyGeneration = crypto.randomUUID();
   const chunkCount = Math.ceil(compressed.byteLength / CODEX_CATALOG_CHUNK_BYTES);
   const expireIn = Math.max(1, fetchedAtMs + CODEX_CATALOG_RETENTION_MS - Date.now());
@@ -312,8 +373,10 @@ export const storeCodexCatalog = async (
     fetched_at_ms: fetchedAtMs,
     chunk_count: chunkCount,
     compressed_bytes: compressed.byteLength,
-    body_bytes: new TextEncoder().encode(input.body).byteLength,
-    sha256: await sha256Hex(input.body),
+    // Integrity metadata describes the bytes actually stored, which carry the
+    // raised override ceiling, not the upstream response verbatim.
+    body_bytes: new TextEncoder().encode(body).byteLength,
+    sha256: await sha256Hex(body),
   };
   const metadataEntry = await kv.get<CodexCatalogMetadata>(metadataKey(input.clientVersion));
   const generation = await kv.get<string>(CODEX_CATALOG_AUTH_GENERATION_KEY);
