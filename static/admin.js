@@ -224,6 +224,7 @@ const modelsInvertBtn = mustGet("models-whitelist-invert");
 const modelsDropMissingBtn = mustGet("models-whitelist-drop-missing");
 const modelsDiscardBtn = mustGet("models-whitelist-discard");
 const modelsReloadBtn = mustGet("models-whitelist-reload");
+const modelsMetadataRefreshBtn = mustGet("models-metadata-refresh");
 const modelsSummary = mustGet("models-whitelist-summary");
 const modelsWarning = mustGet("models-whitelist-warning");
 const modelsList = mustGet("models-whitelist-list");
@@ -8286,6 +8287,52 @@ const modelsDefaultModelWarning = () => {
   return `The default model ${defaultModel} is not checked, so it will disappear from /v1/models while this selection is saved.`;
 };
 
+/**
+ * How current the third-party metadata behind the picker is, in one sentence.
+ * The catalog reports enrichment as a source, so the operator sees the upstream
+ * size, how many rows it actually filled, and when it was last fetched.
+ */
+const modelsMetadataStatus = () => {
+  const enrichment = modelsCatalogSources?.openrouter;
+  if (!enrichment || enrichment.configured === false) return "";
+  const rows = formatNumber(enrichment.count ?? 0);
+  const updatedAt = toNumber(enrichment.updated_at_ms);
+  if (!updatedAt) return `Model metadata: ${rows} rows enriched, not fetched yet.`;
+  const minutes = Math.max(0, Math.round((Date.now() - updatedAt) / 60_000));
+  const ago = minutes === 0 ? "just now" : minutes === 1 ? "1 minute ago" : `${formatNumber(minutes)} minutes ago`;
+  return `Model metadata: ${rows} rows enriched, updated ${ago}.`;
+};
+
+/** Force an upstream metadata fetch, then reload the picker from the result. */
+const refreshModelsMetadata = async () => {
+  const token = getAdminToken();
+  if (!token && !hasAdminCredential()) {
+    setModelsWhitelistBadge("bad", "Missing token");
+    return;
+  }
+  modelsMetadataRefreshBtn.disabled = true;
+  try {
+    const response = await fetch(apiUrl("/admin/models/refresh"), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      toast.error("Metadata refresh failed", { description: payload?.error?.message ?? `HTTP ${response.status}` });
+      return;
+    }
+    await loadModelsWhitelist({ force: true });
+    const upstream = payload?.data?.openrouter?.upstream_models;
+    toast.success("Model metadata refreshed", {
+      description: typeof upstream === "number" ? `${formatNumber(upstream)} upstream models` : undefined,
+    });
+  } catch {
+    toast.error("Metadata refresh failed", { description: "Offline" });
+  } finally {
+    modelsMetadataRefreshBtn.disabled = false;
+  }
+};
+
 const updateModelsStatus = () => {
   const total = modelsCatalog.length;
   const selected = modelsSelection.size;
@@ -8304,6 +8351,11 @@ const updateModelsStatus = () => {
     : `${formatNumber(selected)} of ${formatNumber(total)} models checked: only those stay listed.` +
       (missing.length ? ` ${formatNumber(missing.length)} of them are missing from the catalog.` : "") +
       (visibleCount < total ? ` Showing ${formatNumber(visibleCount)}.` : "");
+
+  const metadata = modelsMetadataStatus();
+  if (metadata) {
+    modelsSummary.textContent += ` ${metadata}`;
+  }
 
   const warnings = [modelsCatalogWarning(), modelsMissingWarning(), modelsDefaultModelWarning()].filter(Boolean);
   modelsWarning.textContent = warnings.join(" ");
@@ -8567,6 +8619,9 @@ modelsDropMissingBtn.addEventListener("click", () => {
 
 modelsDiscardBtn.addEventListener("click", discardModelsChanges);
 modelsReloadBtn.addEventListener("click", reloadModelsWhitelist);
+modelsMetadataRefreshBtn.addEventListener("click", () => {
+  void refreshModelsMetadata();
+});
 modelsWhitelistSave.addEventListener("click", () => {
   void saveModelsWhitelist();
 });

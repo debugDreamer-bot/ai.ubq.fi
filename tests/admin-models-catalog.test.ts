@@ -4,7 +4,7 @@ import adminHtml from "../static/admin.html" with { type: "text" };
 import adminScript from "../static/admin.js" with { type: "text" };
 import modelsScript from "../static/models.js" with { type: "text" };
 import adminSource from "../src/admin.ts" with { type: "text" };
-import { handleAdminCodexModelsWhitelistGet, handleAdminCodexModelsWhitelistSet, handleAdminModelsCatalogGet } from "../src/admin.ts";
+import { handleAdminCodexModelsWhitelistGet, handleAdminCodexModelsWhitelistSet, handleAdminModelsCatalogGet, handleAdminModelsRefresh } from "../src/admin.ts";
 import {
   CODEX_MODELS_WHITELIST_KV_KEY,
   filterWhitelistedCatalogModels,
@@ -14,6 +14,8 @@ import {
   type CodexModelsWhitelist,
 } from "../src/codex_models_whitelist.ts";
 import handler from "../src/handler.ts";
+import handlerSource from "../src/handler.ts" with { type: "text" };
+import type { OpenRouterModelsSnapshot } from "../src/openrouter_models.ts";
 import { setKvForTest } from "../src/kv.ts";
 import { buildModelCatalogSnapshot } from "../src/openai.ts";
 import openaiSource from "../src/openai.ts" with { type: "text" };
@@ -325,6 +327,7 @@ Deno.test("the Models tab renders checkbox tools instead of a free-text whitelis
     "models-whitelist-drop-missing",
     "models-whitelist-discard",
     "models-whitelist-reload",
+    "models-metadata-refresh",
     "models-whitelist-save",
     "models-whitelist-badge",
     "models-whitelist-summary",
@@ -414,4 +417,55 @@ Deno.test("the Providers tab renders a provider picker next to the Analytics tab
   assert.match(adminScript, /providersEmptyWarning/);
   // The waterfall order is fixed, so the picker must never claim to reorder it.
   assert.match(adminHtml, /The waterfall order itself never changes/);
+});
+
+Deno.test("admin metadata refresh forces every upstream and reports what is cached", async () => {
+  const calls: string[] = [];
+  const enrichment: OpenRouterModelsSnapshot = {
+    models: [
+      { id: "openai/gpt-5.6-sol", context_window_tokens: 1_050_000, max_context_window_tokens: 1_050_000, reasoning: null },
+      { id: "z-ai/glm-5.3", context_window_tokens: 1_310_720, max_context_window_tokens: 1_310_720, reasoning: null },
+    ],
+    updated_at_ms: 1_789_000_000_000,
+  };
+  const response = await handleAdminModelsRefresh({
+    refreshEnrichment: () => {
+      calls.push("openrouter");
+      return Promise.resolve(enrichment);
+    },
+    refreshOpenlux: (options) => {
+      calls.push(`openlux:${options?.force === true ? "force" : "plain"}`);
+      return Promise.resolve({
+        models: [{ id: "gpt-5.6-sol", object: "model", created: 0, owned_by: "openlux", supported_endpoint_types: ["openai-response"] }],
+        updated_at_ms: 1,
+      });
+    },
+    refreshSurplus: (options) => {
+      calls.push(`surplus:${options?.force === true ? "force" : "plain"}`);
+      return Promise.resolve({
+        models: [
+          { id: "gpt-5.6-sol", object: "model", created: 0, owned_by: "OpenAI", supported_endpoint_types: ["openai-response"] },
+          { id: "hy3", object: "model", created: 0, owned_by: "Tencent", supported_endpoint_types: ["openai-response"] },
+        ],
+        updated_at_ms: 2,
+      });
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const body = await response.json();
+  assert.deepEqual(
+    [...calls].sort((left, right) => left.localeCompare(right)),
+    ["openlux:force", "openrouter", "surplus:force"],
+    "every upstream is force-refreshed"
+  );
+  assert.deepEqual(body.data, {
+    openrouter: { upstream_models: 2, updated_at_ms: 1_789_000_000_000, refreshed: true },
+    openlux: { models: 1, updated_at_ms: 1 },
+    surplus: { models: 2, updated_at_ms: 2 },
+  });
+});
+
+Deno.test("admin metadata refresh is registered as an operator POST route", () => {
+  assert.match(handlerSource, /\{ methods: \["POST"\], path: "\/admin\/models\/refresh", run: \(\) => handleAdminModelsRefresh\(\) \}/);
 });
