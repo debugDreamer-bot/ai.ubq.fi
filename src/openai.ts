@@ -6350,6 +6350,21 @@ const chatOutputTextPartKey = (event: Record<string, unknown>): string => {
 
 type ReconciledChatContent = Readonly<{ outputText: string; refusal: string }>;
 
+/**
+ * True when an identity-less completed part only repeats content this stream has
+ * already delivered. Compatible upstreams repeat the complete message content in
+ * their terminal payload, and one that omits the message id there -- Surplus
+ * drops `id` inside `response.completed` -- cannot address the per-part entry its
+ * own deltas wrote, so the repeat would otherwise look like new content.
+ * Comparing it against everything emitted so far keeps the message delivered
+ * once; a longer or conflicting payload still takes the ordinary path.
+ */
+const completedPartRepeatsEmittedContent = (emittedParts: ReadonlyMap<string, string>, completed: string): boolean => {
+  if (!completed) return false;
+  const emitted = [...emittedParts.values()].join("");
+  return emitted === completed || emitted.startsWith(completed);
+};
+
 const reconcileChatContentPart = (
   outputTextParts: Map<string, string>,
   refusalParts: Map<string, string>,
@@ -6361,10 +6376,15 @@ const reconcileChatContentPart = (
   }
   const type = getString(part.type);
   const key = chatOutputTextPartKey(event);
+  // Without an item id this part cannot address the entry its own deltas wrote.
+  const identified = Boolean(getString(event.item_id)?.trim());
   if (type === "output_text" || type === "text") {
     const completedText = getString(part.text);
     if (completedText === null) {
       return malformedFunctionCallStream("Upstream completed content part is missing string output text.");
+    }
+    if (!identified && !outputTextParts.has(key) && completedPartRepeatsEmittedContent(outputTextParts, completedText)) {
+      return { outputText: "", refusal: "" };
     }
     const emittedText = outputTextParts.get(key) ?? "";
     const suffix = reconcileCompletedOutputText(emittedText, completedText);
@@ -6375,6 +6395,9 @@ const reconcileChatContentPart = (
     const completedRefusal = getString(part.refusal);
     if (completedRefusal === null) {
       return malformedFunctionCallStream("Upstream completed content part is missing string refusal text.");
+    }
+    if (!identified && !refusalParts.has(key) && completedPartRepeatsEmittedContent(refusalParts, completedRefusal)) {
+      return { outputText: "", refusal: "" };
     }
     const emittedRefusal = refusalParts.get(key) ?? "";
     const suffix = reconcileCompletedRefusal(emittedRefusal, completedRefusal);
