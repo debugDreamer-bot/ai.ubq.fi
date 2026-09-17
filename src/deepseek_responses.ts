@@ -170,19 +170,27 @@ export const toDeepSeekChatMessages = (input: unknown, instructions: string | nu
 };
 
 /**
- * DeepSeek rejects a tool-bearing request when a historical assistant turn with
- * tool calls omits `reasoning_content`:
+ * DeepSeek rejects a tool-bearing request whose assistant turns omit
+ * `reasoning_content` while thinking mode is on:
  *
  *   "The `reasoning_content` in the thinking mode must be passed back to the API."
  *
- * The field is required even when the client cannot replay the original chain of
- * thought, and the provider accepts an empty string, so a turn without captured
- * reasoning is filled in rather than left absent. Without this, the second turn
- * of any tool-using conversation failed with HTTP 400.
+ * The measured boundary (probed against `deepseek-v4-flash`, `reasoning_effort`
+ * other than `none`, with tools advertised) is: every assistant message that
+ * follows the last `user` message must carry the field, and an empty string
+ * satisfies it. Messages before the last user message are exempt, which is why
+ * the fill is restricted to that tail instead of touching replayed history.
+ *
+ * A tool-call turn is not the only shape that trips this: Codex echoes the
+ * assistant's text message ahead of its `function_call`, so the request that
+ * continues a tool call carries a plain assistant message in the tail as well.
+ * Filling only `tool_calls` turns left that message bare and the follow-up died
+ * with HTTP 400 (observed in production on `deepseek-v4-flash`, `max`).
  */
-const ensureToolTurnReasoning = (messages: readonly Record<string, unknown>[]): void => {
-  for (const message of messages) {
-    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+const ensureTrailingAssistantReasoning = (messages: readonly Record<string, unknown>[]): void => {
+  const lastUser = messages.findLastIndex((message) => message.role === "user");
+  for (const message of messages.slice(lastUser + 1)) {
+    if (message.role !== "assistant") continue;
     if (typeof message.reasoning_content !== "string") message.reasoning_content = "";
   }
 };
@@ -358,7 +366,7 @@ export const toDeepSeekResponsesChatBody = (
   const toolNames = applyTools(body, rawRecord);
   if (!toolNames.ok) return toolNames;
   // Only a tool-bearing request makes the provider require replayed reasoning.
-  if (Array.isArray(body.tools) && body.tools.length) ensureToolTurnReasoning(messages.value);
+  if (Array.isArray(body.tools) && body.tools.length) ensureTrailingAssistantReasoning(messages.value);
   return { ok: true, value: { body, toolNames: toolNames.value } };
 };
 

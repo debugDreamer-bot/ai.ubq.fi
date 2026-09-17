@@ -2324,7 +2324,47 @@ const deepseekResponseHeaders = (providerRequestId: string | null): Record<strin
 // DeepSeek documents no `x-ratelimit-*` response headers: its capacity model is
 // concurrency based and surfaces as HTTP 429, so unlike Cerebras there is no
 // provider capacity header list to forward.
-const toDeepSeekUpstreamErrorResponse = async (upstream: Response, signal?: AbortSignal): Promise<Response> => {
+const diagnosticReasoningLabel = (value: unknown): string => {
+  if (typeof value !== "string") return "absent";
+  return value ? "present" : "empty";
+};
+
+const diagnosticContentLabel = (value: unknown): string => {
+  if (value === null || value === undefined) return "null";
+  return Array.isArray(value) ? "parts" : typeof value;
+};
+
+/**
+ * Bounded, content-free digest of a projected DeepSeek Chat body. Upstream 4xx
+ * answers are client-visible but were previously opaque in the server log: a
+ * production HTTP 400 was only diagnosable by reading the client's rollout file.
+ * Message text, tool names, arguments, and ids are deliberately excluded — the
+ * digest carries shapes, not prompts.
+ */
+const deepSeekChatBodyDiagnostic = (body: Record<string, unknown>): Record<string, unknown> => {
+  const messages = Array.isArray(body.messages) ? body.messages.filter(isRecord) : [];
+  const lastUser = messages.findLastIndex((message) => message.role === "user");
+  return {
+    model: typeof body.model === "string" ? body.model : null,
+    reasoning_effort: typeof body.reasoning_effort === "string" ? body.reasoning_effort : null,
+    stream: body.stream === true,
+    tools: Array.isArray(body.tools) ? body.tools.length : 0,
+    tool_choice: typeof body.tool_choice === "string" ? body.tool_choice : null,
+    max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : null,
+    message_count: messages.length,
+    last_user_index: lastUser,
+    messages: messages.map((message, index) => ({
+      index,
+      role: typeof message.role === "string" ? message.role : null,
+      reasoning: diagnosticReasoningLabel(message.reasoning_content),
+      tool_calls: Array.isArray(message.tool_calls) ? message.tool_calls.length : 0,
+      content: diagnosticContentLabel(message.content),
+      after_last_user: index > lastUser,
+    })),
+  };
+};
+
+const toDeepSeekUpstreamErrorResponse = async (upstream: Response, signal?: AbortSignal, bodyDiagnostic?: Record<string, unknown>): Promise<Response> => {
   // Read the error body under the shared bounded ceiling (64 KiB / 1 s) so a
   // stalled upstream cannot extend the gateway request; only message/code are
   // ever forwarded.
@@ -2351,6 +2391,12 @@ const toDeepSeekUpstreamErrorResponse = async (upstream: Response, signal?: Abor
   const headers = deepseekResponseHeaders(getDeepSeekProviderRequestId(upstream));
   const retryAfter = upstream.headers.get("Retry-After");
   if (retryAfter) headers["Retry-After"] = retryAfter;
+  // Bounded provider diagnostics: the gateway forwards this message to the
+  // client, so it must also appear in the server log to be debuggable.
+  console.warn(
+    "[ai.ubq.fi] deepseek_upstream_error",
+    JSON.stringify({ status: upstream.status, code: detail.code ?? null, message: detail.message ?? null, request: bodyDiagnostic ?? null })
+  );
   return openaiError(upstream.status, detail.message ?? "DeepSeek upstream returned an error.", detail.code ?? "deepseek_upstream_error", {
     type: upstream.status === 408 ? "server_error" : upstreamStatusToErrorType(upstream.status),
     headers,
@@ -9217,13 +9263,14 @@ const respondDeepSeekChatUpstreamHttpFailure = async (
   upstream: Response,
   requestSignal: AbortSignal,
   providerRequestId: string | null,
-  usageContext: UsageContext | undefined
+  usageContext: UsageContext | undefined,
+  body: Record<string, unknown>
 ): Promise<Response> => {
   recordDeepSeekResponseHealth(upstream.status, providerRequestId);
   recordDeepSeekFailureKind(usageContext, "upstream_http_error");
   recordStreamTerminalType(usageContext, "response.failed");
   await recordErrorUsage(usageContext);
-  return await toDeepSeekUpstreamErrorResponse(upstream, requestSignal);
+  return await toDeepSeekUpstreamErrorResponse(upstream, requestSignal, deepSeekChatBodyDiagnostic(body));
 };
 
 const respondDeepSeekChatIncompleteCapture = async (
@@ -9414,7 +9461,7 @@ const dispatchDeepSeekUpstream = async (
   const providerRequestId = getDeepSeekProviderRequestId(upstream);
   if (usageContext?.responseTelemetry) usageContext.responseTelemetry.providerRequestId = providerRequestId;
   if (!upstream.ok) {
-    return { ok: false, response: await respondDeepSeekChatUpstreamHttpFailure(upstream, requestSignal, providerRequestId, usageContext) };
+    return { ok: false, response: await respondDeepSeekChatUpstreamHttpFailure(upstream, requestSignal, providerRequestId, usageContext, body) };
   }
   return { ok: true, upstream, providerRequestId, requestSignal, downstreamSignal };
 };

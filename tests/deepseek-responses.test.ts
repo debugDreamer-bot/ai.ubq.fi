@@ -148,6 +148,59 @@ Deno.test("deepseek responses: replays reasoning on tool turns because the provi
   ]);
 });
 
+Deno.test("deepseek responses: fills reasoning on every assistant turn after the last user message", () => {
+  // Reproduces the production failure: Codex echoes the assistant's text
+  // message ahead of its `function_call`, so continuing a tool call sends a
+  // plain assistant message in the tail. The provider rejected that request
+  // with HTTP 400 until every trailing assistant turn carried the field.
+  const body = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "list files" }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "Let me look." }] },
+        { type: "function_call", name: "shell", arguments: '{"cmd":"ls"}', call_id: "call_1" },
+        { type: "function_call_output", call_id: "call_1", output: "a.ts" },
+      ],
+      tools: [{ type: "function", name: "shell", parameters: { type: "object" } }],
+    },
+    "deepseek-flash",
+    false
+  );
+  assert.equal(body.ok, true);
+  const messages = body.value.body.messages as Record<string, unknown>[];
+  assert.deepEqual(messages, [
+    { role: "user", content: "list files" },
+    { role: "assistant", content: "Let me look.", reasoning_content: "" },
+    {
+      role: "assistant",
+      content: null,
+      reasoning_content: "",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"ls"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "a.ts" },
+  ]);
+});
+
+Deno.test("deepseek responses: an assistant turn before the last user message keeps its reasoning absent", () => {
+  // The measured provider rule exempts history before the last user message, so
+  // the fill must not rewrite replayed turns the provider never validated.
+  const body = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "message", role: "user", content: "list files" },
+        { type: "message", role: "assistant", content: "Let me look." },
+        { type: "message", role: "user", content: "now summarize" },
+      ],
+      tools: [{ type: "function", name: "shell", parameters: { type: "object" } }],
+    },
+    "deepseek-flash",
+    false
+  );
+  assert.equal(body.ok, true);
+  const messages = body.value.body.messages as Record<string, unknown>[];
+  assert.equal("reasoning_content" in messages[1], false);
+});
+
 Deno.test("deepseek responses: carries the client's echoed reasoning onto its assistant turn", () => {
   const withReasoning = toDeepSeekResponsesChatBody(
     {
