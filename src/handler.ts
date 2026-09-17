@@ -30,6 +30,8 @@ import {
   handleAdminKvMigrationValidate,
   handleAdminModelsCatalogGet,
   handleAdminPromptCacheAnalytics,
+  handleAdminProviderSelectionGet,
+  handleAdminProviderSelectionSet,
   handleAdminProvidersQuotaProjection,
   handleAdminProvidersQuotaProjectionBackfill,
 } from "./admin.ts";
@@ -859,6 +861,8 @@ const ADMIN_ROUTES: readonly AdminRouteEntry[] = [
   { methods: ["GET", "POST"], path: "/admin/defaults", run: (req) => handleAdminDefaults(req) },
   { methods: ["GET", "POST", "DELETE"], path: "/admin/debug/routing", run: (req) => handleAdminDebugRouting(req) },
   { methods: ["GET"], path: "/admin/providers", run: () => handleHealthProviders({ includeQuota: true }) },
+  { methods: ["GET"], path: "/admin/providers/selection", run: () => handleAdminProviderSelectionGet() },
+  { methods: ["POST"], path: "/admin/providers/selection", run: (req) => handleAdminProviderSelectionSet(req) },
   { methods: ["GET"], path: "/admin/providers/capacity", run: (req) => handleProviderCapacity(req) },
   { methods: ["GET"], path: "/admin/providers/quota-projection", run: (req) => handleAdminProvidersQuotaProjection(req) },
   { methods: ["POST"], path: "/admin/providers/quota-projection/backfill", run: (req) => handleAdminProvidersQuotaProjectionBackfill(req) },

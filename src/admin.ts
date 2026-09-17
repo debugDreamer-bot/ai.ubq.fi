@@ -93,6 +93,13 @@ import { listKernelPolicyQueue } from "./kernel_policy_queue.ts";
 import { defaultIncludeLegacyForProfile, importKvMigrationLines, type KvMigrationProfile, validateKvMigrationTarget } from "./kv_migration.ts";
 import { getKv } from "./kv.ts";
 import { loadCodexModelsWhitelist, normalizeWhitelistModelIds, storeCodexModelsWhitelist } from "./codex_models_whitelist.ts";
+import {
+  isSelectableProviderId,
+  loadProviderSelection,
+  providerSelectionIsActive,
+  SELECTABLE_PROVIDER_IDS,
+  storeProviderSelection,
+} from "./provider_selection.ts";
 import { buildModelCatalogSnapshot } from "./openai.ts";
 import { listCodexResetShadowDecisions } from "./codex_banked_reset.ts";
 import {
@@ -678,6 +685,82 @@ export const handleAdminCodexModelsWhitelistSet = async (req: Request): Promise<
     return openaiError(500, "Deno KV is not available; cannot persist model whitelist", "server_error", { type: "server_error" });
   }
   return json(200, { ok: true, stored: true, model_ids: modelIds, updated_at_ms: Date.now() });
+};
+
+/**
+ * Provider picker data: the fixed provider roster with the catalog entry count
+ * each provider currently contributes, plus the stored selection, so the admin
+ * console can render one consistent checkbox list from a single read.
+ *
+ * `buildCatalog` is injectable for tests, matching the other admin handlers.
+ */
+export const handleAdminProviderSelectionGet = async (dependencies: Readonly<{ buildCatalog?: typeof buildModelCatalogSnapshot }> = {}): Promise<Response> => {
+  const kv = await getKv();
+  if (!kv) {
+    return openaiError(500, "Deno KV is not available; cannot read the provider selection", "server_error", { type: "server_error" });
+  }
+  const buildCatalog = dependencies.buildCatalog ?? buildModelCatalogSnapshot;
+  const [catalog, selection] = await Promise.all([buildCatalog(), loadProviderSelection(kv)]);
+  const counts = new Map<string, number>(SELECTABLE_PROVIDER_IDS.map((id) => [id, 0]));
+  for (const entry of catalog.models) {
+    for (const provider of entry.providers) {
+      const count = counts.get(provider.id);
+      if (count !== undefined) counts.set(provider.id, count + 1);
+    }
+  }
+  return json(
+    200,
+    {
+      ok: true,
+      data: {
+        providers: SELECTABLE_PROVIDER_IDS.map((id) => {
+          const source = catalog.sources[id];
+          return {
+            id,
+            model_count: counts.get(id) ?? 0,
+            status: source.status,
+            // Only credential-gated providers report this; for the discovered
+            // sources the status already says whether they answered.
+            configured: source.configured ?? source.status === "available",
+          };
+        }),
+        selection: { provider_ids: selection ? [...selection.provider_ids] : [], updated_at_ms: selection?.updated_at_ms ?? 0 },
+        // An empty (or absent) selection applies no filter at all, which is the
+        // documented behaviour the picker has to explain to the operator.
+        filter_active: providerSelectionIsActive(selection),
+      },
+    },
+    { "Cache-Control": "no-store" }
+  );
+};
+
+export const handleAdminProviderSelectionSet = async (req: Request): Promise<Response> => {
+  const kv = await getKv();
+  if (!kv) {
+    return openaiError(500, "Deno KV is not available; cannot store the provider selection", "server_error", { type: "server_error" });
+  }
+  const raw = await readJsonBody(req);
+  if (!raw || !isRecord(raw)) return openaiError(400, "Invalid JSON body", "invalid_request_error");
+  const rawIds = raw.provider_ids;
+  if (!Array.isArray(rawIds)) {
+    return openaiError(400, "provider_ids must be an array", "invalid_request_error");
+  }
+  // Every entry has to be a string naming a provider on the roster: silently
+  // dropping an unknown id would store a selection the operator never made, and
+  // the console would show it as saved.
+  if (rawIds.some((id: unknown) => typeof id !== "string")) {
+    return openaiError(400, "provider_ids must contain only strings", "invalid_request_error");
+  }
+  const submittedIds = (rawIds as string[]).map((id) => id.trim());
+  const unknownIds = submittedIds.filter((id) => !isSelectableProviderId(id));
+  if (unknownIds.length) {
+    return openaiError(400, `unknown provider ids: ${unknownIds.join(", ")}`, "invalid_request_error", { param: "provider_ids" });
+  }
+  const stored = await storeProviderSelection(kv, submittedIds.filter(isSelectableProviderId));
+  if (!stored) {
+    return openaiError(500, "Deno KV is not available; cannot persist the provider selection", "server_error", { type: "server_error" });
+  }
+  return json(200, { ok: true, stored: true, provider_ids: [...stored.provider_ids], updated_at_ms: stored.updated_at_ms });
 };
 
 const parseBooleanParam = (url: URL, name: string): boolean | null => {
