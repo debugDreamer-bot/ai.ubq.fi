@@ -13,9 +13,13 @@ import { getString, isRecord } from "./utils.ts";
  *
  * Provider facts (https://api-docs.deepseek.com, read 2026-09-16):
  * - base URL `https://api.deepseek.com`, Chat Completions at `/chat/completions`
- * - model ids `deepseek-flash` (DeepSeek-V4.1-Flash) and `deepseek-v4-pro`
- * - `deepseek-v4-flash` is a retired-but-accepted interchangeable alias that the
- *   API still serves with the DeepSeek-V4.1-Flash model
+ * - model ids `deepseek-flash` and `deepseek-v4-pro`; the provider's own
+ *   `GET /models` lists exactly those two
+ * - `deepseek-v4-flash` is an accepted interchangeable alias: the API answers it
+ *   with `"model": "deepseek-flash"`. It is NOT `deepseek-v4.1-flash`, which the
+ *   API rejects ("The supported API model names are deepseek-flash,
+ *   deepseek-v4-pro"). That id belongs to the paid Surplus/Metered catalogue,
+ *   not to this provider.
  * - `reasoning_effort` accepts none/low/high/max, plus the documented
  *   compatibility aliases minimal (→low), medium and xhigh (→high)
  * - thinking mode is ENABLED BY DEFAULT and its output arrives as

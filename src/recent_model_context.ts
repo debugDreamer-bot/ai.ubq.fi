@@ -71,8 +71,10 @@ const RECENT_MODEL_CONTEXT_RULES: readonly RecentModelContextRule[] = [
     context_window_tokens: 1_000_000,
   },
   {
-    // `deepseek-flash` is the official API's current name for DeepSeek-V4.1-Flash
-    // and shares the V4 family window (https://api-docs.deepseek.com/quick_start/pricing).
+    // `deepseek-flash` is the official API's canonical id (its `GET /models` lists
+    // only `deepseek-flash` and `deepseek-v4-pro`) and shares the V4 family window
+    // (https://api-docs.deepseek.com/quick_start/pricing). `deepseek-v4-flash` is
+    // the accepted alias; `deepseek-v4.1-flash` is a different, paid catalogue id.
     model_class: "deepseek-v4",
     pattern: /^deepseek-(?:v4(?:-(?:pro|flash))?|flash)(?:-|:|$)/,
     context_window_tokens: 1_000_000,

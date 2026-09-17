@@ -263,6 +263,119 @@ Deno.test("deepseek responses: reasoning is never invented without tools", () =>
   assert.equal("reasoning_content" in messages[1], false);
 });
 
+Deno.test("deepseek responses: freeform tools round-trip through the function-only provider contract", () => {
+  // Codex's freeform tools (`apply_patch`, code-mode `exec`) have no Chat
+  // Completions shape, so they are advertised as one freeform string parameter
+  // and their calls come back as `custom_tool_call` items.
+  const body = toDeepSeekResponsesChatBody(
+    {
+      instructions: "You are a coding agent.",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "patch it" }] },
+        { type: "custom_tool_call", call_id: "call_1", name: "apply_patch", input: "*** Begin Patch\n*** End Patch" },
+        { type: "custom_tool_call_output", call_id: "call_1", output: "Done!" },
+      ],
+      tools: [{ type: "custom", name: "apply_patch", description: "Apply a patch." }],
+      reasoning: { effort: "max" },
+    },
+    "deepseek-v4-flash",
+    false
+  );
+  assert.equal(body.ok, true);
+  const tools = body.value.body.tools as { type: string; function: { name: string; parameters: unknown } }[];
+  assert.deepEqual(tools, [
+    {
+      type: "function",
+      function: {
+        name: "apply_patch",
+        description: "Apply a patch.",
+        parameters: {
+          type: "object",
+          properties: { input: { type: "string", description: "Freeform input for the tool." } },
+          required: ["input"],
+          additionalProperties: false,
+        },
+      },
+    },
+  ]);
+  // The replayed freeform text travels as the single Chat argument.
+  const messages = body.value.body.messages as Record<string, unknown>[];
+  assert.equal(messages[0].role, "system");
+  assert.deepEqual(messages[2], {
+    role: "assistant",
+    content: null,
+    reasoning_content: "",
+    tool_calls: [{ id: "call_1", type: "function", function: { name: "apply_patch", arguments: '{"input":"*** Begin Patch\\n*** End Patch"}' } }],
+  });
+  assert.deepEqual(messages[3], { role: "tool", tool_call_id: "call_1", content: "Done!" });
+  assert.deepEqual([...body.value.customToolNames], ["apply_patch"]);
+
+  // The provider answers with JSON arguments; the client gets its text back.
+  const payload = toDeepSeekResponsesPayload(
+    chatCompletion({
+      content: "",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "apply_patch", arguments: '{"input":"*** Begin Patch\\n*** End Patch"}' } }],
+    }),
+    "deepseek-v4-flash",
+    "resp_1",
+    echo,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
+    id: "resp_1_ctc_0_0",
+    type: "custom_tool_call",
+    status: "completed",
+    call_id: "call_1",
+    name: "apply_patch",
+    input: "*** Begin Patch\n*** End Patch",
+  });
+});
+
+Deno.test("deepseek responses: a streamed freeform call emits custom tool events", () => {
+  const body = toDeepSeekResponsesChatBody(
+    {
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "run code" }] }],
+      tools: [{ type: "custom", name: "exec", description: "Run code." }],
+    },
+    "deepseek-v4-flash",
+    true
+  );
+  assert.equal(body.ok, true);
+  const translator = createDeepSeekResponsesStreamTranslator(
+    "deepseek-v4-flash",
+    "resp_1",
+    echo,
+    1_780_000_000,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  translator.open();
+  const events = [
+    ...translator.push({
+      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "exec", arguments: '{"input":"text(' } }] } }],
+    }),
+    ...translator.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 'hi);"}' } }] } }] }),
+    ...translator.finish(),
+  ];
+  const added = events.find((event) => event.type === "response.output_item.added") as { item: Record<string, unknown> };
+  assert.equal(added.item.type, "custom_tool_call");
+  assert.equal(added.item.input, "");
+  // No function-argument deltas: a freeform call carries its input on the item.
+  assert.equal(
+    events.some((event) => event.type === "response.function_call_arguments.delta"),
+    false
+  );
+  const deltas = events.filter((event) => event.type === "response.custom_tool_call_input.delta");
+  assert.equal(deltas.length, 1);
+  assert.equal(deltas[0].delta, "text(hi);");
+  const completed = events.filter((event) => event.type === "response.completed");
+  assert.equal(completed.length, 1);
+  assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
+    { id: "resp_1_fc_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
+  ]);
+});
+
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
   const schema = toDeepSeekResponsesChatBody({ input: "hi", text: { format: { type: "json_schema", name: "x" } } }, "deepseek-flash", false);
   assert.equal(schema.ok, false);

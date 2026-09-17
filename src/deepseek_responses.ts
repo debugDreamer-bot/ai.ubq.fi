@@ -70,6 +70,21 @@ const chatToolResultItem = (item: Record<string, unknown>): DeepSeekResponsesRes
 };
 
 /**
+ * A freeform (`custom`) tool call replayed from history. Chat Completions has no
+ * custom tool type, so the freeform text travels as the single `input` argument
+ * the adapter advertises for those tools, wrapped as the JSON string Chat
+ * requires. Without this translation Codex rejected the whole request:
+ * "input item type 'custom_tool_call' is not supported".
+ */
+const chatCustomToolCallItem = (item: Record<string, unknown>): DeepSeekResponsesResult<Record<string, unknown>> => {
+  const callId = getString(item.call_id) ?? getString(item.id);
+  const name = getString(item.name);
+  if (!callId || !name) return failure("input", "custom_tool_call items require call_id and name");
+  const input = typeof item.input === "string" ? item.input : "";
+  return { ok: true, value: { id: callId, type: "function", function: { name, arguments: JSON.stringify({ input }) } } };
+};
+
+/**
  * The chain-of-thought text a `reasoning` input item carries. Codex echoes the
  * reasoning item this adapter emitted, either as `summary` parts or as
  * `content` parts depending on the client version.
@@ -135,13 +150,15 @@ const appendInputItem = (messages: Record<string, unknown>[], rawItem: unknown, 
     pending.reasoning += reasoningTextFromItem(rawItem);
     return { ok: true, value: undefined };
   }
-  if (type === "function_call") {
-    const call = chatToolCallItem(rawItem);
+  // A freeform (`custom`) call carries raw text and a function call carries JSON
+  // arguments; both become one assistant `tool_calls` entry either way.
+  if (type === "function_call" || type === "custom_tool_call") {
+    const call = type === "custom_tool_call" ? chatCustomToolCallItem(rawItem) : chatToolCallItem(rawItem);
     if (!call.ok) return call;
     appendToolCall(messages, call.value, pending);
     return { ok: true, value: undefined };
   }
-  if (type === "function_call_output") {
+  if (type === "function_call_output" || type === "custom_tool_call_output") {
     const result = chatToolResultItem(rawItem);
     if (!result.ok) return result;
     messages.push(result.value);
@@ -225,7 +242,38 @@ const uniqueChatName = (used: ReadonlySet<string>, name: string): string => {
   }
 };
 
-type ToolCollector = { tools: Record<string, unknown>[]; toolNames: Map<string, string>; used: Set<string> };
+type ToolCollector = { tools: Record<string, unknown>[]; toolNames: Map<string, string>; customNames: Set<string>; used: Set<string> };
+
+/**
+ * The one parameter a freeform tool is advertised with. Codex's `apply_patch`
+ * and code-mode `exec` tools take raw text, and Chat Completions only has JSON
+ * function arguments, so the adapter asks for that text under `input` and
+ * unwraps it again on the way back.
+ */
+const CUSTOM_TOOL_PARAMETERS = {
+  type: "object",
+  properties: { input: { type: "string", description: "Freeform input for the tool." } },
+  required: ["input"],
+  additionalProperties: false,
+};
+
+const collectCustom = (collector: ToolCollector, tool: Record<string, unknown>): DeepSeekResponsesResult<void> => {
+  const name = getString(tool.name);
+  if (!name) return failure("tools.name", "custom tools require a name");
+  const chatName = uniqueChatName(collector.used, name);
+  collector.used.add(chatName);
+  collector.customNames.add(chatName);
+  if (chatName !== name) collector.toolNames.set(chatName, name);
+  collector.tools.push({
+    type: "function",
+    function: {
+      name: chatName,
+      ...(typeof tool.description === "string" ? { description: tool.description } : {}),
+      parameters: CUSTOM_TOOL_PARAMETERS,
+    },
+  });
+  return { ok: true, value: undefined };
+};
 
 const collectFunction = (collector: ToolCollector, fn: Record<string, unknown>, namespace: string | null): DeepSeekResponsesResult<void> => {
   const name = getString(fn.name);
@@ -253,23 +301,30 @@ const collectNamespace = (collector: ToolCollector, tool: Record<string, unknown
 
 const collectTool = (collector: ToolCollector, tool: unknown): DeepSeekResponsesResult<void> => {
   if (!isRecord(tool) || Array.isArray(tool)) return failure("tools", "tools must contain objects");
-  if (getString(tool.type) === "namespace") return collectNamespace(collector, tool);
+  const type = getString(tool.type);
+  if (type === "namespace") return collectNamespace(collector, tool);
+  // A freeform (`custom`) tool is advertised as a function taking one string so
+  // the model can still invoke it, and its call is translated back into a
+  // `custom_tool_call` item the client recognizes.
+  if (type === "custom") return collectCustom(collector, tool);
   const nested = isRecord(tool.function) && !Array.isArray(tool.function) ? tool.function : null;
   // A nested function object is always a function; otherwise only an explicit
   // `function` type is translatable and anything else (for example
   // `web_search`) is dropped.
-  if (!nested && getString(tool.type) !== "function") return { ok: true, value: undefined };
+  if (!nested && type !== "function") return { ok: true, value: undefined };
   return collectFunction(collector, nested ?? tool, null);
 };
 
-const toChatTools = (value: unknown): DeepSeekResponsesResult<Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, string> }>> => {
+const toChatTools = (
+  value: unknown
+): DeepSeekResponsesResult<Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
   if (!Array.isArray(value)) return failure("tools", "tools must be an array");
-  const collector: ToolCollector = { tools: [], toolNames: new Map(), used: new Set() };
+  const collector: ToolCollector = { tools: [], toolNames: new Map(), customNames: new Set(), used: new Set() };
   for (const tool of value) {
     const collected = collectTool(collector, tool);
     if (!collected.ok) return collected;
   }
-  return { ok: true, value: { tools: collector.tools, toolNames: collector.toolNames } };
+  return { ok: true, value: { tools: collector.tools, toolNames: collector.toolNames, customToolNames: collector.customNames } };
 };
 
 /** Maps a flattened Chat tool name back to the name the client asked for. */
@@ -320,13 +375,18 @@ const applyReasoning = (body: Record<string, unknown>, rawRecord: Record<string,
   return { ok: true, value: undefined };
 };
 
-const applyTools = (body: Record<string, unknown>, rawRecord: Record<string, unknown>): DeepSeekResponsesResult<ReadonlyMap<string, string>> => {
+const applyTools = (
+  body: Record<string, unknown>,
+  rawRecord: Record<string, unknown>
+): DeepSeekResponsesResult<Readonly<{ toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
   const toolNames = new Map<string, string>();
+  let customToolNames: ReadonlySet<string> = new Set();
   if (rawRecord.tools !== undefined) {
     const tools = toChatTools(rawRecord.tools);
     if (!tools.ok) return tools;
     if (tools.value.tools.length) body.tools = tools.value.tools;
     for (const [chatName, original] of tools.value.toolNames) toolNames.set(chatName, original);
+    customToolNames = tools.value.customToolNames;
   }
   const toolChoice = toChatToolChoice(rawRecord.tool_choice, toolNames);
   if (!toolChoice.ok) return toolChoice;
@@ -335,7 +395,7 @@ const applyTools = (body: Record<string, unknown>, rawRecord: Record<string, unk
   const responseFormat = toChatResponseFormat(rawRecord.text);
   if (!responseFormat.ok) return responseFormat;
   if (responseFormat.value) body.response_format = responseFormat.value;
-  return { ok: true, value: toolNames };
+  return { ok: true, value: { toolNames, customToolNames } };
 };
 
 /**
@@ -347,7 +407,7 @@ export const toDeepSeekResponsesChatBody = (
   rawRecord: Record<string, unknown>,
   requestedModel: string,
   clientWantsStream: boolean
-): DeepSeekResponsesResult<Readonly<{ body: Record<string, unknown>; toolNames: ReadonlyMap<string, string> }>> => {
+): DeepSeekResponsesResult<Readonly<{ body: Record<string, unknown>; toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
   const canonical = deepSeekUpstreamModelFor(requestedModel);
   if (!canonical) return failure("model", `model '${requestedModel}' is not a DeepSeek official model`);
   const instructions = typeof rawRecord.instructions === "string" && rawRecord.instructions.trim() ? rawRecord.instructions : null;
@@ -367,7 +427,7 @@ export const toDeepSeekResponsesChatBody = (
   if (!toolNames.ok) return toolNames;
   // Only a tool-bearing request makes the provider require replayed reasoning.
   if (Array.isArray(body.tools) && body.tools.length) ensureTrailingAssistantReasoning(messages.value);
-  return { ok: true, value: { body, toolNames: toolNames.value } };
+  return { ok: true, value: { body, toolNames: toolNames.value.toolNames, customToolNames: toolNames.value.customToolNames } };
 };
 
 const responseMessageItem = (id: string, text: string): Record<string, unknown> => ({
@@ -393,6 +453,35 @@ const functionCallItem = (id: string, callId: string, name: string, args: string
   name,
   arguments: args,
 });
+
+/** Codex's freeform tool item; the text travels in `input`, not JSON arguments. */
+const customToolCallItem = (id: string, callId: string, name: string, input: string): Record<string, unknown> => ({
+  id,
+  type: "custom_tool_call",
+  status: "completed",
+  call_id: callId,
+  name,
+  input,
+});
+
+/**
+ * Unwraps the single freeform `input` parameter back into the tool's raw text.
+ * The provider answers with JSON arguments because Chat Completions has no
+ * freeform tool shape, and the client expects the original text.
+ */
+const freeformInputFromArguments = (args: string): string => {
+  try {
+    const parsed: unknown = JSON.parse(args);
+    if (typeof parsed === "string") return parsed;
+    if (isRecord(parsed) && !Array.isArray(parsed)) {
+      const input = getString(parsed.input);
+      if (input !== null) return input;
+    }
+  } catch {
+    // Not JSON: the arguments already are the freeform input.
+  }
+  return args;
+};
 
 /** Maps one Chat Completions usage object onto the Responses usage shape. */
 export const toResponsesUsage = (value: unknown): Record<string, unknown> | null => {
@@ -453,7 +542,8 @@ const outputItemsForChoice = (
   message: Record<string, unknown>,
   choiceIndex: number,
   responseId: string,
-  toolNames: ReadonlyMap<string, string>
+  toolNames: ReadonlyMap<string, string>,
+  customToolNames: ReadonlySet<string>
 ): Record<string, unknown>[] => {
   const items: Record<string, unknown>[] = [];
   if (typeof message.reasoning_content === "string" && message.reasoning_content) {
@@ -466,8 +556,13 @@ const outputItemsForChoice = (
   for (const [callIndex, call] of toolCalls.entries()) {
     if (!isRecord(call) || Array.isArray(call) || !isRecord(call.function) || Array.isArray(call.function)) continue;
     const callId = getString(call.id) ?? `${responseId}_call_${callIndex}`;
-    const name = originalToolName(getString(call.function.name) ?? "", toolNames);
+    const chatName = getString(call.function.name) ?? "";
+    const name = originalToolName(chatName, toolNames);
     const args = typeof call.function.arguments === "string" ? call.function.arguments : "";
+    if (customToolNames.has(chatName)) {
+      items.push(customToolCallItem(`${responseId}_ctc_${choiceIndex}_${callIndex}`, callId, name, freeformInputFromArguments(args)));
+      continue;
+    }
     items.push(functionCallItem(`${responseId}_fc_${choiceIndex}_${callIndex}`, callId, name, args));
   }
   return items;
@@ -483,7 +578,8 @@ export const toDeepSeekResponsesPayload = (
   requestedModel: string,
   responseId: string,
   echo: DeepSeekResponsesEcho,
-  toolNames: ReadonlyMap<string, string> = new Map()
+  toolNames: ReadonlyMap<string, string> = new Map(),
+  customToolNames: ReadonlySet<string> = new Set()
 ): Record<string, unknown> => {
   const created = typeof completion.created === "number" ? completion.created : Math.floor(Date.now() / 1000);
   const payload = responsesEnvelope(responseId, requestedModel, created, "completed", echo);
@@ -491,7 +587,7 @@ export const toDeepSeekResponsesPayload = (
   const output: Record<string, unknown>[] = [];
   for (const [index, choice] of choices.entries()) {
     if (!isRecord(choice) || Array.isArray(choice) || !isRecord(choice.message) || Array.isArray(choice.message)) continue;
-    output.push(...outputItemsForChoice(choice.message, index, responseId, toolNames));
+    output.push(...outputItemsForChoice(choice.message, index, responseId, toolNames, customToolNames));
   }
   payload.output = output;
   payload.usage = toResponsesUsage(completion.usage);
@@ -559,7 +655,8 @@ export const createDeepSeekResponsesStreamTranslator = (
   responseId: string,
   echo: DeepSeekResponsesEcho,
   createdAtSeconds: number,
-  toolNames: ReadonlyMap<string, string> = new Map()
+  toolNames: ReadonlyMap<string, string> = new Map(),
+  customToolNames: ReadonlySet<string> = new Set()
 ) => {
   const state = newStreamState();
   const messageId = `${responseId}_msg_0`;
@@ -594,20 +691,23 @@ export const createDeepSeekResponsesStreamTranslator = (
     ];
   };
 
+  const isCustomCall = (call: StreamToolCall): boolean => customToolNames.has(call.name);
+
   const announceToolCall = (call: StreamToolCall): Record<string, unknown>[] => {
     call.announced = true;
     call.outputIndex = state.nextOutputIndex++;
+    const custom = isCustomCall(call);
     return [
       {
         type: "response.output_item.added",
         output_index: call.outputIndex,
         item: {
           id: call.id,
-          type: "function_call",
+          type: custom ? "custom_tool_call" : "function_call",
           status: "in_progress",
           call_id: call.callId,
           name: originalToolName(call.name, toolNames),
-          arguments: "",
+          ...(custom ? { input: "" } : { arguments: "" }),
         },
       },
     ];
@@ -638,7 +738,9 @@ export const createDeepSeekResponsesStreamTranslator = (
       const call = mergeToolCallDelta(state, responseId, entry, position);
       if (!call.announced && call.name) events.push(...announceToolCall(call));
       const fn = isRecord(entry.function) && !Array.isArray(entry.function) ? entry.function : null;
-      if (call.announced && fn && typeof fn.arguments === "string" && fn.arguments) {
+      // A freeform call streams its input at the terminal item instead: the
+      // provider sends JSON arguments, and the client wants the raw text.
+      if (call.announced && !isCustomCall(call) && fn && typeof fn.arguments === "string" && fn.arguments) {
         events.push({ type: "response.function_call_arguments.delta", item_id: call.id, output_index: call.outputIndex, delta: fn.arguments });
       }
     }
@@ -670,6 +772,16 @@ export const createDeepSeekResponsesStreamTranslator = (
       if (!call.announced) {
         if (!call.name) continue;
         events.push(...announceToolCall(call));
+      }
+      if (isCustomCall(call)) {
+        const input = freeformInputFromArguments(call.arguments);
+        const item = customToolCallItem(call.id, call.callId, originalToolName(call.name, toolNames), input);
+        if (input) {
+          events.push({ type: "response.custom_tool_call_input.delta", item_id: call.id, output_index: call.outputIndex, call_id: call.callId, delta: input });
+        }
+        state.output.push(item);
+        events.push({ type: "response.output_item.done", output_index: call.outputIndex, item });
+        continue;
       }
       events.push({ type: "response.function_call_arguments.done", item_id: call.id, output_index: call.outputIndex, arguments: call.arguments });
       const item = functionCallItem(call.id, call.callId, originalToolName(call.name, toolNames), call.arguments);
