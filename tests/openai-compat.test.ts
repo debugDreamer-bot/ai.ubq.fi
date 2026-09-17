@@ -2198,12 +2198,16 @@ Deno.test("openai: public catalog hides OpenLux-only models", async () => {
       byId.get("openlux-surplus-shared-model")?.providers?.map((provider) => provider.id),
       ["openlux", "surplus"]
     );
-    assert.equal(byId.has("openlux-only-model"), false);
+    assert.deepEqual(
+      byId.get("openlux-only-model")?.providers?.map((provider) => provider.id),
+      ["openlux"],
+      "a provider's own models are listed without another provider confirming them"
+    );
     assert.deepEqual(
       byId.get("surplus-only-model")?.providers?.map((provider) => provider.id),
       ["surplus"]
     );
-    assert.equal(payload.sources?.openlux?.count, 2);
+    assert.equal(payload.sources?.openlux?.count, 3);
   } finally {
     resetMeteredModelsCacheForTest();
     resetSurplusModelsCacheForTest();
@@ -2544,7 +2548,9 @@ Deno.test("openai: DeepSeek request projection translates the documented wire co
   // Documented compatibility aliases pass through unchanged; the official API
   // performs their tier mapping.
   assert.equal(projectDeepSeekRequest({ model: DEEPSEEK_FLASH_MODEL, reasoning_effort: "medium" }, DEEPSEEK_FLASH_MODEL).reasoning_effort, "medium");
-  assert.throws(() => projectDeepSeekRequest({ model: DEEPSEEK_FLASH_MODEL }, "deepseek-v4-pro"), /not configured/);
+  // The provider's published pro model is served under its own canonical id.
+  assert.equal(projectDeepSeekRequest({ model: DEEPSEEK_FLASH_MODEL }, "deepseek-v4-pro").model, "deepseek-v4-pro");
+  assert.throws(() => projectDeepSeekRequest({ model: DEEPSEEK_FLASH_MODEL }, "deepseek-v4-nope"), /not configured/);
 });
 
 Deno.test("openai: unsupported snapshot model is rejected before upstream fetch", async () => {
@@ -13908,18 +13914,33 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
       }
     });
 
-    await t.step("does not route non-flash DeepSeek ids to the official provider", async () => {
-      let deepseekCalls = 0;
-      const response = await withFetchMock(
-        (url) => {
-          if (url === DEEPSEEK_CHAT_COMPLETIONS_URL) deepseekCalls += 1;
-          throw new Error(`unexpected upstream request for a non-flash DeepSeek id: ${url}`);
-        },
-        () => handleChatCompletions(request({ model: "deepseek-v4-pro", messages, stream: false }))
-      );
-      assert.notEqual(response.status, 200);
-      assert.equal(deepseekCalls, 0);
-      assert.deepEqual(getResponseTelemetry(response)?.attemptedProviders, []);
+    await t.step("routes every published DeepSeek id to the official provider and nothing else", async () => {
+      for (const model of ["deepseek-v4-pro", "deepseek-v4-flash"]) {
+        const urls: string[] = [];
+        const response = await withFetchMock(
+          (url) => {
+            urls.push(url);
+            if (url !== DEEPSEEK_CHAT_COMPLETIONS_URL) {
+              throw new Error(`unexpected upstream request for ${model}: ${url}`);
+            }
+            return Promise.resolve(
+              Response.json({
+                id: "chatcmpl-deepseek-published",
+                object: "chat.completion",
+                created: 1_800_000_000,
+                model,
+                choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              })
+            );
+          },
+          () => handleChatCompletions(request({ model, messages, stream: false }))
+        );
+        assert.equal(response.status, 200, model);
+        assert.deepEqual(urls, [DEEPSEEK_CHAT_COMPLETIONS_URL], model);
+        assert.deepEqual(getResponseTelemetry(response)?.attemptedProviders, ["deepseek"], model);
+        await response.arrayBuffer();
+      }
     });
 
     await t.step("classifies malformed, truncated, and invalid buffered payloads without reflecting provider content", async () => {

@@ -133,20 +133,20 @@ Deno.test("the official DeepSeek ids are cataloged as their own provider categor
     const rows = catalog.models.filter((model) => model.providers.some((provider) => provider.id === "deepseek"));
     assert.deepEqual(
       rows.map((model) => model.id),
-      ["deepseek-flash", "deepseek-v4-flash"],
-      "both official ids are selectable in the picker"
+      ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"],
+      "every model the provider publishes is selectable in the picker"
     );
     for (const row of rows) {
       assert.deepEqual(
         row.providers.map((provider) => provider.id),
         ["deepseek"],
-        "the official route replaces a discovered attribution"
+        "the provider's own models are listed without another provider confirming them"
       );
       assert.deepEqual(row.providers[0].supported_endpoints, ["/v1/chat/completions", "/v1/responses"]);
       assert.equal(row.context_source, "provider_discovery");
       assert.equal(row.context_window_tokens, 1_000_000);
     }
-    assert.deepEqual(catalog.sources.deepseek, { status: "available", count: 2, updated_at_ms: null, configured: true });
+    assert.deepEqual(catalog.sources.deepseek, { status: "available", count: 3, updated_at_ms: null, configured: true });
     assert.deepEqual(catalog.sources.cerebras, { status: "unavailable", count: 0, updated_at_ms: null, configured: false });
   } finally {
     Deno.env.delete("DEEPSEEK_API_KEY");
